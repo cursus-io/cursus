@@ -26,6 +26,34 @@ func (s ConsumerHistorySegment) Range() (uint64, uint64) { return s.first, s.end
 
 func (s ConsumerHistorySegment) Empty() bool { return s.empty }
 
+// RefreshConsumerHistorySegment is used only after the coordinator validates
+// the sweep's current prefix generation. Recheck the physical boundaries and
+// capture a fresh storage witness without statting every other segment again.
+func (d *DiskHandler) RefreshConsumerHistorySegment(ctx context.Context, old ConsumerHistorySegment) (ConsumerHistorySegment, error) {
+	if old.owner != d || ctx.Err() != nil {
+		return ConsumerHistorySegment{}, ErrStaleContentGeneration
+	}
+	unlock, err := lockProofContext(ctx, &d.maintenanceMu)
+	if err != nil {
+		return ConsumerHistorySegment{}, err
+	}
+	defer unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.writeAvailabilityError(); err != nil {
+		return ConsumerHistorySegment{}, err
+	}
+	i := sort.Search(len(d.segments), func(i int) bool { return d.segments[i] >= old.first })
+	if i+1 >= len(d.segments) || d.segments[i] != old.first || d.segments[i+1] != old.end || old.first == d.CurrentSegment {
+		return ConsumerHistorySegment{}, ErrStaleContentGeneration
+	}
+	info, err := os.Stat(d.GetSegmentPath(old.first))
+	if err != nil {
+		return ConsumerHistorySegment{}, err
+	}
+	return ConsumerHistorySegment{d, d.contentGenerationLocked(), old.first, old.end, info.Size() == 0}, nil
+}
+
 func (d *DiskHandler) ConsumerHistorySegments(ctx context.Context, committed uint64) ([]ConsumerHistorySegment, error) {
 	if !d.internalMetadata || d.topicName != config.ConsumerOffsetsTopicName {
 		return nil, fmt.Errorf("consumer history requires offsets storage")
@@ -69,6 +97,25 @@ func (d *DiskHandler) ConsumerHistorySegments(ctx context.Context, committed uin
 // fences; the partition owns visibility exclusion. The ordinary key compactor
 // remains forbidden on distributed internal metadata.
 func (d *DiskHandler) RewriteConsumerHistory(ctx context.Context, segment ConsumerHistorySegment, removed []types.Message) (result CompactionResult, err error) {
+	return d.rewriteConsumerHistory(ctx, segment, removed, nil)
+}
+
+// ConsumerHistoryRemovalCertificate is a detached coordinator proof, validated
+// under the live FSM fence immediately before installation. The ordinary API
+// above continues to reject every physical transaction frame.
+type ConsumerHistoryRemovalCertificate interface {
+	RemovedRecords() []types.Message
+	PermitsTransactionRemoval(types.Message) bool
+}
+
+func (d *DiskHandler) RewriteCertifiedConsumerHistory(ctx context.Context, segment ConsumerHistorySegment, certificate ConsumerHistoryRemovalCertificate) (CompactionResult, error) {
+	if certificate == nil {
+		return CompactionResult{}, fmt.Errorf("missing consumer history certificate")
+	}
+	return d.rewriteConsumerHistory(ctx, segment, certificate.RemovedRecords(), certificate.PermitsTransactionRemoval)
+}
+
+func (d *DiskHandler) rewriteConsumerHistory(ctx context.Context, segment ConsumerHistorySegment, removed []types.Message, permitTransaction func(types.Message) bool) (result CompactionResult, err error) {
 	if segment.owner != d || segment.first >= segment.end {
 		return result, ErrStaleContentGeneration
 	}
@@ -88,7 +135,7 @@ func (d *DiskHandler) RewriteConsumerHistory(ctx context.Context, segment Consum
 	}
 	remove := make(map[uint64]types.Message, len(removed))
 	for _, m := range removed {
-		if m.Offset < segment.first || m.Offset >= segment.end || m.Key == "" {
+		if m.Offset < segment.first || m.Offset >= segment.end || m.Key == "" && m.TransactionMarker == types.TransactionMarkerNone {
 			return result, fmt.Errorf("invalid history removal range")
 		}
 		if _, exists := remove[m.Offset]; exists {
@@ -117,8 +164,11 @@ func (d *DiskHandler) RewriteConsumerHistory(ctx context.Context, segment Consum
 			// unforgeable segment witness already binds the physical handler.
 			original.Topic, original.Partition = "", 0
 			m.Topic, m.Partition = "", 0
-			if hasTransactionMetadata(frame.message) || !reflect.DeepEqual(original, m) {
-				return fmt.Errorf("history removal does not match original ordinary frame")
+			if !reflect.DeepEqual(original, m) {
+				return fmt.Errorf("history removal does not match original frame")
+			}
+			if hasTransactionMetadata(frame.message) && (permitTransaction == nil || !permitTransaction(m)) {
+				return fmt.Errorf("history transaction removal lacks retirement certificate")
 			}
 			matched++
 		}

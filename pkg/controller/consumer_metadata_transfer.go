@@ -223,7 +223,7 @@ func (c *consumerMetadataRecoveryCache) stagePartition(ctx context.Context, requ
 		c.rememberCleanup(cleanup)
 		return errors.Join(err, cleanup)
 	}
-	c.entries[p] = &consumerMetadataCacheEntry{request: r, bounds: bounds, certificate: response.CertificateID, store: store}
+	c.entries[p] = &consumerMetadataCacheEntry{request: r, bounds: bounds, certificate: response.CertificateID, generation: response.CertificateID, store: store}
 	if old != nil {
 		err = retireConsumerMetadataStore(old.store)
 		c.rememberCleanup(err)

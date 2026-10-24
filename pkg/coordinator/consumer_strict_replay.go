@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -458,12 +459,15 @@ func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetada
 			return nil, err
 		}
 		if indexed.cached != nil {
+			metrics.RecordRecoveryWork(metrics.RecoveryConsumerIndex, metrics.RecoveryCacheHits, 1)
 			for name, partitions := range indexed.cached.Sources {
 				for p := range partitions {
 					scratch.RecordConsumerMetadataSource(name, p)
 				}
 			}
 			prepared.status.IndexHit = true
+		} else {
+			metrics.RecordRecoveryWork(metrics.RecoveryConsumerIndex, metrics.RecoveryCacheMisses, 1)
 		}
 		prepared.status.IndexTransactionChecks = indexed.transactionChecks
 		prepared.status.IndexReadBytes = indexed.cacheBytes

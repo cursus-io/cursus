@@ -99,7 +99,17 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	}
 	t.Setenv("TRANSACTION_TIMEOUT_MS", "60000")
 	const input, output, group = "prepared-input", "prepared-output", "prepared-workers"
-	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml").WithClusterSize(3).WithTopic(output).WithPartitions(1).WithAcks("all")
+	var ctx *ClusterTestContext
+	if os.Getenv("RUN_E2E_CONSUMER_HISTORY") == "1" {
+		require.NotZero(t, cleanupPortOffset())
+		t.Setenv("CURSUS_HISTORY_MEASURE_COMPACTION", "true")
+		t.Setenv("CURSUS_HISTORY_TRACE_SYNC", "false")
+		ctx = givenCleanupCluster(t, composeFile, "docker-compose.consumer-history.yml", "docker-compose.history-measure.yml")
+	} else {
+		ctx = givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml")
+	}
+	defer ctx.Cleanup()
+	ctx.WithClusterSize(3).WithTopic(output).WithPartitions(1).WithAcks("all")
 	ctx.WhenCluster().StartCluster()
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer client.Close()

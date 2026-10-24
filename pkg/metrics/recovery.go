@@ -29,6 +29,9 @@ const (
 	RecoveryCatchupRPC
 	RecoveryBootstrapInstall
 	RecoveryRetentionTime
+	RecoveryConsumerReplay
+	RecoveryConsumerIndex
+	RecoveryConsumerFrames
 )
 
 const (
@@ -46,7 +49,7 @@ const (
 	RecoveryCanonicalHashBytes
 )
 
-var recoveryStages = [...]string{"full_export", "retained_export", "retained_page", "checksum", "chunk_read", "chunk_receive", "detached_copy", "detached_read", "metadata_rpc", "replica_rpc", "retained_scan", "bootstrap_file", "lineage", "catchup_rpc", "bootstrap_install", "retention_time"}
+var recoveryStages = [...]string{"full_export", "retained_export", "retained_page", "checksum", "chunk_read", "chunk_receive", "detached_copy", "detached_read", "metadata_rpc", "replica_rpc", "retained_scan", "bootstrap_file", "lineage", "catchup_rpc", "bootstrap_install", "retention_time", "consumer_replay", "consumer_index", "consumer_frames"}
 var recoveryUnits = [...]string{"read_bytes", "write_bytes", "hash_bytes", "transfer_bytes", "decoded_frames", "decoded_bytes", "sync_calls", "pages", "cache_hits", "cache_misses", "retries", "canonical_hash_bytes"}
 
 var recoveryWork = prometheus.NewCounterVec(prometheus.CounterOpts{

@@ -12,15 +12,46 @@ import (
 )
 
 type stagedConsumerMetadata struct {
-	ch             *CommandHandler
-	ctx            context.Context
-	releaseContext func()
-	count          int
-	leases         map[int]*topic.DetachedMetadataLease
-	sources        map[int]ConsumerMetadataRecoverySource
-	done           func(error)
-	once           sync.Once
-	closeErr       error
+	ch                *CommandHandler
+	ctx               context.Context
+	releaseContext    func()
+	count             int
+	leases            map[int]*topic.DetachedMetadataLease
+	sources           map[int]ConsumerMetadataRecoverySource
+	historyIdentities map[int]string
+	done              func(error)
+	once              sync.Once
+	closeErr          error
+}
+
+// These methods deliberately do not implement ConsumerMetadataIndexReader:
+// adopted transfer evidence is process-local, not a durable startup index.
+func (s *stagedConsumerMetadata) ConsumerHistoryIdentity(p int) (string, error) {
+	if err := s.ctx.Err(); err != nil {
+		return "", err
+	}
+	lease, err := s.lease(config.ConsumerOffsetsTopicName, p)
+	if err != nil || s.historyIdentities[p] == "" {
+		return "", fmt.Errorf("staged history generation unavailable")
+	}
+	b := lease.Bounds()
+	return fmt.Sprintf("%s:%d:%d:%d:%d", s.historyIdentities[p], b.StartOffset, b.EndOffset, b.RawBytes, b.IndexBytes), nil
+}
+
+func (s *stagedConsumerMetadata) ReadRawConsumerHistory(p int, next uint64, max int) ([]types.Message, error) {
+	lease, err := s.lease(config.ConsumerOffsetsTopicName, p)
+	if err != nil {
+		return nil, err
+	}
+	return lease.ReadRawMetadata(s.ctx, next, max)
+}
+
+func (s *stagedConsumerMetadata) ReadConsumerCleanupPage(p int, next uint64, maxRecords, maxBytes int) (types.ReplayPage, error) {
+	lease, err := s.lease(config.ConsumerOffsetsTopicName, p)
+	if err != nil {
+		return types.ReplayPage{}, err
+	}
+	return lease.ReadCleanupPage(s.ctx, next, maxRecords, maxBytes)
 }
 
 func (s *stagedConsumerMetadata) Sources() map[int]ConsumerMetadataRecoverySource {

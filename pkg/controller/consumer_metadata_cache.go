@@ -29,6 +29,7 @@ type consumerMetadataCacheEntry struct {
 	request     fsm.BootstrapBeginRequest
 	bounds      disk.DetachedRawBounds
 	certificate string
+	generation  string // first certificate of this adopted raw generation
 	store       *topic.DetachedMetadataStore
 }
 
@@ -115,6 +116,9 @@ func (ch *CommandHandler) ConfigureConsumerMetadataRecovery(ctx context.Context,
 	c.constructStore = topic.NewDetachedMetadataStore
 	ch.consumerRecoveryCache = c
 	ch.SetConsumerMetadataRecoveryProvider(c.stage)
+	if ch.Coordinator != nil {
+		ch.Coordinator.SetConsumerCleanupProvider(ch.prepareConsumerCleanup)
+	}
 	// This one process-lifetime observer never owns a stage or a staged lease.
 	go func() { <-ownerCtx.Done(); _ = c.close() }()
 	return nil
@@ -210,7 +214,7 @@ func (c *consumerMetadataRecoveryCache) stage(ctx context.Context, request Consu
 	}
 	readCtx, cancelRead := context.WithCancel(callerCtx)
 	stopRead := context.AfterFunc(c.ctx, cancelRead)
-	staged := &stagedConsumerMetadata{ch: c.ch, ctx: readCtx, releaseContext: func() { stopRead(); cancelRead() }, count: len(request.Metadata), leases: make(map[int]*topic.DetachedMetadataLease), sources: make(map[int]ConsumerMetadataRecoverySource)}
+	staged := &stagedConsumerMetadata{ch: c.ch, ctx: readCtx, releaseContext: func() { stopRead(); cancelRead() }, count: len(request.Metadata), leases: make(map[int]*topic.DetachedMetadataLease), sources: make(map[int]ConsumerMetadataRecoverySource), historyIdentities: make(map[int]string)}
 	for _, p := range request.Partitions {
 		entry := c.entries[p]
 		lease, err := entry.store.Acquire()
@@ -219,6 +223,7 @@ func (c *consumerMetadataRecoveryCache) stage(ctx context.Context, request Consu
 			return nil, err
 		}
 		staged.leases[p] = lease
+		staged.historyIdentities[p] = entry.generation
 		s := entry.request.Source
 		staged.sources[p] = ConsumerMetadataRecoverySource{BrokerID: s.BrokerID, IncarnationID: s.IncarnationID, IncarnationEpoch: s.IncarnationEpoch}
 	}

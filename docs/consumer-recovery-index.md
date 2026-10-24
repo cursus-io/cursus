@@ -9,7 +9,7 @@ partition. Cleanup checkpoints and detached transfer staging did not replace
 that scan, and the audit did not establish an end-to-end cold-start speedup.
 
 The integration base is official main
-`544b38739fc5cea3721640eb88cdd0758ab0d4c9` (2026-10-24). It already contains
+`d5b8d773ad215362c80ee46a2a8764c37ead9728` (2026-10-24). It already contains
 the derived ordinary recovery index and separately gated certified ordinary
 history maintenance introduced after that audit. The generic distributed
 internal-topic compaction guard remains in `pkg/disk/compaction.go`. Full replay

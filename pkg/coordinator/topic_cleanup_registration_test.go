@@ -336,6 +336,24 @@ func TestTruncateCleanupRegistrationChangesBetweenPasses(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestTruncateCleanupRefreshesChangedMembershipTarget(t *testing.T) {
+	c, log := newCleanupFollower(t)
+	c.topicHandler = &boundaryCleanupLog{log}
+	log.append(cleanupMessage(t, ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordRegistration, Group: "workers", Topic: "orders", PartitionCount: 1, Epoch: 1}))
+	b := &TopicCleanupBoundary{TopicEpoch: 2, MetadataEpoch: 1, Ends: []uint64{1}}
+	_, err := c.ReconcileTopicGroupsContext(context.Background(), "orders", func() bool { return true }, b)
+	require.ErrorContains(t, err, "waiting for a newer committed group tombstone")
+	group := c.GetGroup("workers")
+	group.mu.Lock()
+	group.Generation++ // Membership may change between bounded reconciliation passes.
+	group.mu.Unlock()
+	log.append(cleanupMessage(t, cleanupDeletion()))
+	deleted, err := c.ReconcileTopicGroupsContext(context.Background(), "orders", func() bool { return true }, b)
+	require.NoError(t, err)
+	require.Equal(t, []string{"workers"}, deleted)
+	require.Nil(t, c.GetGroup("workers"))
+}
+
 func TestTruncateCleanupRemovesOnlyStaleLocalIncarnation(t *testing.T) {
 	c, log := newCleanupFollower(t)
 	c.topicHandler = &boundaryCleanupLog{log}

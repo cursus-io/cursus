@@ -45,8 +45,19 @@ type ConsumerCleanupView interface {
 	Read(partition int, offset uint64, cursor types.ReplayCursor, maxRecords, maxBytes int) (ConsumerCleanupPage, error)
 }
 
-type consumerCleanupReader interface {
+type ConsumerCleanupReader interface {
 	WithConsumerCleanupView(func(ConsumerCleanupView) error) error
+}
+
+type consumerCleanupReader = ConsumerCleanupReader
+
+// SetConsumerCleanupProvider installs optional detached preparation. Preparation
+// may perform network I/O; view callbacks and proof checks must be local-only.
+// It must not import coordinator state or renew member/ownership clocks.
+func (c *Coordinator) SetConsumerCleanupProvider(provider func(context.Context) (ConsumerCleanupReader, func(), error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupProvider = provider
 }
 
 // TopicCleanupPending is structured progress for a committed topic intent that
@@ -113,6 +124,7 @@ type topicCleanupScan struct {
 	completed           map[string]*cleanupTarget
 	completedPartitions []ConsumerCleanupPartition
 	validated           bool
+	checkProof          func([]ConsumerCleanupPartition) error
 	boundary            *TopicCleanupBoundary
 	current             func() bool
 	targets             map[string]*cleanupTarget
@@ -164,9 +176,13 @@ func (c *Coordinator) CheckTopicGroupCleanup(topicName string, boundaries ...*To
 		defer c.cleanupMu.Unlock()
 		candidate := c.cleanupProgress[topicName]
 		if candidate != nil && candidate.validated && reflect.DeepEqual(candidate.boundary, boundary) && candidate.matches(candidate.partitions) {
+			check := candidate.checkProof
 			if validator, ok := c.topicHandler.(interface {
 				CheckConsumerCleanupProof([]ConsumerCleanupPartition) error
-			}); ok && validator.CheckConsumerCleanupProof(candidate.partitions) == nil {
+			}); ok && check == nil {
+				check = validator.CheckConsumerCleanupProof
+			}
+			if check != nil && check(candidate.partitions) == nil {
 				scan = candidate
 			}
 		}
@@ -231,6 +247,7 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 	// holding lifecycleMu or the metadata read view.
 	c.mu.RLock()
 	checkOwner := c.groupOwnerChecker
+	provider := c.cleanupProvider
 	c.mu.RUnlock()
 	owners := make(map[string]bool)
 	references := c.TopicGroupReferences(topicName)
@@ -251,6 +268,17 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		}
 	}
 
+	reader, ok := c.topicHandler.(consumerCleanupReader)
+	if provider != nil && len(references) > 0 {
+		prepared, closePrepared, err := provider(ctx)
+		if closePrepared != nil {
+			defer closePrepared()
+		}
+		if err != nil {
+			return nil, err
+		}
+		reader, ok = prepared, prepared != nil
+	}
 	if !c.lifecycleMu.TryLock() {
 		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "group lifecycle busy"}
 	}
@@ -261,6 +289,9 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		c.removeCleanupCheckpoint(topicName)
 		return nil, nil
 	}
+	if !ok {
+		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "committed metadata view unavailable"}
+	}
 	references = c.pendingCleanupReferences(references, previous, boundary)
 	for _, reference := range references {
 		// Stale members may be covered by a committed deletion. The remaining
@@ -269,10 +300,6 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		if err := reference.validateCleanup(topicName); err != nil && (boundary == nil || reference.Shared || reference.Pattern) {
 			return nil, err
 		}
-	}
-	reader, ok := c.topicHandler.(consumerCleanupReader)
-	if !ok {
-		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "committed metadata view unavailable"}
 	}
 	if c.cleanupProgress == nil {
 		c.cleanupProgress = make(map[string]*topicCleanupScan)
@@ -433,6 +460,12 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		return deleted, &status
 	}
 	scan.validated = true
+	scan.checkProof = nil
+	if validator, ok := reader.(interface {
+		CheckConsumerCleanupProof([]ConsumerCleanupPartition) error
+	}); ok {
+		scan.checkProof = validator.CheckConsumerCleanupProof
+	}
 	if boundary != nil {
 		if scan.completed == nil {
 			scan.completed = make(map[string]*cleanupTarget)
@@ -532,7 +565,11 @@ func (c *Coordinator) cleanupTargetsCurrent(scan *topicCleanupScan, refs []Topic
 			return false
 		}
 		group.mu.RLock()
-		same := group.RegistrationEpoch == target.epoch && (scan.boundary != nil || (group.Generation == target.generation && cooperativeRevision(group) == target.cooperativeRevision))
+		// The deletion apply check fences membership as well as registration.
+		// Refresh a changed target instead of retaining a scan that can never
+		// satisfy that check. Completed preserved registrations are filtered
+		// separately and remain independent of membership changes.
+		same := group.RegistrationEpoch == target.epoch && group.Generation == target.generation && cooperativeRevision(group) == target.cooperativeRevision
 		group.mu.RUnlock()
 		if !same {
 			return false
@@ -738,6 +775,16 @@ func (scan *topicCleanupScan) observeAt(message types.Message, partition int) er
 	record, versioned, err := decodeConsumerMetadataRecord(message.Payload)
 	if err != nil || !versioned || message.Key != consumerMetadataRecordKey(record) {
 		return fmt.Errorf("invalid consumer metadata for group %q", identity.Group)
+	}
+	if record.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot {
+		// Raw transaction intents do not materialize group state and cannot
+		// authorize cleanup. Validate their envelope before ignoring them;
+		// current reservations remain protected by lifecycle admission.
+		if message.TransactionalID != record.TransactionalID || message.ProducerID != record.ProducerID || message.Epoch != record.ProducerEpoch ||
+			(message.TransactionState != types.TransactionStateOpen && message.TransactionState != types.TransactionStateCommitted) {
+			return fmt.Errorf("invalid transactional cleanup evidence for group %q", identity.Group)
+		}
+		return nil
 	}
 	// Group lifecycle records are nontransactional. A transaction (even an
 	// aborted/open one) can never supply deletion authority.

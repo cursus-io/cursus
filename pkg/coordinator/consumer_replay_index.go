@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -104,6 +105,7 @@ func (r *indexedMetadataReader) load() {
 	}
 	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(io.LimitReader(f, consumerReplayIndexLimit+1))
+	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerIndex, metrics.RecoveryReadBytes, int64(len(data)))
 	if err != nil || len(data) > consumerReplayIndexLimit {
 		return
 	}
@@ -386,6 +388,7 @@ func writeConsumerReplayIndex(path string, data []byte, after func(string) error
 	}
 	defer func() { _ = os.Remove(f.Name()) }()
 	n, err := f.Write(data)
+	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerIndex, metrics.RecoveryWriteBytes, int64(n))
 	if err == nil && n != len(data) {
 		err = io.ErrShortWrite
 	}

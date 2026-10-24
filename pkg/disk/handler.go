@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 	"golang.org/x/exp/mmap"
@@ -761,6 +762,16 @@ func (dh *DiskHandler) ReadMessagesBounded(offset uint64, maxRecords, maxBytes i
 }
 
 func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, position uint64, max, maxBytes int, allowOversizedFirst bool, targetOffset, segmentBase uint64, allowPartialTail, allowOffsetGaps bool) ([]types.Message, int, bool, error) {
+	var readBytes, frames int64
+	if dh.internalMetadata {
+		defer func() {
+			// Actual mmap ReadAt return counts, including rejected headers,
+			// partial failures and retries. This is logical frame I/O, not
+			// physical device I/O and not merely visible key/payload bytes.
+			metrics.RecordRecoveryBytes(metrics.RecoveryConsumerFrames, metrics.RecoveryReadBytes, readBytes)
+			metrics.RecordRecoveryBytes(metrics.RecoveryConsumerFrames, metrics.RecoveryDecodedFrames, frames)
+		}()
+	}
 	if position > math.MaxInt {
 		return nil, 0, false, fmt.Errorf("read position %d exceeds int range", position)
 	}
@@ -780,8 +791,10 @@ func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, po
 	havePreviousOffset := false
 
 	for len(messages) < max && pos+4 <= reader.Len() {
-		if _, err := reader.ReadAt(lenBuf[:], int64(pos)); err != nil {
-			return nil, decodedBytes, false, fmt.Errorf("read length at byte %d: %w", pos, err)
+		n, readErr := reader.ReadAt(lenBuf[:], int64(pos))
+		readBytes += int64(n)
+		if readErr != nil {
+			return nil, decodedBytes, false, fmt.Errorf("read length at byte %d: %w", pos, readErr)
 		}
 
 		msgLen := binary.BigEndian.Uint32(lenBuf[:])
@@ -804,14 +817,17 @@ func (dh *DiskHandler) readMessagesFromPositionBounded(reader *mmap.ReaderAt, po
 		} else {
 			dataBuf = dataBuf[:msgLen]
 		}
-		if _, err := reader.ReadAt(dataBuf, int64(pos+4)); err != nil {
-			return nil, decodedBytes, false, fmt.Errorf("read payload at byte %d: %w", pos, err)
+		n, readErr = reader.ReadAt(dataBuf, int64(pos+4))
+		readBytes += int64(n)
+		if readErr != nil {
+			return nil, decodedBytes, false, fmt.Errorf("read payload at byte %d: %w", pos, readErr)
 		}
 
 		diskMsg, err := util.DeserializeDiskMessage(dataBuf)
 		if err != nil {
 			return nil, decodedBytes, false, fmt.Errorf("decode message at byte %d: %w", pos, err)
 		}
+		frames++
 		if !havePreviousOffset && pos == 0 && !allowOffsetGaps && diskMsg.Offset != segmentBase {
 			return nil, decodedBytes, false, fmt.Errorf("unexpected first offset at byte %d: got %d for segment base %d", pos, diskMsg.Offset, segmentBase)
 		}

@@ -10,6 +10,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/disk"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -17,6 +18,7 @@ import (
 var ErrConsumerRecoveryPending = errors.New("consumer metadata local recovery pending")
 
 type consumerRecoveryReader struct {
+	measureReplay      bool
 	indexTopicInstance string
 	repairGenerations  map[int]disk.ContentGeneration
 	ctx                context.Context
@@ -41,7 +43,8 @@ func (r *consumerRecoveryReader) EarliestTopicOffset(_ string, p int) (uint64, e
 func (r *consumerRecoveryReader) EndTopicOffset(_ string, p int) (uint64, error) {
 	return r.ends[p], r.ctx.Err()
 }
-func (r *consumerRecoveryReader) ReadCommittedConsumerMetadata(_ string, p int, offset uint64, max int) ([]types.Message, error) {
+func (r *consumerRecoveryReader) ReadCommittedConsumerMetadata(_ string, p int, offset uint64, max int) (messages []types.Message, err error) {
+	defer func() { r.observeReplayRead(messages) }()
 	if err := r.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -107,7 +110,9 @@ func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context
 		if err := ch.validateConsumerRecoveryPlan(plan, metadata); err != nil {
 			return err
 		}
-		return ch.withConsumerRecoveryPlan(ctx, plan, -1, nil, func(reader *consumerRecoveryReader) error {
+		return ch.withConsumerRecoveryPlan(ctx, plan, -1, nil, func(reader *consumerRecoveryReader) (replayErr error) {
+			reader.measureReplay = true
+			defer func() { metrics.RecordRecoveryAttempt(metrics.RecoveryConsumerReplay, replayErr) }()
 			var prepared *coordinator.PreparedConsumerMetadataReplay
 			var err error
 			if plan.legacy {
@@ -159,6 +164,20 @@ func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context
 		return fmt.Errorf("%w: %v", ErrConsumerRecoveryPending, err)
 	}
 	return err
+}
+
+func (r *consumerRecoveryReader) observeReplayRead(messages []types.Message) {
+	if !r.measureReplay {
+		return
+	}
+	metrics.RecordRecoveryWork(metrics.RecoveryConsumerReplay, metrics.RecoveryPages, 1)
+	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerReplay, metrics.RecoveryDecodedFrames, int64(len(messages)))
+	var decodedBytes int64
+	for _, m := range messages {
+		decodedBytes += int64(len(m.Key) + len(m.Payload))
+	}
+	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerReplay, metrics.RecoveryDecodedBytes, decodedBytes)
+	consumerReplayMeasurementFault(len(messages))
 }
 
 func (ch *CommandHandler) consumerReadinessError() error {

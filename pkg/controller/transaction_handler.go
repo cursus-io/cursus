@@ -490,6 +490,9 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 		var epochErr error
 		registrationEpoch, epochErr = ch.transactionGroupRegistrationEpoch(groupID, offsetTopic, offsetPairs[0].Partition)
 		if epochErr != nil {
+			if epochErr == coordinator.ErrConsumerMetadataRecovering {
+				return epochErr.Error()
+			}
 			return fmt.Sprintf("ERROR: transaction_offset_prepare_failed reason=%q", epochErr.Error())
 		}
 	}

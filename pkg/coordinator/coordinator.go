@@ -60,6 +60,7 @@ type Coordinator struct {
 
 	cleanupMu       sync.Mutex
 	cleanupProgress map[string]*topicCleanupScan
+	cleanupProvider func(context.Context) (ConsumerCleanupReader, func(), error) // guarded by mu
 }
 
 type TopicHandler interface {

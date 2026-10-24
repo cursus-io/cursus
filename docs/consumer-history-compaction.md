@@ -1,10 +1,85 @@
 # Consumer history compaction
 
+The [acceptance evidence](consumer-history-acceptance-evidence.md) maps the
+current tests to recovery and durability requirements and labels historical
+measurements by source commit. The experiments below retain earlier failures
+and partial results; they are not all measurements of the current head.
+The completed [whole-broker scaling report](consumer-history-whole-broker-results.md)
+contains the hosted Linux 100 / 1,000 / 10,000 baseline/fix matrix, physical
+retained-log bounds, cache-miss recovery and all measured costs.
+
+## Remaining-work design and regression contract
+
+The follow-up compares against Apache Kafka release commit
+`13f70256db3c994c590e5d262a7cc50b9e973204` (4.1.0), specifically
+`LogCleaner.java` and `OffsetMetadataManager.java`, and accepted KIP-848.
+Kafka protects producer continuity and retains a transaction marker until its
+associated batches are gone. Cursus must additionally prove that old consumer
+intents cannot still be materialized and preserve registration epochs,
+reservations, decisions and physical provenance. Neither Kafka's retained-log
+replay nor KIP-848 provides a persistent Cursus current-state snapshot.
+
+The extension uses version-7 intents and the stable `txn-history:<id>:<decision>`
+control producer, enabled only by a second durable protocol gate. A committed
+higher producer epoch for the same transaction ID and producer is the retirement
+witness; **mutable transaction-manager state is never deletion authority**. The
+new epoch must have a physical intent inside the certified committed cut. Both
+the retired and witness intents must be version 7. Version-3 history predates
+some materialization guards and is deliberately retained as a finite upgrade
+prefix, not retroactively certified by newer code.
+
+Initialization holds the per-ID lock through old reservation release, committed
+offset materialization and Raft acknowledgement. SEND_OFFSETS uses the same lock.
+A later version-7 physical intent therefore proves an earlier version-7 epoch
+cannot still materialize offsets. Valid, consistent terminal controls are also
+required. Pending/current epochs, conflicting controls and producer recovery
+witnesses survive. Controls are removed only after all their intents are absent
+or removed by the same atomic segment publication. Control sequence numbers are
+the positive coordinator epoch; ownership movement advances sequence without
+creating another producer ID. Old control identities remain protected.
+
+A whole closed-prefix certificate can be reused for an ordered segment sweep
+only when every target group's ordinary state has one physical source, each semantic key advances
+epoch/revision, and lifecycle formats stay constant within an epoch. The retained
+final witnesses then preserve **every intermediate state**, not just final replay
+equivalence. Other histories use the conservative single-segment path. Each
+publication reacquires admission/FSM/storage fences and validates all identities;
+only its own successful rewrite can advance the certificate generation. Scanning
+uses the monitor's cancellation context, avoiding a fixed one-minute deadline
+that could restart a large scan forever. Each individual admission acquisition
+still has a 250 ms bound. When the FSM fence was never entered, publication can
+retry the existing certificate up to 16 times, releasing admission and waiting
+100 ms between attempts. A failure after entry discards the certificate. Metrics
+include successful earlier segments even when a later segment defers. No live membership or ownership clock is imported.
+
+Version-7 transactional intents may reside on another physical partition. They
+do not supply materialized offset state and use the separate retirement proof;
+the final intent preserves that source's provenance and producer continuity.
+Cross-partition transaction tests replay after every single-frame publication,
+including each gap between intent and control removal. Ordinary multi-source
+histories still require conservative single-segment certification.
+
+Nonreplica partitions use the existing budgeted detached-transfer cache, with
+raw reads and immutable adopted-prefix generation. Before publication, refresh
+source certificates outside local admission/FSM locks and revalidate topology,
+source/requester incarnations and the fixed committed vector. Replacement or
+certificate loss changes the adopted identity and discards the proof. This does
+not turn a remote transfer cache into a normal-startup index.
+
+Before enabling deletion, regression checks cover committed/aborted epochs,
+pending/current epochs, legacy records, missing/conflicting/late controls,
+producer changes, exact cuts, restore, cross-segment controls, repeated recovery,
+and abrupt process exit at all nine replacement durability stages. Compare full
+state, physical provenance and raw producer/control recovery. Whole-broker
+measurements remain separate from these correctness tests.
+
 ## Implementation and rollout contract
 
-Official main `17fa455` contains the large-record, durable append-time,
-cooperative ownership/recovery and recovery scheduling changes. They are incorporated through the
-existing PRs. Production metadata
+The current integration base is official main
+`d5b8d773ad215362c80ee46a2a8764c37ead9728`, including the cooperative runtime
+protocol and snapshot contract. The earlier audit base
+`9c43d398eecc387ae0011bb7900b54a74a0b0d8d` already contained the large-record,
+durable append-time and recovery scheduling changes. Production metadata
 uses producer ID `consumer-offset-coordinator`; fixtures must use that ID too.
 Keep both the last physical producer record and the maximum positive
 epoch/sequence/offset record used by partition recovery. Kafka 4.1.0 LogCleaner
@@ -18,7 +93,7 @@ segment. Ordinary suffix appends may advance the committed end; prefix changes,
 restore, lifecycle or compatibility changes invalidate the work. No live state
 is installed and membership clocks are never rewritten. Empty interior segments
 are removed using the durable deletion protocol; the first logical-start anchor
-and active tail remain. No-op candidates do not acquire a publication lease.
+and active tail remain. Sweep no-op ranges still validate the certificate before advancing to the next range.
 
 Before activation, test real producer-bearing records, non-monotonic producer
 epochs/sequences, changed source generations, canceled work, concurrent suffix
@@ -29,8 +104,8 @@ producer/control state have an equivalent certified representation.
 
 ## Scope and comparison before implementation
 
-The implementation base is official main
-`17fa455`. Its distributed internal-topic
+The pre-implementation comparison used official main
+`9c43d398eecc387ae0011bb7900b54a74a0b0d8d`. The distributed internal-topic
 compaction guard remains necessary. The recovery index is disposable and must
 never authorize deleting authoritative records.
 
@@ -57,9 +132,9 @@ removal list is bound to all partition identities and committed bounds, the
 exclusive lease and compatibility generation. Raw and committed scans must
 agree for ordinary records. Legacy batches, inferred registrations, orphan
 future epochs and unrecognized physical transaction formats are rejected.
-Versioned transaction intents and validated control frames are preserved in
-full, including invisible pending/aborted transactions. They never authorize
-removing ordinary snapshots. Completed transactions materialize ordinary offset
+Legacy/current transaction intents and their controls are preserved. Version-7
+retirement follows the additional proof above, including invisible aborted
+intents. Transaction evidence never authorizes removing ordinary snapshots. Completed transactions materialize ordinary offset
 snapshots separately; those snapshots may be compacted after replay equivalence.
 Reservation and decision snapshots remain ordinary metadata and are compared in
 full. Certification never installs replayed state or changes membership clocks.
@@ -91,8 +166,8 @@ tail, original offsets, topic/partition identity and producer continuity.
 - Disk replacement faults before source generation invalidation, after marker
   publication, after log replacement and after index replacement. Reopen and
   replay both possible durable outcomes; no recovery cache is required.
-- Producer recovery witnesses, control/transaction records and uncommitted tails are never selected
-  for deletion. Bootstrap and snapshot replacement must invalidate old plans.
+- Producer recovery witnesses, unresolved/current transaction records and
+  uncommitted tails survive. Bootstrap and snapshot replacement invalidate plans.
 
 ## Format, upgrade and downgrade
 
@@ -106,27 +181,44 @@ Activation is stored in the Raft FSM snapshot. Registration rejects older
 capabilities afterward; voter admission already requires registration with the
 current protocol. Turning the flag off stops maintenance, not the durable gate.
 
-The local Raft recovery marker is **13**. A supported marker-12 volume is first
-replayed successfully, then atomically upgraded and synced before this binary
-can advertise its new capability. Previous binaries reject marker 13. Snapshot
-versions 11 and 12 carry optional activation evidence (12 when cooperative
-ownership is present); older strict decoders reject that field after activation.
-Metadata record versions and original frame bytes are
-unchanged. Perform a coordinated upgrade with complete immutable backups; mixed
-release operation and in-place downgrade are unsupported. Restore a complete
-pre-upgrade backup into isolated volumes to return to an older binary. Never
-edit/remove the marker or activation field to bypass the boundary.
+The leader then commits `CONSUMER_TRANSACTION_HISTORY_ACTIVATE` only when every
+registered broker and voter supports lifecycle protocol **12**. The second flag
+is persisted in snapshot **14**; restoring a flag with an older snapshot version,
+missing ordinary history gate or incapable broker is rejected. Writers emit
+metadata v7 and stable history controls only after that gate. Before activation,
+writers retain v3 and existing control identities. New binaries read both.
 
-No retention or large-record functionality is duplicated. The merged storage
-changes on the stated official main are prerequisites, not assumed open work.
+The local Raft recovery marker is **15**. Supported marker-9 through marker-14
+volumes are replayed first, then atomically upgraded and synced before capability
+advertisement. Older binaries reject marker 15; active snapshot 14 also fails
+closed. Unactivated snapshots keep the existing version 11/12/13 contract. Turning
+configuration off stops maintenance but does not reverse either durable gate or
+new writer format. In-place downgrade is unsupported. Restore a complete
+pre-upgrade backup into isolated volumes; never edit a marker or activation flag.
+
+Replay index v2 is **derived**, not authoritative. It stores selected ordinary
+records, compatibility/source provenance and all certified raw v7 transaction
+evidence. Reuse resolves each cached intent against the current committed read
+view, so a formerly pending decision cannot be cached as permanently invisible.
+Reservations and decisions remain complete ordinary snapshots. V1 ordinary-only
+indexes remain readable; a legacy or incompatible transactional range falls back
+to full replay. A lost/corrupt/unsupported index changes recovery work, not state.
+The 32 MiB cache limit remains an explicit fallback boundary. Transaction evidence
+cost is proportional to retained transactions, not discarded ordinary revisions.
+
+No retention or large-record functionality is duplicated. The large-record and
+retention issues are both closed as of 2026-10-24; closure alone is not evidence
+that a particular follow-up implementation was merged. Only the already merged
+durable broker-time implementation (PR #300, commit `2260df1`) is a prerequisite.
+No unverified retention follow-up or its acceptance evidence is assumed.
 
 Removing historical revisions necessarily removes the ability to diagnose
 conflicts with those discarded revisions later. Activation accepts that
 validation boundary and rejects pre-activation writers. The ordinary distributed
 internal-topic compactor remains blocked. Only the separate certified path may
 rewrite a closed, fully committed range with all replicas caught up and eligible.
-All metadata partitions must be available as ordinary local read views; missing
-coverage defers work instead of transferring or certifying a partial state.
+All metadata partitions must have fixed certified coverage, either local views
+or existing detached transfers. Missing or stale coverage defers publication.
 
 ## Recovery and cost contract of this layer
 
@@ -164,26 +256,30 @@ bootstrap scans would correctly reject an unexplained trailing gap. Crash tests
 cover both the predecessor-marker boundary and completed empty-segment deletion.
 
 The recovery scheduler from the updated main continues to own bootstrap/transfer
-admission. This maintenance path uses ordinary local read views and its own
-interval/deadline; it does not add a remote transfer or another scheduler.
+admission. Maintenance uses ordinary local read views and the existing budgeted
+detached transfer cache for nonreplicas, with its own interval/cancellation.
+It does not introduce a separate transfer scheduler.
 Linux race regressions cover the consumer bootstrap staging and installation
 slot ordering together with replay and compaction. Native Windows bootstrap
 fixtures can reject a low-space host before exercising recovery (the default
 5% reserve required 24.6 GB on the validation host). The same checks pass in the
 isolated Linux filesystem; the production reserve is not lowered to run them.
 
-The current certification deliberately replays all partitions twice and scans
-the raw committed records once **per candidate segment**. A filtered page can
+Conservative certification replays all partitions twice and scans the raw
+committed records once per candidate segment. A subsequence-safe sweep performs
+that certification once for the selected partition's closed prefix, then
+revalidates and publishes each segment separately. A filtered page can
 end before its consumed source page: the sequential candidate reader retains
 the consumed position separately from the last returned offset, so removed
 trailing records are not read again within that pass. This cursor lives only
 inside one certification; an error or retry starts from the original bounds.
 It is not a durable checkpoint or an authority to skip validation. Scanning does
 not hold a live recovery lease; publication does and includes storage reads and
-fsync. Maintenance processes one segment per configured compaction interval with
-a one-minute attempt deadline. This bounds each attempt but does not prove that
-maintenance keeps up with an arbitrary append rate. Transaction intent/control
-frames remain protected. Distinct deleted-group fences and reservation-decision
+fsync. Maintenance yields between publications and waits the configured interval
+between partition passes. Scanning is cancellable without a fixed restart
+deadline. This does not prove maintenance keeps up with an arbitrary append
+rate or segment-creation rate. Transaction intent/control frames require the
+additional v7 retirement proof. Distinct deleted-group fences and reservation-decision
 state can still grow: this is not a bound on every consumer metadata workload.
 
 Observe `cursus_consumer_history_runs_total{result}` for completed/deferred/skipped
@@ -316,21 +412,21 @@ new timing. Neither sequence drops OS caches. Broker CPU/peak heap/device I/O,
 transfer bytes and total fsync counts were not measured in this cluster sample;
 the local-storage measurements above must not be substituted for them.
 
-The current production path requires all metadata partitions to have ordinary
-local committed coverage. Layouts lacking that coverage defer compaction; they
-do not acquire partial deletion authority or reuse remote transfer caches as
-current-state snapshots.
+That integration revision required all metadata partitions to have ordinary
+local committed coverage. The current extension adds separately certified
+nonreplica sources as described above. Remote transfer caches still do not
+become current-state startup snapshots.
 
-Whole cold broker startup/failover across the history ladder, transactional
-intent/control history reclamation, and a proven maintenance-throughput bound
-and compaction without complete local metadata coverage remain separate acceptance
-conditions. Retaining necessary deleted-name fences
+Those results did not validate whole cold broker startup/failover across the
+history ladder, transactional intent/control history reclamation, maintenance
+throughput or compaction without complete local metadata coverage. The current
+follow-up must validate these separately. Retaining necessary deleted-name fences
 or decisions is authoritative state growth, and is not bounded by live-group
 count alone. Do not close the history-growth issue based only on these results.
 
 ## Sequential certification reads (2026-10-24)
 
-The follow-up baseline is official main `9c43d39`, which includes both recovery
+This historical comparison used official main `9c43d39`, which includes both recovery
 index and ordinary history compaction. Kafka comparison was checked again
 against the **4.1.0 release commit**
 [`13f70256db3c994c590e5d262a7cc50b9e973204`](https://github.com/apache/kafka/tree/13f70256db3c994c590e5d262a7cc50b9e973204).
@@ -411,3 +507,184 @@ comparison of cold startup or a measurement of the newly rebased head. Shutdown
 and cache removal are excluded from the restart timer. Broker CPU, peak heap,
 physical I/O, network transfer and complete fsync counts were not collected.
 The full history ladder and resource measurements remain required separately.
+
+## Whole-broker experiment
+
+Publication temporarily closes consumer admission. If it starts between command
+preflight and coordinator routing, routing preserves the same retryable
+`consumer_metadata_recovering` response. The tests count these retries in request
+completion latency; they do not rejoin members or retry epoch/ownership failures.
+
+Ordered sweeps leave an admission-free interval between segment publications:
+at least 25 ms and at least the elapsed preceding publication time. The next
+publication revalidates the certificate after that interval. Background passes
+wait the configured interval after completion, rather than immediately consuming
+an overdue ticker event. This limits consecutive maintenance exclusion, including
+slow fsyncs, without weakening committed-cut or generation checks. It does not
+promise a maximum syscall latency or eliminate cross-broker contention.
+
+Publication must also acquire the partition reconciliation and visibility gates
+nonblockingly while holding the FSM fence. Replication owns a shared mutation
+gate until its Raft decision applies; waiting for that gate under the FSM fence
+deadlocks the decision that would release it. A busy partition has not entered
+the installer: release admission/FSM, back off, and retry the same certificate
+with every identity and committed-cut check repeated. Validation/storage errors
+after entry still discard the plan. A real three-node transaction test exposed
+this lock cycle; spacing publications alone did not fix it.
+
+Cleanup on a nonreplica stages the missing committed raw prefixes through the
+same bounded, certified transfer cache as recovery, before taking coordinator
+lifecycle/global locks. Local read callbacks fence FSM transitions and validate
+topic incarnation, topology, committed cuts and source/requester incarnations.
+The final materialization check performs only nonblocking in-memory validation.
+These remote proofs are ephemeral: they never become a durable cleanup
+checkpoint or startup index. Replacement, restore, rollback or process/topology
+changes require fresh evidence. No cleanup view imports the complete group state
+or renews unrelated membership clocks. If membership changes between bounded
+passes, the deletion target is refreshed so its generation fence can converge.
+
+`cursus_recovery_work_total{stage="consumer_replay"}` counts every source-adapter
+page and returned record/key-payload byte, including partial errors and repeated
+attempts. It excludes in-memory projection reads and maintenance certification,
+which has separate counters. Raw reads count returned uncommitted tails as work,
+never as certified state. `stage="consumer_index"` counts actual cache file
+read/write bytes even when parsing or publication fails. These cumulative counters
+also distinguish completed preparations that hit or miss the index; whole-broker
+experiments assert the requested path actually occurred on each broker. The
+maintenance experiment probes ordinary offset reads without changing the seeded
+history and reports completion latency (including SDK retries), successes and
+returned errors separately. These cumulative counters
+must accompany the last-recovery gauges; a later hit does not erase earlier work.
+Underlying detached/file counters can overlap these logical layers and must not
+be summed as physical I/O. Process counters reset on restart; interrupted runs
+must retain each process sample separately to claim cumulative resource totals.
+
+`stage="consumer_frames"` measures the bounded internal-metadata range parser's
+actual mmap read return bytes and successfully decoded frames, including length
+headers rejected by the byte budget, records preceding the requested offset,
+partial failures and repeated reads. It includes recovery, ordinary metadata
+fetches and maintenance using that parser; it does not cover every disk read
+path. These are logical frame bytes, separate from replay key/payload bytes and
+Linux guest physical I/O. Counters are aggregated once per parser call.
+
+`RUN_E2E_CONSUMER_HISTORY_MEASURE=1 CURSUS_CLEANUP_PORT_OFFSET=34000`
+with `CURSUS_HISTORY_MEASURE_OUTPUT` set to a new JSONL file runs
+`TestConsumerHistoryWholeBrokerLadder`. It requires Docker and uses only that
+fixture's project, network, shifted ports and volumes. The default ladder is
+100/1,000/10,000 acknowledged revisions per each of four groups. The baseline
+is the same binary with maintenance disabled; initial setup, seeding, maintenance
+including restart, individual startup modes and coordinator failover are separate
+rows. Existing historical commit comparisons above remain a different experiment.
+
+The measurement layout uses 64 KiB segments, 1 MiB indexes and a 60 s roll
+interval, with the same layout for baseline and fix. The header records these
+values and the sampler records retained segment counts as well as bytes.
+`CURSUS_HISTORY_MEASURE_ROLL_MS=1000` reproduces the separate tiny-segment stress
+layout; changing layout requires a fresh baseline/fix experiment.
+
+The earlier 1 s roll experiment at `b63cda98af0f760e36cb222c38c75ae1d1420753`
+passed every 100-revision scenario, reducing each replica's log from 180,684 to
+5,632 bytes. Maintenance including recreation took 86.474 s; ordinary fetch
+p50/p95/max were 1.257/5.866/33,065.851 ms, with two returned errors in 364 calls.
+At 1,000 revisions, all baseline recovery modes passed, but maintenance failed
+its five-minute observation deadline with node 1 reporting only 1,936 removed
+records. One partition pass logged 1,000 removals in 146.142 s. It is **not** a
+successful large-history compaction result. The certified scan was amortized;
+many small segments still impose individual durable publication and admission
+costs. The [raw rows](benchmarks/consumer-history-one-second-roll-2026-10-24.jsonl)
+retain this failed experiment. No 10,000-revision result was reached in that run.
+Failed maintenance now emits its collected costs before failing the assertion.
+
+The later local 60 s roll experiment at `7c85be9` passed every 100- and
+1,000-revision scenario, but failed the interrupted restart at 10,000 before
+reaching compaction. The four ordinary 10,000-revision startup modes took
+49.754 / 47.144 / 46.592 / 47.022 s (absent / valid / corrupt / old index).
+During the interrupted restart, node 3 exhausted the ordinary per-node 30 s
+health wait while Raft replay was advancing from applied index 11,345 to
+29,702 toward 40,092. See the [partial raw data](benchmarks/consumer-history-local-partial-2026-10-24.jsonl),
+[resource CSV](benchmarks/consumer-history-local-partial-2026-10-24.summary.csv)
+and [failure excerpt](benchmarks/consumer-history-local-partial-failure-2026-10-24.txt).
+It is not a complete large-history comparison.
+
+The measurement now uses one shared two-minute readiness budget starting at
+the timed start command, independent of which broker is slowest. The former
+per-node helper could allow a 50 s cluster start after waiting for earlier
+nodes, then reject an equally slow start when those nodes became ready quickly.
+Readiness failures emit their elapsed time and error before the test fails.
+All waiting remains in wall time; exact-offset, ISR, five-minute reclamation
+and retained-byte assertions are unchanged. The general Linux CI scaling job
+runs all three history levels and uploads partial measurements even on failure.
+
+The test-only image traces fsync/fdatasync with strace's seccomp BPF filter and samples the broker's `/proc` CPU,
+RSS and I/O counters and exported Go heap. Physical `read_bytes`/`write_bytes`
+are distinct from logical rchar/wchar, replay payload bytes and transfer metrics.
+Go's cumulative allocated bytes/allocation counts and non-loopback container
+interface bytes are recorded too. Interface totals include control/replication
+and monitoring traffic; they are not recovery payload bytes.
+Heap and temporary/store space peaks are sampled at 1 s, not exact maxima.
+Tracing/sampling overhead remains in wall time; tracer/helper CPU and writes are
+not counted as broker-process I/O. Per-file DONTNEED is advisory, restricted to
+stopped fixture files; valid-index runs retain warm OS caches. Shutdown and
+explicit cache preparation are outside startup timers. Failover rows include
+survivor before/after counters. Interrupted-start rows currently expose the last
+process only, so their resource totals cannot represent all interrupted work.
+The experiment header records the source head, working-diff digest and tracing
+configuration. Earlier failed pilots did not use the seccomp filter and are not
+comparable timing samples. Both baseline and fix use the same instrumentation.
+
+The separate opt-in `TestConsumerHistoryReplayCrashResources` closes that
+process-accounting gap without reclassifying the ordinary ladder's interrupted
+rows. It requires `RUN_E2E_CONSUMER_HISTORY_REPLAY_CRASH=1`, an isolated
+`CURSUS_CLEANUP_PORT_OFFSET`, and a new `CURSUS_HISTORY_REPLAY_CRASH_OUTPUT` JSONL
+path. Its dedicated Linux `e2e_faults` image consumes actual recovery source
+pages, records counters, then exits with code 77 before projection/index
+publication. Neither the sentinel nor the exit hook is active in production
+builds. Four groups retain 1,000 revisions each; two replicas stay alive while
+the target repeatedly exits after at least 1,024, 2,048 and 1,024 source records.
+Each attempt asserts its observed threshold and absence of a newly published
+index. A final unarmed restart must recover exact offsets and full ISR.
+The interrupted attempts use advisory file-cache eviction. The final restart
+retains pages read by the last interrupted process; it is not a cold-page-cache
+measurement. Each wrapper report carries a new process token, and restart
+removes its predecessor's exit report so a killed wrapper cannot expose stale
+accounting as a successful new sample.
+
+The [measured replay-crash report](consumer-history-replay-crash-results.md)
+records the tested source/merge commits, all three interrupted processes, final
+recovery, survivor deltas and shutdown-inclusive accounting. It includes raw
+JSONL and does not treat the final warm-page-cache restart as cold recovery.
+
+Each interrupted process records its logical recovery counters, Linux `/proc`
+I/O, CPU, peak RSS and current Go heap before writing the diagnostic result.
+The wrapper then records waited-child accounting and the trace's started and
+successful sync calls after process exit. These scopes differ deliberately:
+the former excludes diagnostic publication, while the latter includes tracing
+and exit work. Survivor counters span all attempts without resetting; final
+ready-state counters and shutdown-inclusive exit accounting are separate rows.
+Initial cluster setup and seeding remain explicit costs, not startup speedups.
+
+[Linux getrusage](https://man7.org/linux/man-pages/man2/getrusage.2.html) and
+[Python resource](https://docs.python.org/3/library/resource.html) define the
+waited-child CPU accounting. Child peak RSS is the largest child's peak, not a
+sum or simultaneous process-tree peak. Block-operation counts are not reported
+as bytes. The wrapper reads cgroup v1 or v2 CPU and peak-memory counters when
+available; missing cgroup I/O counters stay unavailable. Go heap and temporary
+space peaks remain sampled, augmented by the synchronous pre-exit heap sample.
+No sample is represented as a zero-byte heap. Instrumentation overhead remains
+in wall time, and Linux guest accounting is distinct from host-device I/O.
+
+`python3 test/e2e-cluster/summarize_history_measure.py result.jsonl` produces a
+CSV beside the ordinary ladder's raw JSONL. It keeps overlapping frame, replay,
+index and transfer counters separate, and leaves unavailable fields blank.
+It does not reinterpret interrupted rows as cumulative process totals.
+Its reported heap maximum includes both the periodic maximum and the explicit
+end-of-phase observation, which can be newer and larger. A legacy zero emitted
+before any heap observation remains unavailable when no positive heap sample
+exists. Synthetic summary-regression fixtures are not performance measurements.
+
+Retained bytes are metadata `.log` bytes; total store bytes also include Raft,
+indexes and checkpoints and may include sparse logical file sizes. Unique group
+IDs, tombstone epoch fences and producer/transaction identities are not expired
+by this change: fixed live-group count alone is not a bound on unbounded creation
+of distinct identities. Legacy protected prefixes and workloads that fail the
+subsequence proof retain their explicitly documented extra recovery/scan costs.

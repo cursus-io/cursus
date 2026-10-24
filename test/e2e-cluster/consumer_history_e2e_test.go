@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,10 +24,40 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 		t.Skip("set RUN_E2E_CONSUMER_HISTORY=1 with CURSUS_CLEANUP_PORT_OFFSET")
 	}
 	require.NotZero(t, cleanupPortOffset(), "an isolated port/project offset is mandatory")
-	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-history.yml").WithClusterSize(3).WithTopic("history-orders").WithPartitions(1).WithAcks("all")
+	files := []string{composeFile, "docker-compose.consumer-history.yml"}
+	if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
+		t.Setenv("CURSUS_HISTORY_MEASURE_COMPACTION", "true")
+		t.Setenv("CURSUS_HISTORY_TRACE_SYNC", "false")
+		files = append(files, "docker-compose.history-measure.yml")
+	}
+	ctx := givenCleanupCluster(t, files...).WithClusterSize(3).WithTopic("history-orders").WithPartitions(1).WithAcks("all")
 	defer ctx.Cleanup()
 	actions := ctx.WhenCluster().StartCluster()
+	defer historyFailureDiagnostics(t, ctx.GetBrokerAddrs())
 	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-orders partitions=1 replication_factor=3")
+	metadataJSON, err := ctx.GetClient().SendCommand("", "DESCRIBE topic=__consumer_offsets", 5*time.Second)
+	require.NoError(t, err)
+	var metadata topicMetadata
+	require.NoError(t, json.Unmarshal([]byte(metadataJSON), &metadata))
+	replicas := make(map[int]bool)
+	remoteReaders := make(map[int]bool)
+	for _, partition := range metadata.Partitions {
+		if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
+			require.Len(t, partition.Replicas, 2)
+		}
+		for node := 1; node <= 3; node++ {
+			if slices.Contains(partition.Replicas, fmt.Sprintf("broker-%d-9000", node)) {
+				replicas[node] = true
+			} else {
+				remoteReaders[node] = true
+			}
+		}
+	}
+	require.NotEmpty(t, replicas)
+	if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
+		require.NotEmpty(t, remoteReaders, "fixture must include an actual nonreplica reader")
+	}
+	t.Logf("internal metadata replica brokers=%v", replicas)
 	var heartbeat []func()
 	var commit []func(uint64)
 	var fetch []func() uint64
@@ -45,7 +76,7 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 			availabilityRetries += consumerHistoryCommand(t, client, fmt.Sprintf("COMMIT_OFFSET topic=history-orders partition=0 group=%s offset=%d generation=%d member=%s", group, offset, generation, member))
 			commitTimes = append(commitTimes, time.Since(start))
 		})
-		fetch = append(fetch, func() uint64 { return fetchCommittedOffset(t, client, "history-orders", group) })
+		fetch = append(fetch, func() uint64 { return fetchHistoryOffset(t, client, "history-orders", group) })
 		leave = append(leave, func() {
 			consumerHistoryCommand(t, client, fmt.Sprintf("LEAVE_GROUP topic=history-orders group=%s member=%s generation=%d", group, member, generation))
 		})
@@ -69,6 +100,9 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 			beat()
 		}
 		for node := 1; node <= 3; node++ {
+			if !replicas[node] {
+				continue // A nonreplica has no authoritative files to compact.
+			}
 			count, err := consumerHistoryRemoved(node)
 			if err != nil {
 				return false, "metrics", err
@@ -111,9 +145,20 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		group := fmt.Sprintf("history-group-%d", i)
 		client, generation, member := joinRecoveryGroup(t, ctx.GetBrokerAddrs(), "history-orders", group)
-		require.Equal(t, uint64(100), fetchCommittedOffset(t, client, "history-orders", group))
+		require.Equal(t, uint64(100), fetchHistoryOffset(t, client, "history-orders", group))
 		consumerHistoryCommand(t, client, fmt.Sprintf("LEAVE_GROUP topic=history-orders group=%s member=%s generation=%d", group, member, generation))
 		client.Close()
+	}
+	if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
+		for node := 1; node <= 3; node++ {
+			if !remoteReaders[node] {
+				continue
+			}
+			values := historyMeasureMetricsFor(t, []int{node})[node]
+			transferred := values[`cursus_recovery_work_total{stage="metadata_rpc",unit="transfer_bytes"}`]
+			require.Positive(t, transferred, "nonreplica restart must exercise the remote metadata source")
+			t.Logf("nonreplica node=%d metadata transfer logical bytes=%v", node, transferred)
+		}
 	}
 	// Exercise lifecycle cleanup while the activated cleaner keeps running.
 	// The unrelated member must retain the same identity and generation.
@@ -130,11 +175,11 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 			sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-orders partitions=1 replication_factor=3")
 		}
 		consumerHistoryCommand(t, live, fmt.Sprintf("HEARTBEAT topic=history-unrelated group=history-live member=%s generation=%d", liveMember, liveGeneration))
-		require.Equal(t, uint64(17), fetchCommittedOffset(t, live, "history-unrelated", "history-live"))
+		require.Equal(t, uint64(17), fetchHistoryOffset(t, live, "history-unrelated", "history-live"))
 		client, generation, member := joinRecoveryGroup(t, ctx.GetBrokerAddrs(), "history-orders", "history-group-0")
-		require.Zero(t, fetchCommittedOffset(t, client, "history-orders", "history-group-0"), "%s must not resurrect compacted offsets", operation)
+		require.Zero(t, fetchHistoryOffset(t, client, "history-orders", "history-group-0"), "%s must not resurrect compacted offsets", operation)
 		consumerHistoryCommand(t, client, fmt.Sprintf("COMMIT_OFFSET topic=history-orders partition=0 group=history-group-0 offset=1 generation=%d member=%s", generation, member))
-		require.Equal(t, uint64(1), fetchCommittedOffset(t, client, "history-orders", "history-group-0"))
+		require.Equal(t, uint64(1), fetchHistoryOffset(t, client, "history-orders", "history-group-0"))
 		consumerHistoryCommand(t, client, fmt.Sprintf("LEAVE_GROUP topic=history-orders group=history-group-0 member=%s generation=%d", member, generation))
 		client.Close()
 	}
@@ -146,17 +191,36 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 // retry cost in completion latency; never rejoin or forgive a member/epoch error.
 func consumerHistoryCommand(t *testing.T, client *e2e.BrokerClient, command string) int {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for retries := 0; ; retries++ {
+	return retryHistoryAdmission(t, func() error {
 		response, err := client.SendCommand("", command, 5*time.Second)
 		if err == nil {
 			require.True(t, strings.HasPrefix(response, "OK"), response)
-			return retries
 		}
-		if !strings.Contains(err.Error(), "consumer_metadata_recovering") || time.Now().After(deadline) {
-			require.NoError(t, err)
-		}
-		time.Sleep(10 * time.Millisecond)
+		return err
+	})
+}
+
+func fetchHistoryOffset(t *testing.T, client *e2e.BrokerClient, topic, group string) uint64 {
+	t.Helper()
+	var offset uint64
+	retryHistoryAdmission(t, func() error {
+		var err error
+		offset, err = client.FetchCommittedOffset(topic, 0, group)
+		return err
+	})
+	return offset
+}
+
+func historyFailureDiagnostics(t *testing.T, addrs []string) {
+	t.Helper()
+	if !t.Failed() {
+		return
+	}
+	for _, addr := range addrs {
+		client := e2e.NewBrokerClient([]string{addr})
+		response, err := client.SendCommand("admin", "CLUSTER_STATUS", 5*time.Second)
+		client.Close()
+		t.Logf("history failure broker=%s status=%s error=%v", addr, response, err)
 	}
 }
 

@@ -142,7 +142,7 @@ func certifyAndRewriteHistorySegment(t *testing.T, c *coordinator.Coordinator, r
 	require.NoError(t, err)
 	require.NoError(t, c.ValidateConsumerHistoryCompaction(r, plan))
 	if stage == nil {
-		result, err := d.RewriteConsumerHistory(context.Background(), segments[0], plan.RemovedRecords())
+		result, err := d.RewriteCertifiedConsumerHistory(context.Background(), segments[0], plan)
 		return result.RecordsRemoved, result.BytesBefore, result.BytesAfter, err
 	}
 	witness, err := d.CaptureContentGeneration()
@@ -158,7 +158,7 @@ func certifyAndRewriteHistorySegment(t *testing.T, c *coordinator.Coordinator, r
 	require.NoError(t, err)
 	return d.rewriteClosedSegment(0, d.segmentAllowsOffsetGaps(0, info.Size()), func(m types.DiskMessage) bool {
 		old, ok := remove[m.Offset]
-		return ok && old.Payload == m.Payload && old.Key == m.Key && old.ProducerID == m.ProducerID && old.Epoch == m.Epoch && old.SeqNum == m.SeqNum && !hasTransactionMetadata(m)
+		return ok && old.Payload == m.Payload && old.Key == m.Key && old.ProducerID == m.ProducerID && old.Epoch == m.Epoch && old.SeqNum == m.SeqNum && (!hasTransactionMetadata(m) || plan.PermitsTransactionRemoval(old))
 	}, stage)
 }
 

@@ -99,6 +99,33 @@ func cleanupDeletion() ConsumerMetadataRecord {
 	return ConsumerMetadataRecord{Version: 1, Type: ConsumerMetadataRecordTombstone, Group: "workers", Topic: "orders", Epoch: 2}
 }
 
+func TestTopicCleanupIgnoresValidIntentsWithoutTreatingThemAsDeletion(t *testing.T) {
+	for _, mode := range []string{"intent_only", "deleted", "wrong_producer"} {
+		t.Run(mode, func(t *testing.T) {
+			c, log := newCleanupFollower(t)
+			r := ConsumerMetadataRecord{Version: ConsumerMetadataRecordVersionTransactionHistory, Type: ConsumerMetadataRecordTransactionalOffsetSnapshot,
+				Group: "workers", Topic: "orders", Epoch: 1, Revision: 1, Offsets: []OffsetItem{{Partition: 0, Offset: 37}}, TransactionalID: "tx", ProducerID: "producer", ProducerEpoch: 1, CoordinatorEpoch: 1}
+			m := cleanupMessage(t, r)
+			m.TransactionalID, m.ProducerID, m.Epoch, m.TransactionState = "tx", "producer", 1, types.TransactionStateOpen
+			if mode == "wrong_producer" {
+				m.ProducerID = "forged"
+			}
+			log.append(m)
+			if mode != "intent_only" {
+				log.append(cleanupMessage(t, cleanupDeletion()))
+			}
+			_, err := c.ReconcileTopicGroups("orders")
+			if mode == "deleted" {
+				require.NoError(t, err)
+				require.Nil(t, c.GetGroup("workers"))
+			} else {
+				require.Error(t, err)
+				require.NotNil(t, c.GetGroup("workers"))
+			}
+		})
+	}
+}
+
 func newCleanupFollower(t *testing.T) (*Coordinator, *cleanupTestLog) {
 	t.Helper()
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
