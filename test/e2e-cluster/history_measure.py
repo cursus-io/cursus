@@ -20,7 +20,7 @@ TRACE = '/tmp/history-sync.trace'
 
 
 def sizes():
-    total = retained = temporary = 0
+    total = retained = temporary = segments = 0
     for path in ROOT.rglob('*'):
         try:
             if path.is_symlink() or not path.is_file():
@@ -29,12 +29,13 @@ def sizes():
             total += size
             if '__consumer_offsets' in path.parts and path.suffix == '.log':
                 retained += size
+                segments += 1
             if '.tmp' in path.name or 'compact' in path.name or 'rewrite' in path.name:
                 temporary += size
         except FileNotFoundError:
             pass
     return {'store_bytes': total, 'retained_metadata_bytes': retained,
-            'temporary_bytes': temporary}
+            'temporary_bytes': temporary, 'retained_metadata_segments': segments}
 
 
 def broker_pid():

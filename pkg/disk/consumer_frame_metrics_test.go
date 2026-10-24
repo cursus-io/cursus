@@ -26,7 +26,7 @@ func TestConsumerFrameWorkCountsRejectedAndRepeatedReads(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, data, 0600))
 	r, err := mmap.Open(path)
 	require.NoError(t, err)
-	defer r.Close()
+	defer func() { require.NoError(t, r.Close()) }()
 	value := func(unit string) float64 {
 		families, err := prometheus.DefaultGatherer.Gather()
 		require.NoError(t, err)

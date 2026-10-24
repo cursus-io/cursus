@@ -172,16 +172,16 @@ capabilities afterward; voter admission already requires registration with the
 current protocol. Turning the flag off stops maintenance, not the durable gate.
 
 The leader then commits `CONSUMER_TRANSACTION_HISTORY_ACTIVATE` only when every
-registered broker and voter supports lifecycle protocol **11**. The second flag
-is persisted in snapshot **13**; restoring a flag with an older snapshot version,
+registered broker and voter supports lifecycle protocol **12**. The second flag
+is persisted in snapshot **14**; restoring a flag with an older snapshot version,
 missing ordinary history gate or incapable broker is rejected. Writers emit
 metadata v7 and stable history controls only after that gate. Before activation,
 writers retain v3 and existing control identities. New binaries read both.
 
-The local Raft recovery marker is **14**. Supported marker-9 through marker-13
+The local Raft recovery marker is **15**. Supported marker-9 through marker-14
 volumes are replayed first, then atomically upgraded and synced before capability
-advertisement. Older binaries reject marker 14; active snapshot 13 also fails
-closed. Unactivated snapshots keep the existing version 11/12 contract. Turning
+advertisement. Older binaries reject marker 15; active snapshot 14 also fails
+closed. Unactivated snapshots keep the existing version 11/12/13 contract. Turning
 configuration off stops maintenance but does not reverse either durable gate or
 new writer format. In-place downgrade is unsupported. Restore a complete
 pre-upgrade backup into isolated volumes; never edit a marker or activation flag.
@@ -245,26 +245,30 @@ bootstrap scans would correctly reject an unexplained trailing gap. Crash tests
 cover both the predecessor-marker boundary and completed empty-segment deletion.
 
 The recovery scheduler from the updated main continues to own bootstrap/transfer
-admission. This maintenance path uses ordinary local read views and its own
-interval/deadline; it does not add a remote transfer or another scheduler.
+admission. Maintenance uses ordinary local read views and the existing budgeted
+detached transfer cache for nonreplicas, with its own interval/cancellation.
+It does not introduce a separate transfer scheduler.
 Linux race regressions cover the consumer bootstrap staging and installation
 slot ordering together with replay and compaction. Native Windows bootstrap
 fixtures can reject a low-space host before exercising recovery (the default
 5% reserve required 24.6 GB on the validation host). The same checks pass in the
 isolated Linux filesystem; the production reserve is not lowered to run them.
 
-The current certification deliberately replays all partitions twice and scans
-the raw committed records once **per candidate segment**. A filtered page can
+Conservative certification replays all partitions twice and scans the raw
+committed records once per candidate segment. A subsequence-safe sweep performs
+that certification once for the selected partition's closed prefix, then
+revalidates and publishes each segment separately. A filtered page can
 end before its consumed source page: the sequential candidate reader retains
 the consumed position separately from the last returned offset, so removed
 trailing records are not read again within that pass. This cursor lives only
 inside one certification; an error or retry starts from the original bounds.
 It is not a durable checkpoint or an authority to skip validation. Scanning does
 not hold a live recovery lease; publication does and includes storage reads and
-fsync. Maintenance processes one segment per configured compaction interval with
-a one-minute attempt deadline. This bounds each attempt but does not prove that
-maintenance keeps up with an arbitrary append rate. Transaction intent/control
-frames remain protected. Distinct deleted-group fences and reservation-decision
+fsync. Maintenance yields between publications and waits the configured interval
+between partition passes. Scanning is cancellable without a fixed restart
+deadline. This does not prove maintenance keeps up with an arbitrary append
+rate or segment-creation rate. Transaction intent/control frames require the
+additional v7 retirement proof. Distinct deleted-group fences and reservation-decision
 state can still grow: this is not a bound on every consumer metadata workload.
 
 Observe `cursus_consumer_history_runs_total{result}` for completed/deferred/skipped
@@ -560,6 +564,25 @@ fixture's project, network, shifted ports and volumes. The default ladder is
 is the same binary with maintenance disabled; initial setup, seeding, maintenance
 including restart, individual startup modes and coordinator failover are separate
 rows. Existing historical commit comparisons above remain a different experiment.
+
+The measurement layout uses 64 KiB segments, 1 MiB indexes and a 60 s roll
+interval, with the same layout for baseline and fix. The header records these
+values and the sampler records retained segment counts as well as bytes.
+`CURSUS_HISTORY_MEASURE_ROLL_MS=1000` reproduces the separate tiny-segment stress
+layout; changing layout requires a fresh baseline/fix experiment.
+
+The earlier 1 s roll experiment at `b63cda98af0f760e36cb222c38c75ae1d1420753`
+passed every 100-revision scenario, reducing each replica's log from 180,684 to
+5,632 bytes. Maintenance including recreation took 86.474 s; ordinary fetch
+p50/p95/max were 1.257/5.866/33,065.851 ms, with two returned errors in 364 calls.
+At 1,000 revisions, all baseline recovery modes passed, but maintenance failed
+its five-minute observation deadline with node 1 reporting only 1,936 removed
+records. One partition pass logged 1,000 removals in 146.142 s. It is **not** a
+successful large-history compaction result. The certified scan was amortized;
+many small segments still impose individual durable publication and admission
+costs. The [raw rows](benchmarks/consumer-history-one-second-roll-2026-10-24.jsonl)
+retain this failed experiment. No 10,000-revision result was reached in that run.
+Failed maintenance now emits its collected costs before failing the assertion.
 
 The test-only image traces fsync/fdatasync with strace's seccomp BPF filter and samples the broker's `/proc` CPU,
 RSS and I/O counters and exported Go heap. Physical `read_bytes`/`write_bytes`

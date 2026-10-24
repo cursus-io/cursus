@@ -1,6 +1,7 @@
 services:
   broker-1: &measure-broker
     cpus: 2
+    command: ["./broker", "--segment-roll-time-ms", "${CURSUS_HISTORY_MEASURE_ROLL_MS:-60000}"]
     build:
       dockerfile: test/e2e-cluster/Dockerfile.history-measure
     cap_add: [SYS_PTRACE]

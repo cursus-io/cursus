@@ -43,10 +43,17 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 	require.NoError(t, err)
 	diff, err := exec.Command("git", "diff", "--binary", "HEAD").Output()
 	require.NoError(t, err)
+	rollMS := 60000
+	if value := os.Getenv("CURSUS_HISTORY_MEASURE_ROLL_MS"); value != "" {
+		rollMS, err = strconv.Atoi(value)
+		require.NoError(t, err)
+		require.Positive(t, rollMS)
+	}
 	emit(map[string]any{"phase": "experiment", "source_head": strings.TrimSpace(string(head)), "source_clean": len(diff) == 0,
 		"source_diff_sha256": fmt.Sprintf("%x", sha256.Sum256(diff)), "driver_go": runtime.Version(),
 		"broker_cpus": 2, "broker_memory_bytes": 1 << 30, "trace": "strace -f --seccomp-bpf -e trace=fsync,fdatasync",
-		"logical_groups": 4, "metadata_partitions": 4, "replication_factor": 3})
+		"logical_groups": 4, "metadata_partitions": 4, "replication_factor": 3,
+		"segment_roll_ms": rollMS, "segment_bytes": 65536, "index_bytes": 1 << 20, "maintenance_interval_ms": 1000})
 	levels := []int{100, 1000, 10000}
 	if value := os.Getenv("CURSUS_HISTORY_MEASURE_LEVELS"); value != "" {
 		levels = nil
@@ -133,7 +140,7 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 					compose("up", "-d", "--no-build", "--force-recreate")
 					require.NoError(t, actions.checkAllNodesHealth())
 					stopProbe := historyMeasureReadProbe(t, ctx.GetBrokerAddrs(), uint64(history))
-					require.NoError(t, eventually(t, "history sweep on every replica", 5*time.Minute, func() (bool, string, error) {
+					sweepErr := eventually(t, "history sweep on every replica", 5*time.Minute, func() (bool, string, error) {
 						for node := 1; node <= 3; node++ {
 							count, err := consumerHistoryRemoved(node)
 							if err != nil {
@@ -155,10 +162,17 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 							}
 						}
 						return true, "compacted", nil
-					}))
-					exact(ctx.GetBrokerAddrs())
+					})
+					if sweepErr == nil {
+						exact(ctx.GetBrokerAddrs())
+					}
 					probe := stopProbe()
-					emit(map[string]any{"history": history, "variant": variant, "phase": "maintenance_including_recreate", "wall_seconds": time.Since(began).Seconds(), "fetch_probe_after_ready": probe, "before": before, "after": historyMeasureResources(t), "metrics": historyMeasureMetrics(t)})
+					row := map[string]any{"history": history, "variant": variant, "phase": "maintenance_including_recreate", "wall_seconds": time.Since(began).Seconds(), "fetch_probe_after_ready": probe, "before": before, "after": historyMeasureResources(t), "metrics": historyMeasureMetrics(t)}
+					if sweepErr != nil {
+						row["error"] = sweepErr.Error()
+					}
+					emit(row)
+					require.NoError(t, sweepErr)
 				}
 				for _, mode := range []string{"absent", "valid", "corrupt", "old"} {
 					compose("stop")
