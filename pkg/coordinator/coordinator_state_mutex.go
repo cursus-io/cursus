@@ -17,20 +17,29 @@ type coordinatorStateMutex struct {
 	state   sync.RWMutex
 }
 
+// Lock excludes cooperative appends before acquiring exclusive state access.
 func (m *coordinatorStateMutex) Lock() {
 	m.commits.Lock()
 	m.state.Lock()
 }
 
+// Unlock releases state access before allowing another cooperative append.
 func (m *coordinatorStateMutex) Unlock() {
 	m.state.Unlock()
 	m.commits.Unlock()
 }
 
-func (m *coordinatorStateMutex) RLock()         { m.state.RLock() }
-func (m *coordinatorStateMutex) RUnlock()       { m.state.RUnlock() }
+// RLock protects state reads without excluding in-flight cooperative appends.
+func (m *coordinatorStateMutex) RLock() { m.state.RLock() }
+
+// RUnlock releases state read access; it does not release a commit fence.
+func (m *coordinatorStateMutex) RUnlock() { m.state.RUnlock() }
+
+// TryRLock acquires state read access only if immediately available.
 func (m *coordinatorStateMutex) TryRLock() bool { return m.state.TryRLock() }
 
+// TryLock acquires both mutation fences without waiting, releasing commit
+// exclusion if the state lock is unavailable.
 func (m *coordinatorStateMutex) TryLock() bool {
 	if !m.commits.TryLock() {
 		return false

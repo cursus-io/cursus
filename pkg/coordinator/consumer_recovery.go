@@ -301,6 +301,9 @@ func validateCompatibilityState(state map[string]*GroupStateSnapshot) error {
 	return nil
 }
 
+// ImportStateWithRecovery validates and installs snapshot state and its recovery
+// evidence. A missing envelope leaves authority unknown. It fences detached
+// operations by import generation without waiting for Raft-dependent appends.
 func (c *Coordinator) ImportStateWithRecovery(groups map[string]*GroupStateSnapshot, envelope *ConsumerRecoveryEnvelope) error {
 	if err := ValidateImportState(groups); err != nil {
 		return err

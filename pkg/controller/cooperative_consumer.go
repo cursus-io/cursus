@@ -37,6 +37,8 @@ func (ch *CommandHandler) cooperativeTopic(name string) (topic.Definition, error
 	return topic.Definition{}, fmt.Errorf("ERROR: topic_not_found")
 }
 
+// handleCooperativeMembership validates routing and the single-topic subscription
+// before reconciling membership against the authoritative topic definition.
 func (ch *CommandHandler) handleCooperativeMembership(args map[string]string, action string) string {
 	if !ch.cooperativeEnabled() {
 		return "ERROR: cooperative_not_enabled"
