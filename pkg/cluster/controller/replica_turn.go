@@ -159,7 +159,12 @@ func (cc *ClusterController) advanceReplicaTurn(ctx context.Context, candidate f
 	witness, err := apply(ctx, r, batch)
 	if err != nil {
 		result.err = err
-		*turn = replicaTurn{}
+		// A pre-mutation failure need not repeat the authenticated search.
+		// Partial mutation, replacement or changed authority must rebuild it.
+		// Keep only the request; the next turn fetches and validates a new reply.
+		if turn.refinements == 0 || state.ValidateReplicaPrefixContinuationContext(ctx, r) != nil {
+			*turn = replicaTurn{}
+		}
 		return
 	}
 	if batch.TruncateTo != nil {
