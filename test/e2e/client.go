@@ -242,10 +242,11 @@ func shouldRetryBrokerError(cmdPayload string, brokerErr *wire.BrokerError) bool
 		return false
 	}
 	// JOIN_GROUP appends a random suffix before persisting the member, so an
-	// ambiguous transport failure must never be replayed. These two explicit
+	// ambiguous transport failure must never be replayed. These explicit
 	// responses are emitted before member creation. A coordinator error carrying
 	// a reason can originate from the durable AddConsumer step and stays fenced.
 	return brokerErr.Code == "topic_materialization_pending" ||
+		(brokerErr.Code == "consumer_metadata_recovering" && brokerErr.Fields["reason"] == "") ||
 		(brokerErr.Code == "coordinator_not_available" && brokerErr.Fields["reason"] == "")
 }
 

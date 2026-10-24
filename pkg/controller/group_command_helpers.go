@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/util"
@@ -81,6 +82,16 @@ func formatCoordinatorError(err error) string {
 		return fmt.Sprintf("ERROR: group_not_found reason=%q", msg)
 	}
 	return fmt.Sprintf("ERROR: coordinator_error reason=%q", msg)
+}
+
+// Only the direct admission sentinel proves that JOIN did not persist a member.
+// A wrapped persistence error can describe an ambiguous append and must retain
+// its reason; clients must not interpret it as a safe pre-persistence retry.
+func formatJoinAdmissionError(err error, fallbackCode string) string {
+	if err == coordinator.ErrConsumerMetadataRecovering {
+		return err.Error()
+	}
+	return fmt.Sprintf("ERROR: %s reason=%q", fallbackCode, err.Error())
 }
 
 // resolveOffset determines the starting offset for a consumer.

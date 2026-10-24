@@ -44,6 +44,20 @@ func TestUpgradeRaftRecoveryFormatAtomicallyMigratesLegacyMarker(t *testing.T) {
 	require.NoError(t, upgradeRaftRecoveryFormat(directory))
 }
 
+func TestUpgradeRaftRecoveryFormatFromRetentionTimeVersion(t *testing.T) {
+	directory := t.TempDir()
+	marker := filepath.Join(directory, raftFormatMarkerName)
+	require.NoError(t, os.WriteFile(marker, []byte("12\n"), 0600))
+	require.NoError(t, ensureRaftRecoveryFormat(directory))
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "12\n", string(data), "failed recovery must remain rollback safe")
+	require.NoError(t, upgradeRaftRecoveryFormat(directory))
+	data, err = os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "13\n", string(data), "upgrade completes before advertising history capability")
+}
+
 func TestEnsureRaftRecoveryFormatRejectsUnmarkedPersistedState(t *testing.T) {
 	directory := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(directory, "raft.db"), []byte("legacy"), 0o600))

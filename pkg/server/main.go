@@ -276,6 +276,11 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					if cfg.ConsumerHistoryCompactionEnabled {
+						if err := clusterController.ActivateConsumerHistory(rm); err != nil {
+							util.Debug("consumer history activation pending: %v", err)
+						}
+					}
 					if cfg.RetentionTimeEnabled {
 						if err := clusterController.ActivateRetentionTime(rm); err != nil {
 							util.Debug("retention time activation pending: %v", err)

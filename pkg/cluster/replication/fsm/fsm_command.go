@@ -793,6 +793,10 @@ func (f *BrokerFSM) applyRegisterCommand(jsonData string) interface{} {
 	info.TransactionCoordinatorShards = 0
 
 	f.mu.Lock()
+	if f.consumerHistoryActivated && (info.LifecycleProtocol < ConsumerHistoryProtocolVersion || info.RecoveryProtocol < BootstrapRecoveryProtocolVersion || info.IncarnationID == "") {
+		f.mu.Unlock()
+		return fmt.Errorf("broker_registration_fenced reason=consumer_history_protocol")
+	}
 	if f.retentionTimeActivated && (info.LifecycleProtocol < RetentionTimeProtocolVersion || info.RecoveryProtocol < BootstrapRecoveryProtocolVersion || info.IncarnationID == "") {
 		f.mu.Unlock()
 		return fmt.Errorf("broker_registration_fenced reason=retention_time_protocol")

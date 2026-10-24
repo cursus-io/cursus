@@ -1,0 +1,26 @@
+services:
+  broker-1: &history-broker
+    command: ["./broker", "--segment-roll-time-ms", "1000"]
+    cpus: 1
+    mem_limit: 1g
+    environment: &history-environment
+      CONSUMER_HISTORY_COMPACTION_ENABLED: "true"
+      CONSUMER_RECOVERY_INDEX_ENABLED: "true"
+      LOG_SEGMENT_BYTES: "65536"
+      LOG_COMPACTION_CHECK_INTERVAL_MS: "1000"
+      DISK_MIN_FREE_PERCENT: "0"
+      LOG_DIR: /app/cluster-logs
+      BOOTSTRAP_CLUSTER: "true"
+      BOOTSTRAP_SOLE_VOTER: "true"
+  broker-2:
+    <<: *history-broker
+    environment:
+      <<: *history-environment
+      BOOTSTRAP_CLUSTER: "false"
+      BOOTSTRAP_SOLE_VOTER: "false"
+  broker-3:
+    <<: *history-broker
+    environment:
+      <<: *history-environment
+      BOOTSTRAP_CLUSTER: "false"
+      BOOTSTRAP_SOLE_VOTER: "false"
