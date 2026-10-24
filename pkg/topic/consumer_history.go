@@ -2,11 +2,17 @@ package topic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/disk"
 )
+
+// ErrConsumerHistoryBusy guarantees installation has not started. A replication
+// mutation can hold the partition gate while waiting for Raft apply, so history
+// publication must never wait for it under the caller's FSM transition fence.
+var ErrConsumerHistoryBusy = errors.New("consumer history partition busy")
 
 type consumerHistoryStorage interface {
 	ConsumerHistorySegments(context.Context, uint64) ([]disk.ConsumerHistorySegment, error)
@@ -47,12 +53,15 @@ func (p *Partition) WithConsumerHistoryInstallation(ctx context.Context, fn func
 	if p.topic != config.ConsumerOffsetsTopicName {
 		return fmt.Errorf("not consumer metadata")
 	}
-	if err := p.reconcileMu.LockContext(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !p.reconcileMu.TryLock() {
+		return ErrConsumerHistoryBusy
+	}
 	defer p.reconcileMu.Unlock()
-	if err := p.visibilityMu.LockContext(ctx); err != nil {
-		return err
+	if !p.visibilityMu.TryLock() {
+		return ErrConsumerHistoryBusy
 	}
 	defer p.visibilityMu.Unlock()
 	if p.BootstrapPending() || p.SnapshotRecoveryPending() || !p.HWMKnown() {

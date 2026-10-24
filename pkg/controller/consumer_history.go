@@ -253,6 +253,12 @@ func (ch *CommandHandler) publishConsumerHistorySegment(ctx context.Context, pla
 				})
 			})
 		})
+		if errors.Is(e, topic.ErrConsumerHistoryBusy) {
+			// The partition callback never ran. Release both admission and the
+			// FSM fence before retrying so an in-flight replication decision can
+			// apply and release its partition mutation gate.
+			return false, fsm.ErrConsumerMetadataFencePending
+		}
 		return entered, e
 	})
 	return result, err

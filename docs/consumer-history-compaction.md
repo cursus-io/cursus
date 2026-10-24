@@ -508,6 +508,15 @@ an overdue ticker event. This limits consecutive maintenance exclusion, includin
 slow fsyncs, without weakening committed-cut or generation checks. It does not
 promise a maximum syscall latency or eliminate cross-broker contention.
 
+Publication must also acquire the partition reconciliation and visibility gates
+nonblockingly while holding the FSM fence. Replication owns a shared mutation
+gate until its Raft decision applies; waiting for that gate under the FSM fence
+deadlocks the decision that would release it. A busy partition has not entered
+the installer: release admission/FSM, back off, and retry the same certificate
+with every identity and committed-cut check repeated. Validation/storage errors
+after entry still discard the plan. A real three-node transaction test exposed
+this lock cycle; spacing publications alone did not fix it.
+
 Cleanup on a nonreplica stages the missing committed raw prefixes through the
 same bounded, certified transfer cache as recovery, before taking coordinator
 lifecycle/global locks. Local read callbacks fence FSM transitions and validate
