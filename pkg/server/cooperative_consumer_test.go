@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -244,15 +246,27 @@ func TestCooperativeGoTransactionOffsets(t *testing.T) {
 // A fixed backlog and handler cost make protocol overhead and replay comparable.
 // This is a local TCP measurement, not a production capacity benchmark.
 func TestCooperativeGoEagerComparison(t *testing.T) {
+	runCooperativeGoComparison(t, 160, true)
+}
+
+// This larger diagnostic workload is explicit so routine race/coverage runs
+// exercise the same safety boundaries without repeating a capacity measurement.
+func TestCooperativeGoBacklogThroughput(t *testing.T) {
+	if os.Getenv("RUN_COOPERATIVE_THROUGHPUT") != "1" {
+		t.Skip("set RUN_COOPERATIVE_THROUGHPUT=1 for the 9,600-record comparison")
+	}
+	runCooperativeGoComparison(t, 1600, false)
+}
+
+func runCooperativeGoComparison(t *testing.T, records int, join bool) {
 	for _, mode := range []string{"eager", "cooperative-single", "cooperative-batched"} {
 		t.Run(mode, func(t *testing.T) {
 			cooperative := mode != "eager"
-			cfg, _, tm := cooperativeWireFixture(t, true)
+			cfg, cd, tm := cooperativeWireFixture(t, true)
 			cfg.Mode = sdk.ModePolling
 			cfg.BatchSize = 8
 			cfg.MaxPollRecords = 8
 			cfg.AutoCommitInterval = 10 * time.Millisecond
-			const records = 160
 			for p := 0; p < 6; p++ {
 				partition, err := tm.GetTopic(cfg.Topic).GetPartition(p)
 				require.NoError(t, err)
@@ -262,7 +276,7 @@ func TestCooperativeGoEagerComparison(t *testing.T) {
 				}
 				require.NoError(t, partition.EnqueueBatchSync(batch))
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 			var mu sync.Mutex
 			seen := map[string]int{}
@@ -320,14 +334,33 @@ func TestCooperativeGoEagerComparison(t *testing.T) {
 			doneA, finishA := startConsumer()
 			require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return counts[0] >= 16 }, 5*time.Second, 5*time.Millisecond)
 			joined := time.Now()
-			doneB, finishB := startConsumer()
-			require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(seen) == 6*records }, 20*time.Second, 10*time.Millisecond)
+			var doneB chan error
+			var finishB func()
+			if join {
+				doneB, finishB = startConsumer()
+			}
+			require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(seen) == 6*records }, 60*time.Second, 10*time.Millisecond)
 			elapsed, convergence := time.Since(started), time.Since(joined)
+			require.Eventually(t, func() bool {
+				for p := 0; p < 6; p++ {
+					offset, ok := cd.GetOffset(cfg.GroupID, cfg.Topic, p)
+					if !ok || offset != uint64(records) {
+						return false
+					}
+				}
+				return true
+			}, 10*time.Second, time.Millisecond, "all offsets must be durable before measuring completion")
+			durableElapsed := time.Since(started)
+			t.Logf("durable_records_per_second=%.1f durable_completion_ms=%d", float64(6*records)/durableElapsed.Seconds(), durableElapsed.Milliseconds())
 			cancel()
 			<-doneA
-			<-doneB
+			if doneB != nil {
+				<-doneB
+			}
 			finishA()
-			finishB()
+			if finishB != nil {
+				finishB()
+			}
 			metadataRecords, metadataBytes := 0, 0
 			for p := 0; p < tm.GetTopic(config.ConsumerOffsetsTopicName).Definition().Partitions; p++ {
 				var offset uint64
@@ -351,7 +384,129 @@ func TestCooperativeGoEagerComparison(t *testing.T) {
 			for _, n := range seen {
 				duplicates += n - 1
 			}
+			if cooperative {
+				if join {
+					require.LessOrEqual(t, duplicates, 3*cfg.BatchSize, "three transferred partitions must retain the one-batch replay bound")
+				} else {
+					require.Zero(t, duplicates, "unchanged ownership must not replay handler work")
+				}
+			}
 			t.Logf("unique_records=%d records_per_second=%.1f backlog_drain_after_join_ms=%d retained_partition_0_max_gap_ms=%d duplicate_deliveries=%d replay_payload_bytes=%d", len(seen), float64(len(seen))/elapsed.Seconds(), convergence.Milliseconds(), gaps[0].Milliseconds(), duplicates, duplicates*128)
 		})
+	}
+}
+
+// Read-ahead is allowed; handling a second batch before the first durable
+// commit, or after revocation/handler failure, is not.
+func TestCooperativeGoPrefetchBoundAndCommitBarrier(t *testing.T) {
+	for _, mode := range []sdk.ConsumerMode{sdk.ModePolling, sdk.ModeStreaming} {
+		for _, outcome := range []string{"success", "cancel", "handler-error", "commit-error"} {
+			t.Run(fmt.Sprint(mode)+"/"+outcome, func(t *testing.T) {
+				cfg, cd, tm := cooperativeWireFixture(t, true)
+				cfg.Mode = mode
+				cfg.HandlerMaxRetries = 0
+				partition, err := tm.GetTopic(cfg.Topic).GetPartition(0)
+				require.NoError(t, err)
+				messages := make([]types.Message, 16)
+				for i := range messages {
+					messages[i].Payload = strings.Repeat("p", 128)
+				}
+				require.NoError(t, partition.EnqueueBatchSync(messages))
+				c, err := sdk.NewCooperativeConsumer(cfg)
+				require.NoError(t, err)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				entered, unblock := make(chan struct{}), make(chan struct{})
+				commitEntered, commitRelease := make(chan struct{}), make(chan struct{})
+				var handlerOnce, commitOnce, writerOnce sync.Once
+				releaseHandler := func() { handlerOnce.Do(func() { close(unblock) }) }
+				releaseCommit := func() { commitOnce.Do(func() { close(commitRelease) }) }
+				done := make(chan error, 1)
+				finished := make(chan struct{})
+				var calls atomic.Uint64
+				go func() {
+					defer close(finished)
+					done <- c.Run(ctx, func(ctx context.Context, message sdk.CooperativeMessage) error {
+						calls.Add(1)
+						if message.Offset == 0 {
+							close(entered)
+							<-unblock
+							if outcome == "handler-error" {
+								return errors.New("handler failed")
+							}
+						}
+						return nil
+					})
+				}()
+				t.Cleanup(func() {
+					cancel()
+					releaseHandler()
+					releaseCommit()
+					select {
+					case <-finished:
+					case <-time.After(5 * time.Second):
+						t.Error("worker did not stop")
+					}
+				})
+				select {
+				case <-entered:
+				case <-ctx.Done():
+					t.Fatal("handler did not start")
+				}
+				require.Eventually(t, func() bool { return c.Stats().FetchedRecords == 8 }, time.Second, time.Millisecond)
+				require.Never(t, func() bool { return c.Stats().FetchedRecords > 8 || calls.Load() > 1 }, 50*time.Millisecond, time.Millisecond, "only one batch may be read ahead of a blocked handler")
+				require.Equal(t, uint64(8*128), c.Stats().FetchedPayloadBytes)
+				if outcome == "cancel" {
+					cancel()
+				}
+				cd.SetOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
+					if record.Type == coordinator.ConsumerMetadataRecordOffsetSnapshot {
+						writerOnce.Do(func() { close(commitEntered); <-commitRelease })
+						if outcome == "commit-error" {
+							return errors.New("ERROR: cooperative_fenced")
+						}
+					}
+					payload, key, err := coordinator.EncodeConsumerMetadataRecord(record)
+					if err != nil {
+						return err
+					}
+					return tm.PublishWithAck(config.ConsumerOffsetsTopicName, &types.Message{Payload: string(payload), Key: key})
+				})
+				releaseHandler()
+				if outcome == "success" || outcome == "commit-error" {
+					select {
+					case <-commitEntered:
+					case <-ctx.Done():
+						t.Fatal("commit did not start")
+					}
+					require.Equal(t, uint64(4), calls.Load())
+					require.Never(t, func() bool { return calls.Load() > 4 || c.Stats().FetchedRecords > 8 }, 50*time.Millisecond, time.Millisecond, "prefetch cannot pass a pending commit")
+					releaseCommit()
+				}
+				if outcome == "success" {
+					require.Eventually(t, func() bool { offset, _ := cd.GetOffset(cfg.GroupID, cfg.Topic, 0); return offset == 16 }, 5*time.Second, time.Millisecond)
+					cancel()
+				}
+				select {
+				case <-finished:
+				case <-time.After(5 * time.Second):
+					t.Fatal("consumer did not finish")
+				}
+				runErr := <-done
+				require.Error(t, runErr)
+				wantCalls := uint64(1)
+				if outcome == "success" {
+					wantCalls = 16
+				}
+				if outcome == "commit-error" {
+					wantCalls = 4
+				}
+				require.Equal(t, wantCalls, calls.Load())
+				if outcome != "success" {
+					offset, _ := cd.GetOffset(cfg.GroupID, cfg.Topic, 0)
+					require.Zero(t, offset, "failed or cancelled work cannot commit prefetched offsets")
+				}
+				require.Equal(t, c.Stats().WorkerStarts, c.Stats().WorkerStops)
+			})
+		}
 	}
 }

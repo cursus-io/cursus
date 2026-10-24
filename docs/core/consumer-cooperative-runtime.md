@@ -113,7 +113,8 @@ create a new consumer to explicitly rejoin after diagnosing the interruption.
 
 `EnableAutoCommit` commits the last successfully processed offset of each batch
 synchronously. Concurrent completed partitions share a commit, collected for
-one millisecond and capped at 64 partitions per request. Each worker waits for
+two milliseconds from the oldest queued request and capped at 64 partitions per request.
+Time already spent behind an in-flight append counts toward this window. Each worker waits for
 the durable response before processing its next batch. This API does not use
 the eager consumer's `AutoCommitInterval`
 background batching. With auto-commit disabled, call
@@ -184,6 +185,131 @@ The cluster test creates an isolated three-broker compose project on ports
 coordinator stop/start and rolling broker restart under continuous traffic.
 The dedicated CI job uses the existing main/release pull-request triggers.
 
+
+## Bounded fetch pipeline (2026-10-24)
+
+The remaining gap includes a client execution difference: eager separates fetch
+and handler work, while the initial cooperative worker performed fetch, handling,
+synchronous commit and the polling delay serially. A fresh five-run profile of
+coalesced cooperative consumption accumulated 5.19 s of worker commit waits,
+0.85 s in stable-offset read lock waits, and 0.95 s in durable snapshot appends.
+These overlapping goroutine totals are not elapsed time; a read can wait behind
+another partition's append. The asynchronous eager commit policy still provides
+a throughput advantage with a larger processed-but-uncommitted window.
+
+Kafka 4.1.0 separates network responses in
+[AbstractFetch](https://github.com/apache/kafka/blob/4.1.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractFetch.java)
+from record delivery in
+[FetchCollector](https://github.com/apache/kafka/blob/4.1.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/FetchCollector.java).
+The latter checks assignment/fetchability before returning buffered records.
+Cursus adopts this stage separation with a stricter, one-batch read-ahead limit.
+It retains its original message-bound grant and synchronous auto-commit boundary;
+this is not adoption of Kafka's interval auto-commit policy. KIP-848's ownership
+handoff remains unchanged.
+
+Each partition has a fetch goroutine and an unbuffered batch handoff. While one
+batch is being handled or committed, the reader may decode one additional batch
+and then must wait. Handling the next batch still requires durable success for
+the previous batch. Cancellation closes the fetch connection and discards queued
+work. Worker completion waits for the reader, handler and any submitted commit,
+so a revocation acknowledgement cannot overtake them. Polling and streaming use
+the same processing boundary. Manual/transactional commit users retain their
+existing responsibility for deciding when to commit.
+
+This overlaps reads and polling delays with useful work without releasing the
+broker's group lock or weakening transaction reservation checks. The tradeoff is
+one additional decoded batch per partition, bounded by the existing batch/frame
+limits, plus one goroutine. On cancellation that batch may be fetched again by
+the next owner; fetched payload bytes therefore include discarded work as well
+as handler replay. Metadata encoding and recovery format are unchanged.
+
+Regression checks cover a blocked first handler with exactly two batches fetched
+and only one record handled; a blocked append with exactly one batch handled;
+cancellation, handler failure and rejected commit without delivery of queued
+records; polling/streaming revocation and stale-token rejection. The comparison
+also requires every committed offset to reach log end and asserts at most one
+batch of duplicate handler deliveries per transferred partition (zero without
+membership changes). Existing lost-response and transaction barrier checks still
+apply. The performance comparison includes both a 960-record join and a
+9,600-record single-member backlog, with matched baseline test code and alternating
+execution order. Neither is a production capacity claim.
+
+Five final alternating runs compared published commit `cac136c`, read-ahead
+with a 1 ms collection window, and the selected 2 ms window. Collection now
+starts when the oldest request is queued, so requests waiting behind an append
+do not pay another full collection delay afterward. The 2 ms window gave more
+partitions time to share a snapshot; it retains the same per-partition processed
+work limit. This adds up to 1 ms of intentional collection delay for an otherwise
+idle queue. A slow or blocked partition is never a prerequisite for flushing.
+
+| Median / range | Serial coalesced baseline | Selected pipeline | Eager control with selected pipeline |
+| --- | ---: | ---: | ---: |
+| 9,600 records, durable records/s | 1,634.9 | 2,041.1 | 3,838.3 |
+| 9,600 records, durable records/s range | 1,396.6–1,722.2 | 1,917.2–2,110.9 | 3,602.2–4,015.5 |
+| 9,600 records, metadata records | 429 | 410 | 218 |
+| 9,600 records, metadata replay payload bytes | 146,153 | 140,012 | 72,840 |
+| 9,600 records, handler duplicates | 0 | 0 | 0 |
+| 960 records + join, durable records/s | 1,129.5 | 1,568.9 | 2,073.5 |
+| 960 records + join, handler duplicates (range) | 0–18 | 9–15 | 144–240 |
+| 960 records + join, metadata records | 78 | 44 | 34 |
+| 960 records + join, metadata replay payload bytes | 34,839 | 23,728 | 11,212 |
+| 960 records + join, fetched payload bytes | 125,952 | 129,024 | not instrumented |
+| 960 records + join, maximum retained-partition gap | 93 ms | 43 ms | 57 ms |
+
+Durable throughput improved by 24.8% for the longer backlog and 38.9% with a
+join. The baseline's longer-backlog eager control was 3,716.3 records/s versus
+3,838.3 in the selected runs (+3.3%); host variation remains visible. The 1 ms
+pipeline candidate reached 1,892.3 records/s on the longer backlog, below the
+selected window's 2,041.1. Initial read-ahead-only probes did not consistently
+improve the short join workload. The final change combines read-ahead with
+queue-age-aware collection; the final comparison does not isolate each change's
+causal contribution. Absolute rates are not directly comparable with the earlier
+host runs below.
+
+Replay metadata bytes fell 4.2% on the longer backlog and 31.9% with a join.
+The read-ahead tradeoff is visible: median fetched payload during the join rose
+by 3,072 bytes (24 records), even though handler replay stayed within the original
+three-partition/eight-record bound. The no-join run fetched exactly 9,600 records
+/ 1,228,800 bytes in both cooperative variants. Eager still leads throughput;
+the retained synchronous commit and authoritative ownership/stable-offset checks
+remain costs. No asynchronous processing past an unacknowledged commit was added.
+
+[Raw runs, controls and candidate results](../measurements/consumer-cooperative-pipeline-2026-10-24.json)
+include all 60 workload/mode observations. Both binaries used the same updated
+test fixture; baseline source was archived from `cac136c`, with only the test
+file overlaid. Tests ran without race instrumentation in Linux/Go 1.26.2 with
+two CPUs and GOMAXPROCS=2. Logs were buffered on the container filesystem and
+copied out after execution. To reproduce a current run:
+
+```sh
+RUN_COOPERATIVE_THROUGHPUT=1 go test ./pkg/server -run '^TestCooperativeGo(EagerComparison|BacklogThroughput)$/(eager|cooperative-batched)$' -count=5 -v
+```
+
+The larger diagnostic workload is opt-in; the short join comparison and all
+prefetch/commit/revocation safety tests remain in ordinary race and coverage runs.
+The durable metric waits for every partition's committed offset to reach its log
+end, unlike the older handler-completion metric. Metadata counts include lifecycle
+and shutdown records, but exclude headers, compaction and broker replication
+traffic. All control and candidate runs were kept; no throughput threshold is
+encoded as a correctness test.
+
+Final local validation passed SDK, coordinator and controller race suites;
+the server suite including the large diagnostic passed in 149.656 s after its
+inherited 20 s workload deadline was adjusted. Its initial timeout also affected
+the unchanged eager control under concurrent validation load. The large
+throughput diagnostic is now explicitly requested for measurements; the same
+prefetch, failed-commit, duplicate-bound and revocation checks remain ordinary CI
+tests. `golangci-lint run ./...` reported zero issues.
+
+The selected runtime passed a fresh isolated three-broker fault run (289.72 s),
+including all offsets draining to log end. Join took 7.350 s, process-kill recovery
+12.413 s, coordinator stop/start progress 11.104/14.572 s, and rolling restarts
+26.347/33.121/51.741 s. The run overlapped race/static checks; these phase times
+include readiness and are not recovery SLOs. The main consumer created/stopped
+12 workers; broker restarts added none. It fetched/delivered 309 records and
+41,361 payload bytes. Parent/graceful-peer duplicates were two records / 268
+bytes, and the maximum retained-partition gap was 13.269 s. Killed-child delivery
+counts and broker replication bytes remain outside these counters.
 
 ## Commit throughput analysis and measurements (2026-10-24)
 

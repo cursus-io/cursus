@@ -371,7 +371,7 @@ func (c *CooperativeConsumer) Commit(ctx context.Context, message CooperativeMes
 	return err
 }
 
-func (c *CooperativeConsumer) runPartition(ctx context.Context, w *cooperativeWorker, handler func(context.Context, CooperativeMessage) error) error {
+func (c *CooperativeConsumer) fetchPartition(ctx context.Context, w *cooperativeWorker, batches chan<- []Message) error {
 	cfg := c.transport.config
 	pid := w.token.Grant.Partition.Partition
 	var conn net.Conn
@@ -504,47 +504,13 @@ func (c *CooperativeConsumer) runPartition(ctx context.Context, w *cooperativeWo
 		for _, message := range messages {
 			c.bytes.Add(uint64(len(message.Payload)))
 		}
-		for _, message := range messages {
-			if ctx.Err() != nil {
+		if len(messages) > 0 {
+			select {
+			case batches <- messages:
+				offset = messages[len(messages)-1].Offset + 1
+			case <-ctx.Done():
 				return ctx.Err()
 			}
-			record := CooperativeMessage{Message: message, Group: cfg.GroupID, Ownership: w.token}
-			backoff := newBackoff(cfg.HandlerRetryBackoff, cfg.HandlerRetryMaxBackoff)
-			for attempt := 0; ; attempt++ {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				err := handler(ctx, record)
-				if err == nil {
-					break
-				}
-				if attempt >= cfg.HandlerMaxRetries {
-					return &ConsumerHandlerError{Partition: pid, Offset: message.Offset, Attempts: attempt + 1, Cause: err}
-				}
-				if !cooperativeWait(ctx, backoff.duration()) {
-					return ctx.Err()
-				}
-			}
-			c.delivered.Add(1)
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if cfg.EnableAutoCommit && message.Offset == messages[len(messages)-1].Offset {
-				commitRetry := newBackoff(max(cfg.CommitRetryBackoff, 100*time.Millisecond), time.Second)
-				for {
-					err = c.commitProcessedBatch(ctx, record)
-					if err == nil {
-						break
-					}
-					if !cooperativeRetryable(err) {
-						return err
-					}
-					if !cooperativeWait(ctx, commitRetry.duration()) {
-						return ctx.Err()
-					}
-				}
-			}
-			offset = message.Offset + 1
 		}
 		if cfg.Mode != ModeStreaming && !cooperativeWait(ctx, cfg.PollInterval) {
 			break

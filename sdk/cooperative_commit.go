@@ -13,6 +13,7 @@ import (
 
 type cooperativeCommitRequest struct {
 	ctx    context.Context
+	queued time.Time
 	record CooperativeMessage
 	done   chan error
 }
@@ -23,7 +24,7 @@ func (c *CooperativeConsumer) commitProcessedBatch(ctx context.Context, record C
 	ctx, cancel := boundedRequestContext(ctx, c.transport.requestTimeout())
 	defer cancel()
 	started := time.Now()
-	r := &cooperativeCommitRequest{ctx: ctx, record: record, done: make(chan error, 1)}
+	r := &cooperativeCommitRequest{ctx: ctx, queued: started, record: record, done: make(chan error, 1)}
 	c.commitMu.Lock()
 	c.commitPending = append(c.commitPending, r)
 	if !c.commitRunning {
@@ -42,9 +43,15 @@ func (c *CooperativeConsumer) commitProcessedBatch(ctx context.Context, record C
 
 func (c *CooperativeConsumer) flushProcessedBatches() {
 	for {
-		// A fixed short window collects simultaneously completed partitions;
-		// there is no barrier waiting for a slow or blocked partition.
-		time.Sleep(time.Millisecond)
+		// Collect for two milliseconds from the oldest queued request.
+		// Time spent behind an in-flight append already counts toward this
+		// window; do not sleep again when that append completes.
+		c.commitMu.Lock()
+		readyAt := c.commitPending[0].queued.Add(2 * time.Millisecond)
+		c.commitMu.Unlock()
+		if delay := time.Until(readyAt); delay > 0 {
+			time.Sleep(delay)
+		}
 		c.commitMu.Lock()
 		n := min(len(c.commitPending), protocol.MaxCooperativeCommitPartitions)
 		batch := append([]*cooperativeCommitRequest(nil), c.commitPending[:n]...)
