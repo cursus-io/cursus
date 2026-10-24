@@ -544,6 +544,14 @@ Underlying detached/file counters can overlap these logical layers and must not
 be summed as physical I/O. Process counters reset on restart; interrupted runs
 must retain each process sample separately to claim cumulative resource totals.
 
+`stage="consumer_frames"` measures the bounded internal-metadata range parser's
+actual mmap read return bytes and successfully decoded frames, including length
+headers rejected by the byte budget, records preceding the requested offset,
+partial failures and repeated reads. It includes recovery, ordinary metadata
+fetches and maintenance using that parser; it does not cover every disk read
+path. These are logical frame bytes, separate from replay key/payload bytes and
+Linux guest physical I/O. Counters are aggregated once per parser call.
+
 `RUN_E2E_CONSUMER_HISTORY_MEASURE=1 CURSUS_CLEANUP_PORT_OFFSET=34000`
 with `CURSUS_HISTORY_MEASURE_OUTPUT` set to a new JSONL file runs
 `TestConsumerHistoryWholeBrokerLadder`. It requires Docker and uses only that
