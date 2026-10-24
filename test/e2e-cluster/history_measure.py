@@ -57,6 +57,8 @@ def sample():
     if (cgroup / 'cpu.stat').exists():
         cpu = dict(line.split() for line in (cgroup / 'cpu.stat').read_text().splitlines())
         data['container_cpu_seconds'] = int(cpu['usage_usec']) / 1e6
+    elif (cgroup / 'cpuacct/cpuacct.usage').exists():
+        data['container_cpu_seconds'] = int((cgroup / 'cpuacct/cpuacct.usage').read_text()) / 1e9
     if (cgroup / 'io.stat').exists():
         reads = writes = 0
         for line in (cgroup / 'io.stat').read_text().splitlines():
@@ -66,6 +68,8 @@ def sample():
         data['container_read_bytes'], data['container_write_bytes'] = reads, writes
     if (cgroup / 'memory.peak').exists():
         data['container_peak_memory_bytes'] = int((cgroup / 'memory.peak').read_text())
+    elif (cgroup / 'memory/memory.max_usage_in_bytes').exists():
+        data['container_peak_memory_bytes'] = int((cgroup / 'memory/memory.max_usage_in_bytes').read_text())
     # Interface counters include replication/control traffic and monitoring;
     # they are distinct from application recovery payload-byte counters.
     received = transmitted = 0

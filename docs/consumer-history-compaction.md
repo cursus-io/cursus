@@ -67,9 +67,11 @@ measurements remain separate from these correctness tests.
 
 ## Implementation and rollout contract
 
-Official main `9c43d398eecc387ae0011bb7900b54a74a0b0d8d` contains the large-record, durable append-time,
-cooperative ownership/recovery and recovery scheduling changes. They are incorporated through the
-existing PRs. Production metadata
+The current integration base is official main
+`544b38739fc5cea3721640eb88cdd0758ab0d4c9`, including the cooperative runtime
+protocol and snapshot contract. The earlier audit base
+`9c43d398eecc387ae0011bb7900b54a74a0b0d8d` already contained the large-record,
+durable append-time and recovery scheduling changes. Production metadata
 uses producer ID `consumer-offset-coordinator`; fixtures must use that ID too.
 Keep both the last physical producer record and the maximum positive
 epoch/sequence/offset record used by partition recovery. Kafka 4.1.0 LogCleaner
@@ -94,8 +96,8 @@ producer/control state have an equivalent certified representation.
 
 ## Scope and comparison before implementation
 
-The implementation base is official main
-`9c43d398eecc387ae0011bb7900b54a74a0b0d8d`. Its distributed internal-topic
+The pre-implementation comparison used official main
+`9c43d398eecc387ae0011bb7900b54a74a0b0d8d`. The distributed internal-topic
 compaction guard remains necessary. The recovery index is disposable and must
 never authorize deleting authoritative records.
 
@@ -415,7 +417,7 @@ count alone. Do not close the history-growth issue based only on these results.
 
 ## Sequential certification reads (2026-10-24)
 
-The follow-up baseline is official main `9c43d39`, which includes both recovery
+This historical comparison used official main `9c43d39`, which includes both recovery
 index and ordinary history compaction. Kafka comparison was checked again
 against the **4.1.0 release commit**
 [`13f70256db3c994c590e5d262a7cc50b9e973204`](https://github.com/apache/kafka/tree/13f70256db3c994c590e5d262a7cc50b9e973204).
