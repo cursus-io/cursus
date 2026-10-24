@@ -54,3 +54,19 @@ bytes. The sampled per-node lineage read deltas were 2,159,249 / 4,797,672 /
 scan work was 140 bytes / one record. These instrumented stage counters are
 not physical-device I/O or a claim of no repeated hashing. The test took
 263.71 seconds including its full generation-change/crash/rebuild fixture.
+
+The subsequent proof-fence test commit `3b8a72f` also passed the
+[same unchanged CI job](https://github.com/cursus-io/cursus/actions/runs/40073880222/job/120812982708):
+**23** exchanges, **4,785,673** response bytes, 259.33 seconds. Per-node lineage
+reads were 2,159,249 / 5,573,857 / 2,497,033 bytes and record visits were
+11,533 / 27,109 / 11,563. The retained scan was still 140 bytes / one record.
+Different timing produces different repeated lineage work; neither run proves
+that hashing is eliminated. The following retained bootstrap and interrupted
+installation/index rebuild scenarios also passed in that job. All executable
+CI checks, including patch coverage and DCO, passed at this commit. CodeRabbit's
+rate-limit status is not an actual review and is tracked separately.
+
+These existing indexed-tail fixtures do not collect a per-phase CPU, RSS or
+fsync profile. Their byte/work evidence must not be substituted for the separate
+full live cleanup profile, and no prefix-specific CPU or media-cost claim is
+made from them.
