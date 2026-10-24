@@ -502,7 +502,7 @@ is the same binary with maintenance disabled; initial setup, seeding, maintenanc
 including restart, individual startup modes and coordinator failover are separate
 rows. Existing historical commit comparisons above remain a different experiment.
 
-The test-only image traces fsync/fdatasync and samples the broker's `/proc` CPU,
+The test-only image traces fsync/fdatasync with strace's seccomp BPF filter and samples the broker's `/proc` CPU,
 RSS and I/O counters and exported Go heap. Physical `read_bytes`/`write_bytes`
 are distinct from logical rchar/wchar, replay payload bytes and transfer metrics.
 Heap and temporary/store space peaks are sampled at 1 s, not exact maxima.
@@ -512,6 +512,9 @@ stopped fixture files; valid-index runs retain warm OS caches. Shutdown and
 explicit cache preparation are outside startup timers. Failover rows include
 survivor before/after counters. Interrupted-start rows currently expose the last
 process only, so their resource totals cannot represent all interrupted work.
+The experiment header records the source head, working-diff digest and tracing
+configuration. Earlier failed pilots did not use the seccomp filter and are not
+comparable timing samples. Both baseline and fix use the same instrumentation.
 
 Retained bytes are metadata `.log` bytes; total store bytes also include Raft,
 indexes and checkpoints and may include sparse logical file sizes. Unique group

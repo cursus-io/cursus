@@ -91,7 +91,7 @@ def run():
     trace_enabled = os.environ.get('HISTORY_TRACE_SYNC', 'true') == 'true'
     command = ['/app/broker', *args]
     if trace_enabled:
-        command = ['strace', '-f', '-e', 'trace=fsync,fdatasync', '-o', TRACE, *command]
+        command = ['strace', '-f', '--seccomp-bpf', '-e', 'trace=fsync,fdatasync', '-o', TRACE, *command]
     child = subprocess.Popen(command)
     def stop(sig, _frame):
         pid = broker_pid()

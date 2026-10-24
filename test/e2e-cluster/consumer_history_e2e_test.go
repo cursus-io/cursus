@@ -40,16 +40,22 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 	var metadata topicMetadata
 	require.NoError(t, json.Unmarshal([]byte(metadataJSON), &metadata))
 	replicas := make(map[int]bool)
+	remoteReaders := make(map[int]bool)
 	for _, partition := range metadata.Partitions {
+		if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
+			require.Len(t, partition.Replicas, 2)
+		}
 		for node := 1; node <= 3; node++ {
 			if slices.Contains(partition.Replicas, fmt.Sprintf("broker-%d-9000", node)) {
 				replicas[node] = true
+			} else {
+				remoteReaders[node] = true
 			}
 		}
 	}
 	require.NotEmpty(t, replicas)
 	if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
-		require.Len(t, replicas, 2, "fixture must include an actual nonreplica reader")
+		require.NotEmpty(t, remoteReaders, "fixture must include an actual nonreplica reader")
 	}
 	t.Logf("internal metadata replica brokers=%v", replicas)
 	var heartbeat []func()
@@ -145,7 +151,7 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 	}
 	if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
 		for node := 1; node <= 3; node++ {
-			if replicas[node] {
+			if !remoteReaders[node] {
 				continue
 			}
 			values := historyMeasureMetricsFor(t, []int{node})[node]

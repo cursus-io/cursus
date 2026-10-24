@@ -1,12 +1,14 @@
 package e2e_cluster
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -35,6 +37,14 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 		require.NoError(t, json.NewEncoder(file).Encode(row))
 		require.NoError(t, file.Sync())
 	}
+	head, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	require.NoError(t, err)
+	diff, err := exec.Command("git", "diff", "--binary", "HEAD").Output()
+	require.NoError(t, err)
+	emit(map[string]any{"phase": "experiment", "source_head": strings.TrimSpace(string(head)), "source_clean": len(diff) == 0,
+		"source_diff_sha256": fmt.Sprintf("%x", sha256.Sum256(diff)), "driver_go": runtime.Version(),
+		"broker_cpus": 2, "broker_memory_bytes": 1 << 30, "trace": "strace -f --seccomp-bpf -e trace=fsync,fdatasync",
+		"logical_groups": 4, "metadata_partitions": 4, "replication_factor": 3})
 	levels := []int{100, 1000, 10000}
 	if value := os.Getenv("CURSUS_HISTORY_MEASURE_LEVELS"); value != "" {
 		levels = nil
