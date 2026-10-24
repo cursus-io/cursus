@@ -77,15 +77,8 @@ func TestChaosTransactionCoordinatorFailoverAbortsTimedOutTransaction(t *testing
 	offsetGroup := "transaction-offset-group"
 	visibilityGroup := "transaction-visibility-group"
 
-	offsetClient := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
+	offsetClient, generation, memberID := joinClusterGroup(t, ctx.GetBrokerAddrs(), topic, offsetGroup)
 	defer offsetClient.Close()
-	generation, memberID, err := offsetClient.JoinGroup(topic, offsetGroup)
-	if err != nil {
-		t.Fatalf("join offset group: %v", err)
-	}
-	if _, err := offsetClient.SyncGroup(topic, offsetGroup, generation, memberID); err != nil {
-		t.Fatalf("sync offset group: %v", err)
-	}
 
 	txnClient := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	producer, err := txnClient.InitTransactionProducer(txnID)

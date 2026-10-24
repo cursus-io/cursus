@@ -9,9 +9,9 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// ActivateConsumerMetadataRouting checks every registered process, including
-// inactive ones, and every current voter. New voter admission requires the same
-// capability before membership changes, so a delayed JOIN cannot downgrade it.
+// ActivateConsumerMetadataRouting waits for every registered process and voter
+// to report recovered strict authority. Apply revalidates the complete process
+// set, so a delayed registration/restart cannot reuse another process's report.
 func ActivateConsumerMetadataRouting(rm RaftManager) error {
 	if rm == nil || rm.GetFSM() == nil || !rm.IsLeader() {
 		return nil
@@ -25,11 +25,13 @@ func ActivateConsumerMetadataRouting(rm RaftManager) error {
 		return nil
 	}
 	capable := make(map[string]bool, len(brokers))
+	processes := make([]fsm.BootstrapProcessIdentity, 0, len(brokers))
 	for _, broker := range brokers {
-		if broker.RecoveryProtocol < fsm.BootstrapRecoveryProtocolVersion || broker.LifecycleProtocol < fsm.ReplicaGapRecoveryProtocolVersion || broker.IncarnationID == "" || broker.IncarnationEpoch == 0 {
+		if broker.RecoveryProtocol < fsm.BootstrapRecoveryProtocolVersion || broker.LifecycleProtocol < fsm.ReplicaGapRecoveryProtocolVersion || broker.IncarnationID == "" || broker.IncarnationEpoch == 0 || broker.Status != "active" || !broker.ConsumerRoutingReady {
 			return nil
 		}
 		capable[broker.ID] = true
+		processes = append(processes, fsm.BootstrapProcessIdentity{BrokerID: broker.ID, IncarnationID: broker.IncarnationID, IncarnationEpoch: broker.IncarnationEpoch})
 	}
 	configuration := rm.GetConfiguration()
 	if configuration == nil {
@@ -38,7 +40,8 @@ func ActivateConsumerMetadataRouting(rm RaftManager) error {
 	if err := configuration.Error(); err != nil {
 		return err
 	}
-	command := fsm.ConsumerRoutingActivation{}
+	sort.Slice(processes, func(i, j int) bool { return processes[i].BrokerID < processes[j].BrokerID })
+	command := fsm.ConsumerRoutingActivation{Processes: processes}
 	for _, server := range configuration.Configuration().Servers {
 		if server.Suffrage != raft.Voter {
 			continue

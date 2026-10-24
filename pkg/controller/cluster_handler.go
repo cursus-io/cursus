@@ -330,10 +330,12 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if recovered {
 		return nil
 	}
-	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() || ch.legacyConsumerRecoveryRequired() {
 		// The monitor performs owned recovery outside ordinary admission. A
 		// request cannot drain the admission lease it is currently holding.
-		return ErrConsumerRecoveryPending
+		// Report the existing pre-admission recovery code so callers can retry
+		// the same membership/request without treating it as an absent owner.
+		return coordinator.ErrConsumerMetadataRecovering
 	}
 
 	ch.groupRecoveryReloadMu.Lock()
@@ -434,6 +436,8 @@ func (ch *CommandHandler) refreshLocalGroupRecovery() error {
 	return ch.refreshLocalGroupRecoveryContext(context.Background())
 }
 
+// refreshLocalGroupRecoveryContext reconciles startup/restore requirements and
+// changed ownership outside request admission, which cannot acquire that lease.
 func (ch *CommandHandler) refreshLocalGroupRecoveryContext(ctx context.Context) error {
 	if err := ch.ReconstructConsumerBootstrapTickets(); err != nil {
 		return err
@@ -444,7 +448,7 @@ func (ch *CommandHandler) refreshLocalGroupRecoveryContext(ctx context.Context) 
 	if err := ch.consumerReadinessError(); err != nil {
 		return err
 	}
-	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() || ch.legacyConsumerRecoveryRequired() {
 		epochs, err := ch.localGroupRecoveryEpochs()
 		if err != nil {
 			return err
