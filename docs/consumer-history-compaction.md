@@ -31,7 +31,7 @@ the positive coordinator epoch; ownership movement advances sequence without
 creating another producer ID. Old control identities remain protected.
 
 A whole closed-prefix certificate can be reused for an ordered segment sweep
-only when every target group has one physical source, each semantic key advances
+only when every target group's ordinary state has one physical source, each semantic key advances
 epoch/revision, and lifecycle formats stay constant within an epoch. The retained
 final witnesses then preserve **every intermediate state**, not just final replay
 equivalence. Other histories use the conservative single-segment path. Each
@@ -43,6 +43,13 @@ still has a 250 ms bound. When the FSM fence was never entered, publication can
 retry the existing certificate up to 16 times, releasing admission and waiting
 100 ms between attempts. A failure after entry discards the certificate. Metrics
 include successful earlier segments even when a later segment defers. No live membership or ownership clock is imported.
+
+Version-7 transactional intents may reside on another physical partition. They
+do not supply materialized offset state and use the separate retirement proof;
+the final intent preserves that source's provenance and producer continuity.
+Cross-partition transaction tests replay after every single-frame publication,
+including each gap between intent and control removal. Ordinary multi-source
+histories still require conservative single-segment certification.
 
 Nonreplica partitions use the existing budgeted detached-transfer cache, with
 raw reads and immutable adopted-prefix generation. Before publication, refresh
@@ -492,6 +499,28 @@ Publication temporarily closes consumer admission. If it starts between command
 preflight and coordinator routing, routing preserves the same retryable
 `consumer_metadata_recovering` response. The tests count these retries in request
 completion latency; they do not rejoin members or retry epoch/ownership failures.
+
+Cleanup on a nonreplica stages the missing committed raw prefixes through the
+same bounded, certified transfer cache as recovery, before taking coordinator
+lifecycle/global locks. Local read callbacks fence FSM transitions and validate
+topic incarnation, topology, committed cuts and source/requester incarnations.
+The final materialization check performs only nonblocking in-memory validation.
+These remote proofs are ephemeral: they never become a durable cleanup
+checkpoint or startup index. Replacement, restore, rollback or process/topology
+changes require fresh evidence. No cleanup view imports the complete group state
+or renews unrelated membership clocks. If membership changes between bounded
+passes, the deletion target is refreshed so its generation fence can converge.
+
+`cursus_recovery_work_total{stage="consumer_replay"}` counts every source-adapter
+page and returned record/key-payload byte, including partial errors and repeated
+attempts. It excludes in-memory projection reads and maintenance certification,
+which has separate counters. Raw reads count returned uncommitted tails as work,
+never as certified state. `stage="consumer_index"` counts actual cache file
+read/write bytes even when parsing or publication fails. These cumulative counters
+must accompany the last-recovery gauges; a later hit does not erase earlier work.
+Underlying detached/file counters can overlap these logical layers and must not
+be summed as physical I/O. Process counters reset on restart; interrupted runs
+must retain each process sample separately to claim cumulative resource totals.
 
 `RUN_E2E_CONSUMER_HISTORY_MEASURE=1 CURSUS_CLEANUP_PORT_OFFSET=34000`
 with `CURSUS_HISTORY_MEASURE_OUTPUT` set to a new JSONL file runs

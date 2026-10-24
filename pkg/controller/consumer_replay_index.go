@@ -32,6 +32,9 @@ func (r *consumerRecoveryReader) ReadRawConsumerMetadataIndex(p int, offset uint
 		return nil, fmt.Errorf("local replay index view unavailable")
 	}
 	messages, err := r.views[p].ReadMessages(offset, max)
+	// Count physical adapter results before trimming an uncommitted tail. Work
+	// counters do not certify visibility, and include failed/partial attempts.
+	r.observeReplayRead(messages)
 	for i, m := range messages {
 		if m.Offset >= r.ends[p] {
 			return messages[:i], err
