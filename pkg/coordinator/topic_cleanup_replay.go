@@ -279,9 +279,6 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		}
 		reader, ok = prepared, prepared != nil
 	}
-	if !ok {
-		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "committed metadata view unavailable"}
-	}
 	if !c.lifecycleMu.TryLock() {
 		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "group lifecycle busy"}
 	}
@@ -291,6 +288,9 @@ func (c *Coordinator) ReconcileTopicGroupsContext(ctx context.Context, topicName
 		delete(c.cleanupProgress, topicName)
 		c.removeCleanupCheckpoint(topicName)
 		return nil, nil
+	}
+	if !ok {
+		return nil, &TopicCleanupPending{Topic: topicName, State: CleanupWait, Reason: "committed metadata view unavailable"}
 	}
 	references = c.pendingCleanupReferences(references, previous, boundary)
 	for _, reference := range references {
@@ -775,6 +775,16 @@ func (scan *topicCleanupScan) observeAt(message types.Message, partition int) er
 	record, versioned, err := decodeConsumerMetadataRecord(message.Payload)
 	if err != nil || !versioned || message.Key != consumerMetadataRecordKey(record) {
 		return fmt.Errorf("invalid consumer metadata for group %q", identity.Group)
+	}
+	if record.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot {
+		// Raw transaction intents do not materialize group state and cannot
+		// authorize cleanup. Validate their envelope before ignoring them;
+		// current reservations remain protected by lifecycle admission.
+		if message.TransactionalID != record.TransactionalID || message.ProducerID != record.ProducerID || message.Epoch != record.ProducerEpoch ||
+			(message.TransactionState != types.TransactionStateOpen && message.TransactionState != types.TransactionStateCommitted) {
+			return fmt.Errorf("invalid transactional cleanup evidence for group %q", identity.Group)
+		}
+		return nil
 	}
 	// Group lifecycle records are nontransactional. A transaction (even an
 	// aborted/open one) can never supply deletion authority.
