@@ -172,9 +172,11 @@ func (r *consumerRecoveryReader) observeReplayRead(messages []types.Message) {
 	}
 	metrics.RecordRecoveryWork(metrics.RecoveryConsumerReplay, metrics.RecoveryPages, 1)
 	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerReplay, metrics.RecoveryDecodedFrames, int64(len(messages)))
+	var decodedBytes int64
 	for _, m := range messages {
-		metrics.RecordRecoveryBytes(metrics.RecoveryConsumerReplay, metrics.RecoveryDecodedBytes, int64(len(m.Key)+len(m.Payload)))
+		decodedBytes += int64(len(m.Key) + len(m.Payload))
 	}
+	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerReplay, metrics.RecoveryDecodedBytes, decodedBytes)
 }
 
 func (ch *CommandHandler) consumerReadinessError() error {
