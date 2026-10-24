@@ -256,3 +256,13 @@ matrix/profile list without relabeling the earlier measurements.
    compatibility interpretation above, rather than silently changing clients.
 
 No issue closure, deployment, merge or auto-merge is performed by this audit.
+
+## Cooperative runtime integration
+
+Main at `544b387` includes the cooperative broker/Go runtime from #311. The
+earlier audit and measurements above keep their stated source revisions. The
+integrated deployment now uses lifecycle protocol 11 and local Raft marker 14;
+FSM snapshots remain 11 by default, select 12 for cooperative ownership state,
+and select 13 after runtime activation. See the [upgrade runbook](../operations/upgrade-and-recovery.md)
+for capability and downgrade boundaries. This integration preserves the SDK
+receipt validation and does not repeat or relabel the earlier fault measurements.

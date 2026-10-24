@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
@@ -61,6 +62,13 @@ func TestRetainedRecoveryIndexedExchangeWithCapablePeers(t *testing.T) {
 				provider.storage.afterPage = rewrite
 			}
 			batch, err := f.FetchReplicaCatchup(r)
+			// A background checkpoint may briefly own publication. Retry only
+			// this explicit transient response, never a lineage/fault result.
+			deadline := time.Now().Add(time.Second)
+			for errors.Is(err, disk.ErrContentPublicationBusy) && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+				batch, err = f.FetchReplicaCatchup(r)
+			}
 			switch variant {
 			case "matched":
 				require.NoError(t, err)

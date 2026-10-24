@@ -606,6 +606,10 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 			}
 		} else {
 			c.groups = p.scratch.groups
+			// Only verified full replay under the exclusive lease resolves an
+			// ambiguous lifecycle append. Failed or scoped replay keeps fences.
+			c.lifecyclePending = make(map[string]bool)
+			c.cooperativePending = make(map[string]*CooperativeAssignment)
 			c.groupEpochs = p.scratch.groupEpochs
 			c.ownershipSince = ownership
 			c.consumerAdmission.installedGeneration = p.stamp.required

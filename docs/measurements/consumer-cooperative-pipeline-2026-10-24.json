@@ -1,0 +1,1761 @@
+{
+  "date": "2026-10-24",
+  "baseline_commit": "cac136cccd27d66bbfd5d5ee550b662d87858511",
+  "variants": {
+    "before": "Published synchronous coalescer, serial fetch/handle/commit, fixed 1 ms sleep per flush",
+    "after": "One-batch read-ahead, 1 ms collection measured from oldest queued request",
+    "window2": "Selected implementation: one-batch read-ahead, 2 ms collection measured from oldest queued request"
+  },
+  "environment": {
+    "go": "1.26.2",
+    "os": "Linux Docker",
+    "cpu_limit": 2,
+    "GOMAXPROCS": 2,
+    "race": false,
+    "handler_delay_ms": 1,
+    "batch_records": 8,
+    "payload_bytes": 128,
+    "partitions": 6,
+    "poll_interval_ms": 1,
+    "eager_auto_commit_interval_ms": 10,
+    "logs": "Written inside container; copied to host after each test binary exits"
+  },
+  "method": {
+    "baseline_test_overlay": "All variants use the same extended comparison tests, including durable completion. Final duplicate-bound assertions, longer race-test deadlines and the RUN_COOPERATIVE_THROUGHPUT opt-in for the large diagnostic were added afterward; runtime behavior is identical.",
+    "workloads": {
+      "EagerComparison": "960 records; second member joins after partition 0 delivers 16",
+      "BacklogThroughput": "9600 records; one member throughout"
+    },
+    "run_order": [
+      [
+        "before",
+        "after",
+        "window2"
+      ],
+      [
+        "window2",
+        "after",
+        "before"
+      ],
+      [
+        "after",
+        "before",
+        "window2"
+      ],
+      [
+        "before",
+        "after",
+        "window2"
+      ],
+      [
+        "window2",
+        "after",
+        "before"
+      ]
+    ],
+    "limitations": [
+      "Small local backlogs, not production steady-state capacity",
+      "Host load varied; eager controls and per-run ranges are included",
+      "Commit policies differ: eager interval asynchronous, cooperative synchronous per batch",
+      "Metadata payload bytes exclude record headers, replication traffic and compaction",
+      "Fetched payload includes discarded read-ahead; handler replay bytes count duplicate handler records only",
+      "Do not compare absolute rates against older runs as if host conditions were identical"
+    ]
+  },
+  "runs": [
+    {
+      "variant": "after",
+      "run": 1,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2060.6,
+      "durable_completion_ms": 465,
+      "metadata_records": 30,
+      "metadata_replay_payload_bytes": 9889,
+      "unique_records": 960,
+      "records_per_second": 2311.1,
+      "backlog_drain_after_join_ms": 370,
+      "retained_partition_0_max_gap_ms": 46,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "after",
+      "run": 1,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1284.9,
+      "durable_completion_ms": 747,
+      "worker_starts": 9,
+      "fetched_records": 992,
+      "fetched_payload_bytes": 126976,
+      "commit_requests": 58,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 2408,
+      "metadata_records": 64,
+      "metadata_replay_payload_bytes": 30256,
+      "unique_records": 960,
+      "records_per_second": 1305.2,
+      "backlog_drain_after_join_ms": 670,
+      "retained_partition_0_max_gap_ms": 66,
+      "duplicate_deliveries": 9,
+      "replay_payload_bytes": 1152
+    },
+    {
+      "variant": "after",
+      "run": 1,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3328.0,
+      "durable_completion_ms": 2884,
+      "metadata_records": 198,
+      "metadata_replay_payload_bytes": 66190,
+      "unique_records": 9600,
+      "records_per_second": 3348.8,
+      "backlog_drain_after_join_ms": 2820,
+      "retained_partition_0_max_gap_ms": 71,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 1,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1788.5,
+      "durable_completion_ms": 5367,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 420,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 17583,
+      "metadata_records": 423,
+      "metadata_replay_payload_bytes": 144235,
+      "unique_records": 9600,
+      "records_per_second": 1790.1,
+      "backlog_drain_after_join_ms": 5270,
+      "retained_partition_0_max_gap_ms": 48,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 2,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2807.3,
+      "durable_completion_ms": 341,
+      "metadata_records": 31,
+      "metadata_replay_payload_bytes": 10224,
+      "unique_records": 960,
+      "records_per_second": 2903.5,
+      "backlog_drain_after_join_ms": 290,
+      "retained_partition_0_max_gap_ms": 19,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "after",
+      "run": 2,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1394.0,
+      "durable_completion_ms": 688,
+      "worker_starts": 9,
+      "fetched_records": 984,
+      "fetched_payload_bytes": 125952,
+      "commit_requests": 53,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 2426,
+      "metadata_records": 59,
+      "metadata_replay_payload_bytes": 28700,
+      "unique_records": 960,
+      "records_per_second": 1417.9,
+      "backlog_drain_after_join_ms": 630,
+      "retained_partition_0_max_gap_ms": 63,
+      "duplicate_deliveries": 3,
+      "replay_payload_bytes": 384
+    },
+    {
+      "variant": "after",
+      "run": 2,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 4096.7,
+      "durable_completion_ms": 2343,
+      "metadata_records": 206,
+      "metadata_replay_payload_bytes": 68903,
+      "unique_records": 9600,
+      "records_per_second": 4127.3,
+      "backlog_drain_after_join_ms": 2280,
+      "retained_partition_0_max_gap_ms": 18,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 2,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1892.3,
+      "durable_completion_ms": 5073,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 435,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 16373,
+      "metadata_records": 438,
+      "metadata_replay_payload_bytes": 149294,
+      "unique_records": 9600,
+      "records_per_second": 1896.9,
+      "backlog_drain_after_join_ms": 5010,
+      "retained_partition_0_max_gap_ms": 65,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 3,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2082.9,
+      "durable_completion_ms": 460,
+      "metadata_records": 34,
+      "metadata_replay_payload_bytes": 11217,
+      "unique_records": 960,
+      "records_per_second": 2250.3,
+      "backlog_drain_after_join_ms": 381,
+      "retained_partition_0_max_gap_ms": 39,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "after",
+      "run": 3,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1383.1,
+      "durable_completion_ms": 694,
+      "worker_starts": 9,
+      "fetched_records": 968,
+      "fetched_payload_bytes": 123904,
+      "commit_requests": 58,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 2314,
+      "metadata_records": 64,
+      "metadata_replay_payload_bytes": 30312,
+      "unique_records": 960,
+      "records_per_second": 1390.0,
+      "backlog_drain_after_join_ms": 630,
+      "retained_partition_0_max_gap_ms": 77,
+      "duplicate_deliveries": 1,
+      "replay_payload_bytes": 128
+    },
+    {
+      "variant": "after",
+      "run": 3,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 4090.1,
+      "durable_completion_ms": 2347,
+      "metadata_records": 217,
+      "metadata_replay_payload_bytes": 72486,
+      "unique_records": 9600,
+      "records_per_second": 4099.3,
+      "backlog_drain_after_join_ms": 2281,
+      "retained_partition_0_max_gap_ms": 19,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 3,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1937.6,
+      "durable_completion_ms": 4954,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 425,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 15530,
+      "metadata_records": 428,
+      "metadata_replay_payload_bytes": 146017,
+      "unique_records": 9600,
+      "records_per_second": 1939.0,
+      "backlog_drain_after_join_ms": 4890,
+      "retained_partition_0_max_gap_ms": 218,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 4,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2535.1,
+      "durable_completion_ms": 378,
+      "metadata_records": 31,
+      "metadata_replay_payload_bytes": 10218,
+      "unique_records": 960,
+      "records_per_second": 2595.9,
+      "backlog_drain_after_join_ms": 324,
+      "retained_partition_0_max_gap_ms": 19,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "after",
+      "run": 4,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1578.7,
+      "durable_completion_ms": 608,
+      "worker_starts": 9,
+      "fetched_records": 1008,
+      "fetched_payload_bytes": 129024,
+      "commit_requests": 57,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1846,
+      "metadata_records": 63,
+      "metadata_replay_payload_bytes": 29971,
+      "unique_records": 960,
+      "records_per_second": 1597.2,
+      "backlog_drain_after_join_ms": 550,
+      "retained_partition_0_max_gap_ms": 94,
+      "duplicate_deliveries": 9,
+      "replay_payload_bytes": 1152
+    },
+    {
+      "variant": "after",
+      "run": 4,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3969.2,
+      "durable_completion_ms": 2418,
+      "metadata_records": 222,
+      "metadata_replay_payload_bytes": 74310,
+      "unique_records": 9600,
+      "records_per_second": 4015.4,
+      "backlog_drain_after_join_ms": 2350,
+      "retained_partition_0_max_gap_ms": 18,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 4,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 2121.1,
+      "durable_completion_ms": 4525,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 469,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 13291,
+      "metadata_records": 472,
+      "metadata_replay_payload_bytes": 160913,
+      "unique_records": 9600,
+      "records_per_second": 2123.2,
+      "backlog_drain_after_join_ms": 4471,
+      "retained_partition_0_max_gap_ms": 56,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 5,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2854.5,
+      "durable_completion_ms": 336,
+      "metadata_records": 34,
+      "metadata_replay_payload_bytes": 11209,
+      "unique_records": 960,
+      "records_per_second": 2896.1,
+      "backlog_drain_after_join_ms": 290,
+      "retained_partition_0_max_gap_ms": 17,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "after",
+      "run": 5,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1551.8,
+      "durable_completion_ms": 618,
+      "worker_starts": 9,
+      "fetched_records": 992,
+      "fetched_payload_bytes": 126976,
+      "commit_requests": 53,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1827,
+      "metadata_records": 59,
+      "metadata_replay_payload_bytes": 28672,
+      "unique_records": 960,
+      "records_per_second": 1570.7,
+      "backlog_drain_after_join_ms": 560,
+      "retained_partition_0_max_gap_ms": 52,
+      "duplicate_deliveries": 8,
+      "replay_payload_bytes": 1024
+    },
+    {
+      "variant": "after",
+      "run": 5,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 4112.0,
+      "durable_completion_ms": 2334,
+      "metadata_records": 217,
+      "metadata_replay_payload_bytes": 72631,
+      "unique_records": 9600,
+      "records_per_second": 4128.1,
+      "backlog_drain_after_join_ms": 2280,
+      "retained_partition_0_max_gap_ms": 15,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "after",
+      "run": 5,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1822.3,
+      "durable_completion_ms": 5267,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 441,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 16063,
+      "metadata_records": 444,
+      "metadata_replay_payload_bytes": 151337,
+      "unique_records": 9600,
+      "records_per_second": 1824.9,
+      "backlog_drain_after_join_ms": 5210,
+      "retained_partition_0_max_gap_ms": 38,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 1,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 1425.3,
+      "durable_completion_ms": 673,
+      "metadata_records": 41,
+      "metadata_replay_payload_bytes": 13509,
+      "unique_records": 960,
+      "records_per_second": 1440.7,
+      "backlog_drain_after_join_ms": 621,
+      "retained_partition_0_max_gap_ms": 143,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "before",
+      "run": 1,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 776.7,
+      "durable_completion_ms": 1235,
+      "worker_starts": 9,
+      "fetched_records": 968,
+      "fetched_payload_bytes": 123904,
+      "commit_requests": 83,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 3481,
+      "metadata_records": 89,
+      "metadata_replay_payload_bytes": 38568,
+      "unique_records": 960,
+      "records_per_second": 782.5,
+      "backlog_drain_after_join_ms": 1171,
+      "retained_partition_0_max_gap_ms": 146,
+      "duplicate_deliveries": 1,
+      "replay_payload_bytes": 128
+    },
+    {
+      "variant": "before",
+      "run": 1,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 2724.0,
+      "durable_completion_ms": 3524,
+      "metadata_records": 204,
+      "metadata_replay_payload_bytes": 68120,
+      "unique_records": 9600,
+      "records_per_second": 2734.0,
+      "backlog_drain_after_join_ms": 3450,
+      "retained_partition_0_max_gap_ms": 809,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 1,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1396.6,
+      "durable_completion_ms": 6873,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 406,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 20484,
+      "metadata_records": 409,
+      "metadata_replay_payload_bytes": 139444,
+      "unique_records": 9600,
+      "records_per_second": 1398.0,
+      "backlog_drain_after_join_ms": 6800,
+      "retained_partition_0_max_gap_ms": 104,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 2,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 1581.4,
+      "durable_completion_ms": 607,
+      "metadata_records": 40,
+      "metadata_replay_payload_bytes": 13170,
+      "unique_records": 960,
+      "records_per_second": 1584.3,
+      "backlog_drain_after_join_ms": 560,
+      "retained_partition_0_max_gap_ms": 194,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "before",
+      "run": 2,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 899.0,
+      "durable_completion_ms": 1067,
+      "worker_starts": 9,
+      "fetched_records": 984,
+      "fetched_payload_bytes": 125952,
+      "commit_requests": 72,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 2658,
+      "metadata_records": 78,
+      "metadata_replay_payload_bytes": 34839,
+      "unique_records": 960,
+      "records_per_second": 905.0,
+      "backlog_drain_after_join_ms": 980,
+      "retained_partition_0_max_gap_ms": 90,
+      "duplicate_deliveries": 17,
+      "replay_payload_bytes": 2176
+    },
+    {
+      "variant": "before",
+      "run": 2,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3741.5,
+      "durable_completion_ms": 2565,
+      "metadata_records": 222,
+      "metadata_replay_payload_bytes": 74248,
+      "unique_records": 9600,
+      "records_per_second": 3756.4,
+      "backlog_drain_after_join_ms": 2510,
+      "retained_partition_0_max_gap_ms": 23,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 2,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1634.9,
+      "durable_completion_ms": 5871,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 418,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 15964,
+      "metadata_records": 421,
+      "metadata_replay_payload_bytes": 143596,
+      "unique_records": 9600,
+      "records_per_second": 1635.5,
+      "backlog_drain_after_join_ms": 5818,
+      "retained_partition_0_max_gap_ms": 102,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 3,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2074.7,
+      "durable_completion_ms": 462,
+      "metadata_records": 36,
+      "metadata_replay_payload_bytes": 11871,
+      "unique_records": 960,
+      "records_per_second": 2311.3,
+      "backlog_drain_after_join_ms": 370,
+      "retained_partition_0_max_gap_ms": 48,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "before",
+      "run": 3,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1296.3,
+      "durable_completion_ms": 740,
+      "worker_starts": 9,
+      "fetched_records": 984,
+      "fetched_payload_bytes": 125952,
+      "commit_requests": 47,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1953,
+      "metadata_records": 53,
+      "metadata_replay_payload_bytes": 26702,
+      "unique_records": 960,
+      "records_per_second": 1312.2,
+      "backlog_drain_after_join_ms": 681,
+      "retained_partition_0_max_gap_ms": 102,
+      "duplicate_deliveries": 15,
+      "replay_payload_bytes": 1920
+    },
+    {
+      "variant": "before",
+      "run": 3,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3697.6,
+      "durable_completion_ms": 2596,
+      "metadata_records": 218,
+      "metadata_replay_payload_bytes": 72970,
+      "unique_records": 9600,
+      "records_per_second": 3711.0,
+      "backlog_drain_after_join_ms": 2450,
+      "retained_partition_0_max_gap_ms": 20,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 3,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1583.6,
+      "durable_completion_ms": 6062,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 433,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 16501,
+      "metadata_records": 436,
+      "metadata_replay_payload_bytes": 148567,
+      "unique_records": 9600,
+      "records_per_second": 1586.3,
+      "backlog_drain_after_join_ms": 5990,
+      "retained_partition_0_max_gap_ms": 59,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 4,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2204.8,
+      "durable_completion_ms": 435,
+      "metadata_records": 35,
+      "metadata_replay_payload_bytes": 11537,
+      "unique_records": 960,
+      "records_per_second": 2421.8,
+      "backlog_drain_after_join_ms": 350,
+      "retained_partition_0_max_gap_ms": 34,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "before",
+      "run": 4,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1180.8,
+      "durable_completion_ms": 813,
+      "worker_starts": 9,
+      "fetched_records": 960,
+      "fetched_payload_bytes": 122880,
+      "commit_requests": 69,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1926,
+      "metadata_records": 75,
+      "metadata_replay_payload_bytes": 33790,
+      "unique_records": 960,
+      "records_per_second": 1190.5,
+      "backlog_drain_after_join_ms": 760,
+      "retained_partition_0_max_gap_ms": 49,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 4,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3716.3,
+      "durable_completion_ms": 2583,
+      "metadata_records": 229,
+      "metadata_replay_payload_bytes": 76579,
+      "unique_records": 9600,
+      "records_per_second": 3733.1,
+      "backlog_drain_after_join_ms": 2520,
+      "retained_partition_0_max_gap_ms": 26,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 4,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1697.2,
+      "durable_completion_ms": 5656,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 426,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 14692,
+      "metadata_records": 429,
+      "metadata_replay_payload_bytes": 146153,
+      "unique_records": 9600,
+      "records_per_second": 1699.0,
+      "backlog_drain_after_join_ms": 5580,
+      "retained_partition_0_max_gap_ms": 45,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 5,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2020.6,
+      "durable_completion_ms": 475,
+      "metadata_records": 41,
+      "metadata_replay_payload_bytes": 13513,
+      "unique_records": 960,
+      "records_per_second": 2088.1,
+      "backlog_drain_after_join_ms": 418,
+      "retained_partition_0_max_gap_ms": 80,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "before",
+      "run": 5,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1129.5,
+      "durable_completion_ms": 849,
+      "worker_starts": 9,
+      "fetched_records": 984,
+      "fetched_payload_bytes": 125952,
+      "commit_requests": 82,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 2117,
+      "metadata_records": 88,
+      "metadata_replay_payload_bytes": 38199,
+      "unique_records": 960,
+      "records_per_second": 1133.9,
+      "backlog_drain_after_join_ms": 790,
+      "retained_partition_0_max_gap_ms": 93,
+      "duplicate_deliveries": 18,
+      "replay_payload_bytes": 2304
+    },
+    {
+      "variant": "before",
+      "run": 5,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3895.2,
+      "durable_completion_ms": 2464,
+      "metadata_records": 218,
+      "metadata_replay_payload_bytes": 72953,
+      "unique_records": 9600,
+      "records_per_second": 3909.1,
+      "backlog_drain_after_join_ms": 2410,
+      "retained_partition_0_max_gap_ms": 20,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "before",
+      "run": 5,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1722.2,
+      "durable_completion_ms": 5574,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 442,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 14233,
+      "metadata_records": 445,
+      "metadata_replay_payload_bytes": 151748,
+      "unique_records": 9600,
+      "records_per_second": 1724.8,
+      "backlog_drain_after_join_ms": 5500,
+      "retained_partition_0_max_gap_ms": 66,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 1,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2073.5,
+      "durable_completion_ms": 462,
+      "metadata_records": 33,
+      "metadata_replay_payload_bytes": 10881,
+      "unique_records": 960,
+      "records_per_second": 2224.9,
+      "backlog_drain_after_join_ms": 391,
+      "retained_partition_0_max_gap_ms": 60,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "window2",
+      "run": 1,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1534.0,
+      "durable_completion_ms": 625,
+      "worker_starts": 9,
+      "fetched_records": 1008,
+      "fetched_payload_bytes": 129024,
+      "commit_requests": 38,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1903,
+      "metadata_records": 44,
+      "metadata_replay_payload_bytes": 23720,
+      "unique_records": 960,
+      "records_per_second": 1568.9,
+      "backlog_drain_after_join_ms": 560,
+      "retained_partition_0_max_gap_ms": 43,
+      "duplicate_deliveries": 15,
+      "replay_payload_bytes": 1920
+    },
+    {
+      "variant": "window2",
+      "run": 1,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3838.3,
+      "durable_completion_ms": 2501,
+      "metadata_records": 207,
+      "metadata_replay_payload_bytes": 69251,
+      "unique_records": 9600,
+      "records_per_second": 3861.3,
+      "backlog_drain_after_join_ms": 2420,
+      "retained_partition_0_max_gap_ms": 18,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 1,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 2064.0,
+      "durable_completion_ms": 4651,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 282,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 14701,
+      "metadata_records": 285,
+      "metadata_replay_payload_bytes": 98050,
+      "unique_records": 9600,
+      "records_per_second": 2066.5,
+      "backlog_drain_after_join_ms": 4590,
+      "retained_partition_0_max_gap_ms": 53,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 2,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 1976.1,
+      "durable_completion_ms": 485,
+      "metadata_records": 34,
+      "metadata_replay_payload_bytes": 11212,
+      "unique_records": 960,
+      "records_per_second": 2039.3,
+      "backlog_drain_after_join_ms": 420,
+      "retained_partition_0_max_gap_ms": 44,
+      "duplicate_deliveries": 240,
+      "replay_payload_bytes": 30720
+    },
+    {
+      "variant": "window2",
+      "run": 2,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1568.9,
+      "durable_completion_ms": 611,
+      "worker_starts": 9,
+      "fetched_records": 1008,
+      "fetched_payload_bytes": 129024,
+      "commit_requests": 38,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1907,
+      "metadata_records": 44,
+      "metadata_replay_payload_bytes": 23729,
+      "unique_records": 960,
+      "records_per_second": 1581.7,
+      "backlog_drain_after_join_ms": 560,
+      "retained_partition_0_max_gap_ms": 53,
+      "duplicate_deliveries": 14,
+      "replay_payload_bytes": 1792
+    },
+    {
+      "variant": "window2",
+      "run": 2,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3602.2,
+      "durable_completion_ms": 2665,
+      "metadata_records": 218,
+      "metadata_replay_payload_bytes": 72840,
+      "unique_records": 9600,
+      "records_per_second": 3614.8,
+      "backlog_drain_after_join_ms": 2600,
+      "retained_partition_0_max_gap_ms": 34,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 2,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 2041.1,
+      "durable_completion_ms": 4703,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 377,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 14388,
+      "metadata_records": 380,
+      "metadata_replay_payload_bytes": 129794,
+      "unique_records": 9600,
+      "records_per_second": 2043.2,
+      "backlog_drain_after_join_ms": 4620,
+      "retained_partition_0_max_gap_ms": 61,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 3,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 2078.0,
+      "durable_completion_ms": 461,
+      "metadata_records": 33,
+      "metadata_replay_payload_bytes": 10878,
+      "unique_records": 960,
+      "records_per_second": 2284.7,
+      "backlog_drain_after_join_ms": 380,
+      "retained_partition_0_max_gap_ms": 57,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "window2",
+      "run": 3,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1547.9,
+      "durable_completion_ms": 620,
+      "worker_starts": 9,
+      "fetched_records": 1008,
+      "fetched_payload_bytes": 129024,
+      "commit_requests": 38,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1620,
+      "metadata_records": 44,
+      "metadata_replay_payload_bytes": 23728,
+      "unique_records": 960,
+      "records_per_second": 1557.9,
+      "backlog_drain_after_join_ms": 561,
+      "retained_partition_0_max_gap_ms": 33,
+      "duplicate_deliveries": 15,
+      "replay_payload_bytes": 1920
+    },
+    {
+      "variant": "window2",
+      "run": 3,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3787.0,
+      "durable_completion_ms": 2534,
+      "metadata_records": 217,
+      "metadata_replay_payload_bytes": 72593,
+      "unique_records": 9600,
+      "records_per_second": 3790.8,
+      "backlog_drain_after_join_ms": 2481,
+      "retained_partition_0_max_gap_ms": 43,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 3,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1917.2,
+      "durable_completion_ms": 5007,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 408,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 15817,
+      "metadata_records": 411,
+      "metadata_replay_payload_bytes": 140286,
+      "unique_records": 9600,
+      "records_per_second": 1921.2,
+      "backlog_drain_after_join_ms": 4940,
+      "retained_partition_0_max_gap_ms": 56,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 4,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 3050.6,
+      "durable_completion_ms": 314,
+      "metadata_records": 34,
+      "metadata_replay_payload_bytes": 11216,
+      "unique_records": 960,
+      "records_per_second": 3191.3,
+      "backlog_drain_after_join_ms": 260,
+      "retained_partition_0_max_gap_ms": 14,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "window2",
+      "run": 4,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1716.7,
+      "durable_completion_ms": 559,
+      "worker_starts": 9,
+      "fetched_records": 1008,
+      "fetched_payload_bytes": 129024,
+      "commit_requests": 38,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1624,
+      "metadata_records": 44,
+      "metadata_replay_payload_bytes": 23729,
+      "unique_records": 960,
+      "records_per_second": 1725.9,
+      "backlog_drain_after_join_ms": 510,
+      "retained_partition_0_max_gap_ms": 32,
+      "duplicate_deliveries": 9,
+      "replay_payload_bytes": 1152
+    },
+    {
+      "variant": "window2",
+      "run": 4,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 4015.5,
+      "durable_completion_ms": 2390,
+      "metadata_records": 221,
+      "metadata_replay_payload_bytes": 73939,
+      "unique_records": 9600,
+      "records_per_second": 4047.3,
+      "backlog_drain_after_join_ms": 2330,
+      "retained_partition_0_max_gap_ms": 19,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 4,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 2004.0,
+      "durable_completion_ms": 4790,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 412,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 14769,
+      "metadata_records": 415,
+      "metadata_replay_payload_bytes": 141685,
+      "unique_records": 9600,
+      "records_per_second": 2010.4,
+      "backlog_drain_after_join_ms": 4720,
+      "retained_partition_0_max_gap_ms": 73,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 5,
+      "workload": "EagerComparison",
+      "mode": "eager",
+      "durable_records_per_second": 1925.9,
+      "durable_completion_ms": 498,
+      "metadata_records": 37,
+      "metadata_replay_payload_bytes": 12203,
+      "unique_records": 960,
+      "records_per_second": 1954.1,
+      "backlog_drain_after_join_ms": 441,
+      "retained_partition_0_max_gap_ms": 70,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "variant": "window2",
+      "run": 5,
+      "workload": "EagerComparison",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 1614.0,
+      "durable_completion_ms": 594,
+      "worker_starts": 9,
+      "fetched_records": 1008,
+      "fetched_payload_bytes": 129024,
+      "commit_requests": 38,
+      "commit_partitions": 120,
+      "commit_worker_wait_ms": 1854,
+      "metadata_records": 44,
+      "metadata_replay_payload_bytes": 23727,
+      "unique_records": 960,
+      "records_per_second": 1639.1,
+      "backlog_drain_after_join_ms": 540,
+      "retained_partition_0_max_gap_ms": 56,
+      "duplicate_deliveries": 14,
+      "replay_payload_bytes": 1792
+    },
+    {
+      "variant": "window2",
+      "run": 5,
+      "workload": "BacklogThroughput",
+      "mode": "eager",
+      "durable_records_per_second": 3908.0,
+      "durable_completion_ms": 2456,
+      "metadata_records": 227,
+      "metadata_replay_payload_bytes": 75977,
+      "unique_records": 9600,
+      "records_per_second": 3908.9,
+      "backlog_drain_after_join_ms": 2410,
+      "retained_partition_0_max_gap_ms": 21,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "variant": "window2",
+      "run": 5,
+      "workload": "BacklogThroughput",
+      "mode": "cooperative-batched",
+      "durable_records_per_second": 2110.9,
+      "durable_completion_ms": 4547,
+      "worker_starts": 6,
+      "fetched_records": 9600,
+      "fetched_payload_bytes": 1228800,
+      "commit_requests": 407,
+      "commit_partitions": 1200,
+      "commit_worker_wait_ms": 13394,
+      "metadata_records": 410,
+      "metadata_replay_payload_bytes": 140012,
+      "unique_records": 9600,
+      "records_per_second": 2116.3,
+      "backlog_drain_after_join_ms": 4490,
+      "retained_partition_0_max_gap_ms": 71,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    }
+  ],
+  "summary": [
+    {
+      "workload": "EagerComparison",
+      "variant": "before",
+      "mode": "eager",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 2020.6,
+        "min": 1425.3,
+        "max": 2204.8
+      },
+      "records_per_second": {
+        "median": 2088.1,
+        "min": 1440.7,
+        "max": 2421.8
+      },
+      "metadata_records": {
+        "median": 40,
+        "min": 35,
+        "max": 41
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 13170,
+        "min": 11537,
+        "max": 13513
+      },
+      "duplicate_deliveries": {
+        "median": 144,
+        "min": 144,
+        "max": 144
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 80,
+        "min": 34,
+        "max": 194
+      }
+    },
+    {
+      "workload": "EagerComparison",
+      "variant": "before",
+      "mode": "cooperative-batched",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 1129.5,
+        "min": 776.7,
+        "max": 1296.3
+      },
+      "records_per_second": {
+        "median": 1133.9,
+        "min": 782.5,
+        "max": 1312.2
+      },
+      "metadata_records": {
+        "median": 78,
+        "min": 53,
+        "max": 89
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 34839,
+        "min": 26702,
+        "max": 38568
+      },
+      "duplicate_deliveries": {
+        "median": 15,
+        "min": 0,
+        "max": 18
+      },
+      "fetched_records": {
+        "median": 984,
+        "min": 960,
+        "max": 984
+      },
+      "fetched_payload_bytes": {
+        "median": 125952,
+        "min": 122880,
+        "max": 125952
+      },
+      "commit_requests": {
+        "median": 72,
+        "min": 47,
+        "max": 83
+      },
+      "commit_worker_wait_ms": {
+        "median": 2117,
+        "min": 1926,
+        "max": 3481
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 93,
+        "min": 49,
+        "max": 146
+      }
+    },
+    {
+      "workload": "EagerComparison",
+      "variant": "after",
+      "mode": "eager",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 2535.1,
+        "min": 2060.6,
+        "max": 2854.5
+      },
+      "records_per_second": {
+        "median": 2595.9,
+        "min": 2250.3,
+        "max": 2903.5
+      },
+      "metadata_records": {
+        "median": 31,
+        "min": 30,
+        "max": 34
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 10224,
+        "min": 9889,
+        "max": 11217
+      },
+      "duplicate_deliveries": {
+        "median": 144,
+        "min": 144,
+        "max": 144
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 19,
+        "min": 17,
+        "max": 46
+      }
+    },
+    {
+      "workload": "EagerComparison",
+      "variant": "after",
+      "mode": "cooperative-batched",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 1394.0,
+        "min": 1284.9,
+        "max": 1578.7
+      },
+      "records_per_second": {
+        "median": 1417.9,
+        "min": 1305.2,
+        "max": 1597.2
+      },
+      "metadata_records": {
+        "median": 63,
+        "min": 59,
+        "max": 64
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 29971,
+        "min": 28672,
+        "max": 30312
+      },
+      "duplicate_deliveries": {
+        "median": 8,
+        "min": 1,
+        "max": 9
+      },
+      "fetched_records": {
+        "median": 992,
+        "min": 968,
+        "max": 1008
+      },
+      "fetched_payload_bytes": {
+        "median": 126976,
+        "min": 123904,
+        "max": 129024
+      },
+      "commit_requests": {
+        "median": 57,
+        "min": 53,
+        "max": 58
+      },
+      "commit_worker_wait_ms": {
+        "median": 2314,
+        "min": 1827,
+        "max": 2426
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 66,
+        "min": 52,
+        "max": 94
+      }
+    },
+    {
+      "workload": "EagerComparison",
+      "variant": "window2",
+      "mode": "eager",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 2073.5,
+        "min": 1925.9,
+        "max": 3050.6
+      },
+      "records_per_second": {
+        "median": 2224.9,
+        "min": 1954.1,
+        "max": 3191.3
+      },
+      "metadata_records": {
+        "median": 34,
+        "min": 33,
+        "max": 37
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 11212,
+        "min": 10878,
+        "max": 12203
+      },
+      "duplicate_deliveries": {
+        "median": 144,
+        "min": 144,
+        "max": 240
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 57,
+        "min": 14,
+        "max": 70
+      }
+    },
+    {
+      "workload": "EagerComparison",
+      "variant": "window2",
+      "mode": "cooperative-batched",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 1568.9,
+        "min": 1534.0,
+        "max": 1716.7
+      },
+      "records_per_second": {
+        "median": 1581.7,
+        "min": 1557.9,
+        "max": 1725.9
+      },
+      "metadata_records": {
+        "median": 44,
+        "min": 44,
+        "max": 44
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 23728,
+        "min": 23720,
+        "max": 23729
+      },
+      "duplicate_deliveries": {
+        "median": 14,
+        "min": 9,
+        "max": 15
+      },
+      "fetched_records": {
+        "median": 1008,
+        "min": 1008,
+        "max": 1008
+      },
+      "fetched_payload_bytes": {
+        "median": 129024,
+        "min": 129024,
+        "max": 129024
+      },
+      "commit_requests": {
+        "median": 38,
+        "min": 38,
+        "max": 38
+      },
+      "commit_worker_wait_ms": {
+        "median": 1854,
+        "min": 1620,
+        "max": 1907
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 43,
+        "min": 32,
+        "max": 56
+      }
+    },
+    {
+      "workload": "BacklogThroughput",
+      "variant": "before",
+      "mode": "eager",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 3716.3,
+        "min": 2724.0,
+        "max": 3895.2
+      },
+      "records_per_second": {
+        "median": 3733.1,
+        "min": 2734.0,
+        "max": 3909.1
+      },
+      "metadata_records": {
+        "median": 218,
+        "min": 204,
+        "max": 229
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 72970,
+        "min": 68120,
+        "max": 76579
+      },
+      "duplicate_deliveries": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 23,
+        "min": 20,
+        "max": 809
+      }
+    },
+    {
+      "workload": "BacklogThroughput",
+      "variant": "before",
+      "mode": "cooperative-batched",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 1634.9,
+        "min": 1396.6,
+        "max": 1722.2
+      },
+      "records_per_second": {
+        "median": 1635.5,
+        "min": 1398.0,
+        "max": 1724.8
+      },
+      "metadata_records": {
+        "median": 429,
+        "min": 409,
+        "max": 445
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 146153,
+        "min": 139444,
+        "max": 151748
+      },
+      "duplicate_deliveries": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "fetched_records": {
+        "median": 9600,
+        "min": 9600,
+        "max": 9600
+      },
+      "fetched_payload_bytes": {
+        "median": 1228800,
+        "min": 1228800,
+        "max": 1228800
+      },
+      "commit_requests": {
+        "median": 426,
+        "min": 406,
+        "max": 442
+      },
+      "commit_worker_wait_ms": {
+        "median": 15964,
+        "min": 14233,
+        "max": 20484
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 66,
+        "min": 45,
+        "max": 104
+      }
+    },
+    {
+      "workload": "BacklogThroughput",
+      "variant": "after",
+      "mode": "eager",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 4090.1,
+        "min": 3328.0,
+        "max": 4112.0
+      },
+      "records_per_second": {
+        "median": 4099.3,
+        "min": 3348.8,
+        "max": 4128.1
+      },
+      "metadata_records": {
+        "median": 217,
+        "min": 198,
+        "max": 222
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 72486,
+        "min": 66190,
+        "max": 74310
+      },
+      "duplicate_deliveries": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 18,
+        "min": 15,
+        "max": 71
+      }
+    },
+    {
+      "workload": "BacklogThroughput",
+      "variant": "after",
+      "mode": "cooperative-batched",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 1892.3,
+        "min": 1788.5,
+        "max": 2121.1
+      },
+      "records_per_second": {
+        "median": 1896.9,
+        "min": 1790.1,
+        "max": 2123.2
+      },
+      "metadata_records": {
+        "median": 438,
+        "min": 423,
+        "max": 472
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 149294,
+        "min": 144235,
+        "max": 160913
+      },
+      "duplicate_deliveries": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "fetched_records": {
+        "median": 9600,
+        "min": 9600,
+        "max": 9600
+      },
+      "fetched_payload_bytes": {
+        "median": 1228800,
+        "min": 1228800,
+        "max": 1228800
+      },
+      "commit_requests": {
+        "median": 435,
+        "min": 420,
+        "max": 469
+      },
+      "commit_worker_wait_ms": {
+        "median": 16063,
+        "min": 13291,
+        "max": 17583
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 56,
+        "min": 38,
+        "max": 218
+      }
+    },
+    {
+      "workload": "BacklogThroughput",
+      "variant": "window2",
+      "mode": "eager",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 3838.3,
+        "min": 3602.2,
+        "max": 4015.5
+      },
+      "records_per_second": {
+        "median": 3861.3,
+        "min": 3614.8,
+        "max": 4047.3
+      },
+      "metadata_records": {
+        "median": 218,
+        "min": 207,
+        "max": 227
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 72840,
+        "min": 69251,
+        "max": 75977
+      },
+      "duplicate_deliveries": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 21,
+        "min": 18,
+        "max": 43
+      }
+    },
+    {
+      "workload": "BacklogThroughput",
+      "variant": "window2",
+      "mode": "cooperative-batched",
+      "count": 5,
+      "durable_records_per_second": {
+        "median": 2041.1,
+        "min": 1917.2,
+        "max": 2110.9
+      },
+      "records_per_second": {
+        "median": 2043.2,
+        "min": 1921.2,
+        "max": 2116.3
+      },
+      "metadata_records": {
+        "median": 410,
+        "min": 285,
+        "max": 415
+      },
+      "metadata_replay_payload_bytes": {
+        "median": 140012,
+        "min": 98050,
+        "max": 141685
+      },
+      "duplicate_deliveries": {
+        "median": 0,
+        "min": 0,
+        "max": 0
+      },
+      "fetched_records": {
+        "median": 9600,
+        "min": 9600,
+        "max": 9600
+      },
+      "fetched_payload_bytes": {
+        "median": 1228800,
+        "min": 1228800,
+        "max": 1228800
+      },
+      "commit_requests": {
+        "median": 407,
+        "min": 282,
+        "max": 412
+      },
+      "commit_worker_wait_ms": {
+        "median": 14701,
+        "min": 13394,
+        "max": 15817
+      },
+      "retained_partition_0_max_gap_ms": {
+        "median": 61,
+        "min": 53,
+        "max": 73
+      }
+    }
+  ]
+}

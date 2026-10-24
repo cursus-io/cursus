@@ -12,7 +12,7 @@ var (
 
 const (
 	WireProtocolVersion   = "2"
-	BrokerProtocolVersion = "10"
+	BrokerProtocolVersion = "11"
 	SnapshotFormatVersion = "11"
 	RecordFormatVersion   = "CDM6"
 )

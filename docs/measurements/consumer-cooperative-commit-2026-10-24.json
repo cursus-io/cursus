@@ -1,0 +1,186 @@
+{
+  "date": "2026-10-24",
+  "base": "9c43d39",
+  "environment": {
+    "os": "Linux Docker Desktop on Windows",
+    "cpus": 2,
+    "GOMAXPROCS": 2,
+    "race": false
+  },
+  "workload": {
+    "partitions": 6,
+    "recordsPerPartition": 160,
+    "payloadBytes": 128,
+    "batchRecords": 8,
+    "handlerDelayMS": 1,
+    "secondMemberAfterPartition0Records": 16
+  },
+  "scope": "Handler completion, not steady-state capacity. Metadata counts include membership and shutdown; no history compaction. Single uses public Commit after each eight successful records. Eager uses 10 ms interval commits. Other SDKs excluded.",
+  "runs": [
+    {
+      "mode": "eager",
+      "metadata_records": 37,
+      "metadata_replay_payload_bytes": 12204,
+      "unique_records": 960,
+      "records_per_second": 2308.1,
+      "backlog_drain_after_join_ms": 370,
+      "retained_partition_0_max_gap_ms": 57,
+      "duplicate_deliveries": 144,
+      "replay_payload_bytes": 18432
+    },
+    {
+      "mode": "cooperative-single",
+      "metadata_records": 125,
+      "metadata_replay_payload_bytes": 49939,
+      "unique_records": 960,
+      "records_per_second": 786.5,
+      "backlog_drain_after_join_ms": 1100,
+      "retained_partition_0_max_gap_ms": 108,
+      "duplicate_deliveries": 16,
+      "replay_payload_bytes": 2048
+    },
+    {
+      "mode": "cooperative-batched",
+      "metadata_records": 50,
+      "metadata_replay_payload_bytes": 25687,
+      "unique_records": 960,
+      "records_per_second": 1958.5,
+      "backlog_drain_after_join_ms": 450,
+      "retained_partition_0_max_gap_ms": 29,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "mode": "eager",
+      "metadata_records": 43,
+      "metadata_replay_payload_bytes": 14173,
+      "unique_records": 960,
+      "records_per_second": 3488,
+      "backlog_drain_after_join_ms": 240,
+      "retained_partition_0_max_gap_ms": 15,
+      "duplicate_deliveries": 96,
+      "replay_payload_bytes": 12288
+    },
+    {
+      "mode": "cooperative-single",
+      "metadata_records": 126,
+      "metadata_replay_payload_bytes": 50284,
+      "unique_records": 960,
+      "records_per_second": 1546.8,
+      "backlog_drain_after_join_ms": 570,
+      "retained_partition_0_max_gap_ms": 37,
+      "duplicate_deliveries": 7,
+      "replay_payload_bytes": 896
+    },
+    {
+      "mode": "cooperative-batched",
+      "metadata_records": 52,
+      "metadata_replay_payload_bytes": 26368,
+      "unique_records": 960,
+      "records_per_second": 2037.1,
+      "backlog_drain_after_join_ms": 430,
+      "retained_partition_0_max_gap_ms": 40,
+      "duplicate_deliveries": 0,
+      "replay_payload_bytes": 0
+    },
+    {
+      "mode": "eager",
+      "metadata_records": 42,
+      "metadata_replay_payload_bytes": 13836,
+      "unique_records": 960,
+      "records_per_second": 3614.6,
+      "backlog_drain_after_join_ms": 230,
+      "retained_partition_0_max_gap_ms": 7,
+      "duplicate_deliveries": 96,
+      "replay_payload_bytes": 12288
+    },
+    {
+      "mode": "cooperative-single",
+      "metadata_records": 126,
+      "metadata_replay_payload_bytes": 50287,
+      "unique_records": 960,
+      "records_per_second": 1533.5,
+      "backlog_drain_after_join_ms": 580,
+      "retained_partition_0_max_gap_ms": 39,
+      "duplicate_deliveries": 9,
+      "replay_payload_bytes": 1152
+    },
+    {
+      "mode": "cooperative-batched",
+      "metadata_records": 55,
+      "metadata_replay_payload_bytes": 27313,
+      "unique_records": 960,
+      "records_per_second": 1845.3,
+      "backlog_drain_after_join_ms": 480,
+      "retained_partition_0_max_gap_ms": 18,
+      "duplicate_deliveries": 13,
+      "replay_payload_bytes": 1664
+    },
+    {
+      "mode": "eager",
+      "metadata_records": 45,
+      "metadata_replay_payload_bytes": 14812,
+      "unique_records": 960,
+      "records_per_second": 3481,
+      "backlog_drain_after_join_ms": 240,
+      "retained_partition_0_max_gap_ms": 13,
+      "duplicate_deliveries": 96,
+      "replay_payload_bytes": 12288
+    },
+    {
+      "mode": "cooperative-single",
+      "metadata_records": 126,
+      "metadata_replay_payload_bytes": 50285,
+      "unique_records": 960,
+      "records_per_second": 1322.9,
+      "backlog_drain_after_join_ms": 670,
+      "retained_partition_0_max_gap_ms": 87,
+      "duplicate_deliveries": 12,
+      "replay_payload_bytes": 1536
+    },
+    {
+      "mode": "cooperative-batched",
+      "metadata_records": 48,
+      "metadata_replay_payload_bytes": 24973,
+      "unique_records": 960,
+      "records_per_second": 1935.9,
+      "backlog_drain_after_join_ms": 450,
+      "retained_partition_0_max_gap_ms": 32,
+      "duplicate_deliveries": 16,
+      "replay_payload_bytes": 2048
+    },
+    {
+      "mode": "eager",
+      "metadata_records": 42,
+      "metadata_replay_payload_bytes": 13836,
+      "unique_records": 960,
+      "records_per_second": 3599.4,
+      "backlog_drain_after_join_ms": 230,
+      "retained_partition_0_max_gap_ms": 12,
+      "duplicate_deliveries": 96,
+      "replay_payload_bytes": 12288
+    },
+    {
+      "mode": "cooperative-single",
+      "metadata_records": 125,
+      "metadata_replay_payload_bytes": 49950,
+      "unique_records": 960,
+      "records_per_second": 1557.9,
+      "backlog_drain_after_join_ms": 570,
+      "retained_partition_0_max_gap_ms": 38,
+      "duplicate_deliveries": 13,
+      "replay_payload_bytes": 1664
+    },
+    {
+      "mode": "cooperative-batched",
+      "metadata_records": 56,
+      "metadata_replay_payload_bytes": 27694,
+      "unique_records": 960,
+      "records_per_second": 1933.2,
+      "backlog_drain_after_join_ms": 460,
+      "retained_partition_0_max_gap_ms": 18,
+      "duplicate_deliveries": 8,
+      "replay_payload_bytes": 1024
+    }
+  ]
+}

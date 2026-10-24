@@ -156,7 +156,7 @@ func TestCooperativeFailedLifecycleWriteKeepsInstalledOwnership(t *testing.T) {
 	c.lifecyclePending["workers"] = true
 	require.ErrorContains(t, c.persistAndApplyLifecycle("workers", installed, candidate, publishLifecycle), "injected durable append failure")
 	require.Equal(t, before, c.ExportState())
-	require.False(t, c.lifecyclePending["workers"])
+	require.True(t, c.lifecyclePending["workers"], "ambiguous append keeps admission fenced until recovery")
 	c.SetOffsetRecordWriter(func(ConsumerMetadataRecord) error { return nil })
 	c.lifecyclePending["workers"] = true
 	require.NoError(t, c.persistAndApplyLifecycle("workers", installed, candidate, publishLifecycle))

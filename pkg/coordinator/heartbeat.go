@@ -52,10 +52,13 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 	if err != nil {
 		return
 	}
-	c.mu.Lock()
+	// This pass only selects candidates. Queuing a writer here would block new
+	// readers behind an in-flight durable commit even when no session expired.
+	// The expiration path below still takes the mutation fence and revalidates.
+	c.mu.RLock()
 	group, exists := c.groups[groupName]
 	if !exists || len(group.Members) == 0 {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		release()
 		return
 	}
@@ -67,12 +70,19 @@ func (c *Coordinator) checkSingleGroupTimeout(groupName string, timeout time.Dur
 		}
 	}
 	generation := group.Generation
+	cooperative := group.Cooperative != nil
 	handler := c.expirationHandler
 	distributed := !c.standalone
-	c.mu.Unlock()
+	c.mu.RUnlock()
 	release()
 
 	if len(timedOutMembers) == 0 {
+		return
+	}
+	if cooperative {
+		if err := c.expireCooperative(groupName, timeout); err != nil {
+			util.Warn("Group '%s': cooperative expiration deferred: %v", groupName, err)
+		}
 		return
 	}
 
@@ -115,14 +125,21 @@ func (c *Coordinator) ownsGroupSession(groupName string, now time.Time, timeout 
 		return false
 	}
 
-	c.mu.Lock()
+	c.mu.RLock()
 	since, observed := c.ownershipSince[groupName]
+	c.mu.RUnlock()
 	if !observed {
-		c.ownershipSince[groupName] = now
+		c.mu.Lock()
+		// Another observation may have installed the ownership clock meanwhile.
+		since, observed = c.ownershipSince[groupName]
+		if !observed {
+			c.ownershipSince[groupName] = now
+		}
 		c.mu.Unlock()
-		return false
+		if !observed {
+			return false
+		}
 	}
-	c.mu.Unlock()
 
 	// A new group coordinator waits one full session timeout before expiring
 	// members, giving healthy clients time to redirect and heartbeat.

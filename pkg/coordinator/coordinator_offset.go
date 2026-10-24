@@ -66,6 +66,10 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 	if gm.Cooperative != nil {
 		return errCooperativeProtocolRequired
 	}
+	return c.commitAuthorizedOffsetForGroupLocked(gm, groupName, topic, partition, offset)
+}
+
+func (c *Coordinator) commitAuthorizedOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
 	if err := reservedOffsetError(gm, groupName, topic, partition); err != nil {
 		return err
 	}
@@ -174,6 +178,10 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 	if gm.Cooperative != nil {
 		return errCooperativeProtocolRequired
 	}
+	return c.commitAuthorizedOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
+}
+
+func (c *Coordinator) commitAuthorizedOffsetsBulkForGroupLocked(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
 	}
@@ -200,7 +208,7 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 		}
 		items := mergedOffsetSnapshot(gm, topic, offsets)
 		revision := gm.OffsetRevisions[topic] + 1
-		if err := c.writeOffsetSnapshot(groupName, topic, gm.RegistrationEpoch, revision, items); err != nil {
+		if err := c.writeOffsetSnapshotWithReadWindow(gm, groupName, topic, revision, items); err != nil {
 			return err
 		}
 		for _, item := range offsets {

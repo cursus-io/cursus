@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
@@ -72,6 +73,7 @@ type StreamOperation struct {
 }
 
 type OffsetOperation struct {
+	Ownership         *protocol.CooperativeToken `json:"ownership,omitempty"`
 	Topic             string
 	Group             string
 	Member            string
@@ -711,6 +713,9 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 		scope = tx.Offsets[0]
 	}
 	for _, op := range offsets {
+		if (op.Ownership == nil) != (scope.Ownership == nil) || (op.Ownership != nil && (op.Ownership.Grant.Session != scope.Ownership.Grant.Session || op.Ownership.RegistrationEpoch != scope.Ownership.RegistrationEpoch)) {
+			return fmt.Errorf("transaction cooperative ownership scope mismatch")
+		}
 		topicMismatch := op.Topic != scope.Topic && tx.Mode != ModeProcessingV1
 		if topicMismatch || op.Group != scope.Group || op.Member != scope.Member || op.Generation != scope.Generation || op.RegistrationEpoch != scope.RegistrationEpoch {
 			return fmt.Errorf(
@@ -720,7 +725,7 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 		}
 	}
 
-	candidateOffsets := append([]OffsetOperation(nil), tx.Offsets...)
+	candidateOffsets := cloneOffsetOperations(tx.Offsets)
 	for _, op := range offsets {
 		updated := false
 		for i := range candidateOffsets {
@@ -747,7 +752,7 @@ func (m *Manager) AddOffsets(id, producer string, epoch int64, offsets []OffsetO
 	if err := m.validateTransactionLimits(&candidate); err != nil {
 		return err
 	}
-	tx.Offsets = candidateOffsets
+	tx.Offsets = cloneOffsetOperations(candidateOffsets)
 	tx.Revision++
 	tx.UpdatedAt = time.Now()
 	return nil
@@ -1351,7 +1356,7 @@ func clone(tx *Transaction) *Transaction {
 	out := *tx
 	out.Messages = append([]MessageOperation(nil), tx.Messages...)
 	out.Streams = append([]StreamOperation(nil), tx.Streams...)
-	out.Offsets = append([]OffsetOperation(nil), tx.Offsets...)
+	out.Offsets = cloneOffsetOperations(tx.Offsets)
 	out.Participants = append([]Participant(nil), tx.Participants...)
 	return &out
 }
@@ -1374,7 +1379,7 @@ func snapshot(tx *Transaction) *Snapshot {
 		State:                     tx.State,
 		Messages:                  append([]MessageOperation(nil), tx.Messages...),
 		Streams:                   append([]StreamOperation(nil), tx.Streams...),
-		Offsets:                   append([]OffsetOperation(nil), tx.Offsets...),
+		Offsets:                   cloneOffsetOperations(tx.Offsets),
 		Participants:              append([]Participant(nil), tx.Participants...),
 		SequenceByPartition:       maps.Clone(tx.SequenceByPartition),
 		RequestAssignments:        maps.Clone(tx.RequestAssignments),
@@ -1399,7 +1404,7 @@ func transactionFromSnapshot(snap *Snapshot) *Transaction {
 		State:                     snap.State,
 		Messages:                  append([]MessageOperation(nil), snap.Messages...),
 		Streams:                   append([]StreamOperation(nil), snap.Streams...),
-		Offsets:                   append([]OffsetOperation(nil), snap.Offsets...),
+		Offsets:                   cloneOffsetOperations(snap.Offsets),
 		Participants:              append([]Participant(nil), snap.Participants...),
 		SequenceByPartition:       maps.Clone(snap.SequenceByPartition),
 		RequestAssignments:        maps.Clone(snap.RequestAssignments),
@@ -1422,4 +1427,15 @@ func newProducerID() (string, error) {
 		return "", fmt.Errorf("generate producer id: %w", err)
 	}
 	return "txn-" + hex.EncodeToString(id[:]), nil
+}
+
+func cloneOffsetOperations(offsets []OffsetOperation) []OffsetOperation {
+	result := append([]OffsetOperation(nil), offsets...)
+	for i := range result {
+		if result[i].Ownership != nil {
+			token := *result[i].Ownership
+			result[i].Ownership = &token
+		}
+	}
+	return result
 }

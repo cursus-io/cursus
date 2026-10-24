@@ -228,7 +228,9 @@ func TestMetadataBootstrapSourceRejectsABAAndStaleFinal(t *testing.T) {
 			case "recovery pending":
 				p.MarkReconciliationPending(errors.New("test repair pending"))
 			case "low local HWM":
-				p.HWM = 0
+				// Snapshot recovery lowers visibility under the partition lock;
+				// direct field mutation races with the checkpoint worker.
+				require.NoError(t, p.ReconcileSnapshotHWM(0))
 			}
 			called := false
 			err = f.WithMetadataBootstrapSourceFence(context.Background(), ticket, func(scope *MetadataBootstrapPublication) error {

@@ -11,6 +11,7 @@ import (
 )
 
 type BrokerFSMSnapshot struct {
+	cooperativeConsumerActivated     bool
 	topicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary
 	consumerHistoryActivated         bool
 	retentionTimeActivated           bool
@@ -33,6 +34,7 @@ type BrokerFSMSnapshot struct {
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
+		CooperativeConsumerActivated:     s.cooperativeConsumerActivated,
 		TopicCleanupBoundaries:           s.topicCleanupBoundaries,
 		ConsumerHistoryActivated:         s.consumerHistoryActivated,
 		RetentionTimeActivated:           s.retentionTimeActivated,
@@ -67,6 +69,9 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *BrokerFSMSnapshot) writeVersion() int {
+	if s.cooperativeConsumerActivated {
+		return SnapshotVersionCooperativeRuntime
+	}
 	for _, group := range s.groupState {
 		if group != nil && group.Cooperative != nil {
 			return SnapshotVersionCooperative

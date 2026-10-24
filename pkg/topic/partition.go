@@ -1219,7 +1219,11 @@ func (p *Partition) readCommittedScanRangeBounded(offset, scanLimit, committedHW
 	visible := make([]types.Message, 0, capacity)
 	decodedBytes := 0
 	current := offset
-	const scanBatchSize = 1024
+	// Start with the caller's visible demand: eagerly decoding 1024 records for
+	// an eight-record fetch discards most of the work and repeats it next time.
+	// Grow only across fully filtered pages so long aborted/control runs still
+	// scan efficiently. The byte budget and visibility boundary remain fixed.
+	scanBatchSize := min(1024, maxVisible)
 	for current < scanLimit && len(visible) < maxVisible {
 		remaining := scanLimit - current
 		readMax := scanBatchSize
@@ -1245,6 +1249,7 @@ func (p *Partition) readCommittedScanRangeBounded(offset, scanLimit, committedHW
 		if len(batch) == 0 {
 			break
 		}
+		visibleBefore := len(visible)
 		for _, msg := range batch {
 			if msg.Offset >= scanLimit {
 				// Compacted reads can return the first surviving record beyond
@@ -1268,6 +1273,11 @@ func (p *Partition) readCommittedScanRangeBounded(offset, scanLimit, committedHW
 		}
 		if maxBytes > 0 && decodedBytes >= maxBytes {
 			break
+		}
+		if len(visible) == visibleBefore {
+			scanBatchSize = min(1024, scanBatchSize*2)
+		} else {
+			scanBatchSize = min(1024, maxVisible-len(visible))
 		}
 	}
 	return visible, decodedBytes, current, nil

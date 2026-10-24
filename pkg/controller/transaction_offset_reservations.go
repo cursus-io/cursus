@@ -79,6 +79,9 @@ func reservationRequestFor(tx *transaction.Transaction) (transactionReservationR
 		if op.Group != scope.Group || op.RegistrationEpoch != scope.RegistrationEpoch || op.Member != scope.Member || op.Generation != scope.Generation {
 			return transactionReservationRequest{}, fmt.Errorf("transaction offset reservation scope mismatch")
 		}
+		if op.Ownership != nil {
+			request.Reservation.Grants = append(request.Reservation.Grants, op.Ownership.Grant)
+		}
 		request.Reservation.Offsets = append(request.Reservation.Offsets, coordinator.ReservedTransactionOffset{Topic: op.Topic, Partition: op.Partition, Offset: op.Offset})
 	}
 	return request, nil

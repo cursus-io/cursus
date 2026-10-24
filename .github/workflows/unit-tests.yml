@@ -59,10 +59,18 @@ jobs:
           cache: true
       - name: Run tests with coverage
         run: make coverage
+      # The TCP fixture lives in pkg/server; default package coverage omits
+      # the SDK and controller code exercised through that real Wire connection.
+      - name: Measure cooperative Wire integration coverage
+        run: >-
+          go test -race -covermode=atomic
+          -coverpkg=./pkg/controller,./pkg/coordinator,./pkg/protocol,./sdk
+          -coverprofile=cooperative-runtime-coverage.out
+          ./pkg/server -run '^TestCooperative' -count=1 -timeout 180s
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v7
         with:
-          files: ./coverage.out
+          files: ./coverage.out,./cooperative-runtime-coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
 
   build:

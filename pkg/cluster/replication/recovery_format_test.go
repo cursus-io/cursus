@@ -55,7 +55,21 @@ func TestUpgradeRaftRecoveryFormatFromRetentionTimeVersion(t *testing.T) {
 	require.NoError(t, upgradeRaftRecoveryFormat(directory))
 	data, err = os.ReadFile(marker)
 	require.NoError(t, err)
-	require.Equal(t, "13\n", string(data), "upgrade completes before advertising history capability")
+	require.Equal(t, strconv.Itoa(raftFormatVersionCurrent)+"\n", string(data), "upgrade completes before advertising capability")
+}
+
+func TestUpgradeRaftRecoveryFormatFromHistoryVersion(t *testing.T) {
+	directory := t.TempDir()
+	marker := filepath.Join(directory, raftFormatMarkerName)
+	require.NoError(t, os.WriteFile(marker, []byte("13\n"), 0600))
+	require.NoError(t, ensureRaftRecoveryFormat(directory))
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "13\n", string(data), "validation alone must not prevent rollback")
+	require.NoError(t, upgradeRaftRecoveryFormat(directory))
+	data, err = os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "14\n", string(data))
 }
 
 func TestEnsureRaftRecoveryFormatRejectsUnmarkedPersistedState(t *testing.T) {
