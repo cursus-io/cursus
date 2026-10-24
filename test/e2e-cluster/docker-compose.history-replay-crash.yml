@@ -1,0 +1,10 @@
+services:
+  broker-1: &replay-crash
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.history-replay-crash
+    environment:
+      CURSUS_E2E_FAULTS: "1"
+  broker-2:
+    <<: *replay-crash
+  broker-3:
+    <<: *replay-crash

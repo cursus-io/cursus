@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import signal
 import subprocess
 import sys
@@ -119,9 +120,12 @@ def run():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     peak_heap = peak_store = peak_temp = 0
+    resource_samples = heap_samples = 0
     while child.poll() is None:
         try:
             data = sample()
+            resource_samples += 1
+            heap_samples += int('heap_bytes' in data)
             peak_heap = max(peak_heap, data.get('heap_bytes', 0))
             peak_store = max(peak_store, data['store_bytes'])
             peak_temp = max(peak_temp, data['temporary_bytes'])
@@ -130,10 +134,44 @@ def run():
             temp = STATS.with_suffix('.tmp')
             temp.write_text(json.dumps(data))
             temp.replace(STATS)
-        except (FileNotFoundError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
             pass
         time.sleep(1)
+    # Reaped-child accounting survives an abrupt broker exit. It includes the
+    # tracing process when enabled, unlike live broker-only /proc counters.
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    wrapper = resource.getrusage(resource.RUSAGE_SELF)
+    final = {
+        'child_returncode': child.returncode,
+        'child_cpu_seconds': children.ru_utime + children.ru_stime,
+        'wrapper_cpu_seconds_before_report': wrapper.ru_utime + wrapper.ru_stime,
+        'child_peak_rss_bytes': children.ru_maxrss * 1024,
+        'child_input_blocks': children.ru_inblock,
+        'child_output_blocks': children.ru_oublock,
+        'resource_samples': resource_samples,
+        'heap_samples': heap_samples,
+    }
+    if resource_samples:
+        final.update(sampled_peak_store_bytes=peak_store, sampled_peak_temporary_bytes=peak_temp)
+    if heap_samples:
+        final['sampled_peak_heap_bytes'] = peak_heap
+    if trace_enabled:
+        final.update(sync_work())
+    try:
+        final['resources_after_child_exit'] = sample()
+    except OSError as error:
+        final['resource_sample_error'] = str(error)
+    Path('/tmp/history-exit.json').write_text(json.dumps(final))
     sys.exit(child.returncode)
+
+
+def sync_work():
+    lines = Path(TRACE).read_text().splitlines()
+    return {
+        'started_sync_calls': sum('fsync(' in line or 'fdatasync(' in line for line in lines),
+        'successful_sync_calls': sum(('fsync(' in line or 'fdatasync(' in line or 'resumed>' in line)
+                                     and '= 0' in line for line in lines),
+    }
 
 
 def offline(mode, evict):
@@ -169,9 +207,7 @@ if __name__ == '__main__':
         data = json.loads(STATS.read_text())
         data.update(sample())
         if os.environ.get('HISTORY_TRACE_SYNC', 'true') == 'true':
-            trace = Path(TRACE).read_text()
-            data['successful_sync_calls'] = sum(('fsync(' in line or 'fdatasync(' in line or 'resumed>' in line)
-                                                 and '= 0' in line for line in trace.splitlines())
+            data.update(sync_work())
         print(json.dumps(data))
     elif sys.argv[1] == 'offline':
         offline(sys.argv[2], sys.argv[3] == 'cold')

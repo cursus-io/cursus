@@ -68,7 +68,7 @@ measurements remain separate from these correctness tests.
 ## Implementation and rollout contract
 
 The current integration base is official main
-`544b38739fc5cea3721640eb88cdd0758ab0d4c9`, including the cooperative runtime
+`d5b8d773ad215362c80ee46a2a8764c37ead9728`, including the cooperative runtime
 protocol and snapshot contract. The earlier audit base
 `9c43d398eecc387ae0011bb7900b54a74a0b0d8d` already contained the large-record,
 durable append-time and recovery scheduling changes. Production metadata
@@ -602,6 +602,42 @@ process only, so their resource totals cannot represent all interrupted work.
 The experiment header records the source head, working-diff digest and tracing
 configuration. Earlier failed pilots did not use the seccomp filter and are not
 comparable timing samples. Both baseline and fix use the same instrumentation.
+
+The separate opt-in `TestConsumerHistoryReplayCrashResources` closes that
+process-accounting gap without reclassifying the ordinary ladder's interrupted
+rows. It requires `RUN_E2E_CONSUMER_HISTORY_REPLAY_CRASH=1`, an isolated
+`CURSUS_CLEANUP_PORT_OFFSET`, and a new `CURSUS_HISTORY_REPLAY_CRASH_OUTPUT` JSONL
+path. Its dedicated Linux `e2e_faults` image consumes actual recovery source
+pages, records counters, then exits with code 77 before projection/index
+publication. Neither the sentinel nor the exit hook is active in production
+builds. Four groups retain 1,000 revisions each; two replicas stay alive while
+the target repeatedly exits after at least 1,024, 2,048 and 1,024 source records.
+Each attempt asserts its observed threshold and absence of a newly published
+index. A final unarmed restart must recover exact offsets and full ISR.
+
+Each interrupted process records its logical recovery counters, Linux `/proc`
+I/O, CPU, peak RSS and current Go heap before writing the diagnostic result.
+The wrapper then records waited-child accounting and the trace's started and
+successful sync calls after process exit. These scopes differ deliberately:
+the former excludes diagnostic publication, while the latter includes tracing
+and exit work. Survivor counters span all attempts without resetting; final
+ready-state counters and shutdown-inclusive exit accounting are separate rows.
+Initial cluster setup and seeding remain explicit costs, not startup speedups.
+
+[Linux getrusage](https://man7.org/linux/man-pages/man2/getrusage.2.html) and
+[Python resource](https://docs.python.org/3/library/resource.html) define the
+waited-child CPU accounting. Child peak RSS is the largest child's peak, not a
+sum or simultaneous process-tree peak. Block-operation counts are not reported
+as bytes. The wrapper reads cgroup v1 or v2 CPU and peak-memory counters when
+available; missing cgroup I/O counters stay unavailable. Go heap and temporary
+space peaks remain sampled, augmented by the synchronous pre-exit heap sample.
+No sample is represented as a zero-byte heap. Instrumentation overhead remains
+in wall time, and Linux guest accounting is distinct from host-device I/O.
+
+`python3 test/e2e-cluster/summarize_history_measure.py result.jsonl` produces a
+CSV beside the ordinary ladder's raw JSONL. It keeps overlapping frame, replay,
+index and transfer counters separate, and leaves unavailable fields blank.
+It does not reinterpret interrupted rows as cumulative process totals.
 
 Retained bytes are metadata `.log` bytes; total store bytes also include Raft,
 indexes and checkpoints and may include sparse logical file sizes. Unique group

@@ -177,6 +177,7 @@ func (r *consumerRecoveryReader) observeReplayRead(messages []types.Message) {
 		decodedBytes += int64(len(m.Key) + len(m.Payload))
 	}
 	metrics.RecordRecoveryBytes(metrics.RecoveryConsumerReplay, metrics.RecoveryDecodedBytes, decodedBytes)
+	consumerReplayMeasurementFault(len(messages))
 }
 
 func (ch *CommandHandler) consumerReadinessError() error {
