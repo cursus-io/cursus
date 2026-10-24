@@ -1164,6 +1164,9 @@ func (ch *CommandHandler) handleBatchCommit(cmd string, contexts ...*ClientConte
 	if args["reservation_action"] != "" {
 		return ch.handleTransactionReservationCommand(cmd, firstClientContext(contexts))
 	}
+	if args["ownerships"] != "" {
+		return ch.handleCooperativeBatchCommit(args)
+	}
 
 	topicName := args["topic"]
 	encodedTopicOffsets := args["topic_offsets"]

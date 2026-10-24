@@ -9,6 +9,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/wire"
 )
 
 func (ch *CommandHandler) cooperativeEnabled() bool {
@@ -225,4 +226,44 @@ func (ch *CommandHandler) handleCooperativeCommit(args map[string]string, partit
 		return formatCoordinatorError(err)
 	}
 	return "OK"
+}
+
+func (ch *CommandHandler) handleCooperativeBatchCommit(args map[string]string) string {
+	if args["group"] == "" || args["topic"] == "" || args["member"] == "" || args["topic_offsets"] != "" {
+		return "ERROR: invalid_cooperative_payload"
+	}
+	if ch.isDistributed() {
+		addr, local, err := ch.checkCoordinator(args["group"])
+		if err != nil {
+			return coordinatorUnavailableResponse
+		}
+		if !local {
+			return notCoordinatorResponse(addr)
+		}
+	}
+	if ch.Coordinator == nil {
+		return coordinatorUnavailableResponse
+	}
+	var tokens []protocol.CooperativeToken
+	if err := protocol.DecodeCooperative(args["ownerships"], &tokens); err != nil {
+		return err.Error()
+	}
+	pairs, err := wire.DecodeOffsetPairs(args["offsets"])
+	if err != nil || len(tokens) == 0 || len(tokens) != len(pairs) || len(tokens) > protocol.MaxCooperativeCommitPartitions {
+		return "ERROR: invalid_cooperative_payload"
+	}
+	offsets := make([]coordinator.OffsetItem, len(pairs))
+	for i, token := range tokens {
+		if token.Grant.Member != args["member"] || token.Grant.Partition.Topic != args["topic"] || token.Grant.Partition.Partition != pairs[i].Partition {
+			return "ERROR: cooperative_fenced"
+		}
+		if err := ch.validateCooperativeToken(args["group"], &token); err != nil {
+			return err.Error()
+		}
+		offsets[i] = coordinator.OffsetItem{Partition: pairs[i].Partition, Offset: pairs[i].Offset}
+	}
+	if err := ch.Coordinator.CommitCooperativeBatch(args["group"], tokens, offsets); err != nil {
+		return formatCoordinatorError(err)
+	}
+	return fmt.Sprintf("OK batched=%d", len(offsets))
 }

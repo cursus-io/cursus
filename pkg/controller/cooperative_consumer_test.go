@@ -53,7 +53,7 @@ func TestCooperativeLifecycleErrorPreservesRetryClassification(t *testing.T) {
 
 func TestCooperativeDistributedActivationSurvivesLocalFlagDisable(t *testing.T) {
 	state := fsm.NewBrokerFSM(nil, nil)
-	require.Nil(t, state.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"local","incarnation_id":"process","lifecycle_protocol":10,"recovery_protocol":2}`)}))
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte(fmt.Sprintf(`REGISTER:{"id":"local","incarnation_id":"process","lifecycle_protocol":%d,"recovery_protocol":2}`, fsm.CooperativeConsumerProtocolVersion))}))
 	ch := newCoordinatorRoutingHandler("local", state, nil)
 	t.Cleanup(func() { require.NoError(t, ch.Close()) })
 	ch.Config.ConsumerCooperativeEnabled = true

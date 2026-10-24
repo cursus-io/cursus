@@ -73,18 +73,24 @@ request counts alone do not establish cheaper recovery.
 
 Set `consumer_cooperative_enabled: true` (`--consumer-cooperative-enabled` or
 `CONSUMER_COOPERATIVE_ENABLED=true`) on all brokers after upgrading every
-registered broker and Raft voter. Activation requires lifecycle protocol 10 and
+registered broker and Raft voter. Activation requires lifecycle protocol 11 and
 bootstrap recovery protocol 2. It is durable and rejects incompatible later
 registrations. In distributed mode the durable activation state remains the gate
 even when a restarted broker has its local trigger flag disabled; standalone
 mode continues to use the local flag. Cooperative groups cannot switch back to
 eager membership.
 
-The Raft directory marker advances to 13 when this binary starts, including when
+The Raft directory marker advances to 14 when this binary starts, including when
 cooperative activation is disabled. Activated controller snapshots use version
 13; existing cooperative ownership snapshots without activation remain version
 12. Do not point an older binary at these directories. Draining clients or
 turning off the feature flag does not make persisted state downgrade-compatible.
+History compaction already uses lifecycle protocol 10 and Raft marker 13 on main.
+It does not implement cooperative runtime commands. Keeping those numbers for
+this runtime would incorrectly admit history-only brokers and lose the startup
+downgrade barrier. Markers 9–13 remain readable for upgrade; validation leaves
+the marker unchanged until the existing upgrade stage. Both history and
+cooperative activation flags are retained and validated independently on restore.
 
 ```go
 cfg := sdk.NewDefaultConsumerConfig()
@@ -106,13 +112,49 @@ stop the consumer without committing that record. Session fencing stops `Run`;
 create a new consumer to explicitly rejoin after diagnosing the interruption.
 
 `EnableAutoCommit` commits the last successfully processed offset of each batch
-synchronously. This API does not use the eager consumer's `AutoCommitInterval`
+synchronously. Concurrent completed partitions share a commit, collected for
+one millisecond and capped at 64 partitions per request. Each worker waits for
+the durable response before processing its next batch. This API does not use
+the eager consumer's `AutoCommitInterval`
 background batching. With auto-commit disabled, call
 `consumer.Commit(ctx, record, record.Offset+1)` or
 `producer.SendCooperativeOffsets(record, record.Offset+1)` inside a transaction.
 Retain the delivered record's token for deferred work; never build a token from
 current assignments. External side effects still require application idempotency.
 A cancelled partially processed batch can be delivered again.
+
+`BATCH_COMMIT topic=... group=... member=... offsets=P0:8,P1:8 ownerships=...`
+carries an ordered array of original ownership tokens encoded by
+`protocol.EncodeCooperative`. It supports one topic/session/registration and
+rejects duplicate or mismatched partitions. The coordinator validates every
+grant, reservation and monotonic offset before writing one existing-format
+offset snapshot; a failed append publishes none. Cancelled queued commits are
+discarded. An in-flight commit settles before its worker can acknowledge revoke.
+A stale grant or reserved partition is isolated with individual commits, so
+retained partitions can progress. Retryable transport/coordinator failures retain
+the existing bounded retry policy. A repeated acknowledged batch is a no-op.
+
+### Commit batching comparison and regression contract
+
+[Kafka 4.1.0 CommitRequestManager](https://github.com/apache/kafka/blob/4.1.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CommitRequestManager.java)
+accepts maps of topic-partition offsets, and
+[OffsetMetadataManager](https://github.com/apache/kafka/blob/4.1.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java)
+validates commits and produces records for the coordinator runtime. Cursus adopts
+multi-partition submission but retains message-bound grant epochs, synchronous
+per-batch completion and full topic offset snapshots. It does not substitute
+current membership authority for an old record or adopt interval auto-commit.
+The persisted format and O(P) snapshot size remain unchanged; fewer appends also
+mean fewer replay records/bytes before compaction. One slow partition does not
+hold up collection. A one-partition workload pays the short collection window
+without a batching benefit.
+
+Checks defined for this optimization: all-or-nothing stale-token and reservation
+rejection; failed append leaves every offset unchanged; replay-safe duplicate
+submission; independent progress after a rejected mixed batch; no revoke ACK
+overtaking an in-flight commit; cancellation before submission; mixed history-only
+broker refusal; combined activation restore; fault recovery with all committed
+offsets draining to log end. The paired TCP measurement records both metadata
+replay bytes and handler duplicate bytes, not just request reduction.
 
 Membership and offset operations reuse separate coordinator connections, keeping
 queued commits out of the heartbeat lane. Per-request deadlines and reconnects
@@ -143,7 +185,66 @@ coordinator stop/start and rolling broker restart under continuous traffic.
 The dedicated CI job uses the existing main/release pull-request triggers.
 
 
-## Measured results
+## Commit throughput analysis and measurements (2026-10-24)
+
+The original runtime serialized partition commits through one operation lane,
+persisting a full topic offset snapshot for each eight-record batch. The
+coordinator holds the group lock through the durable write, so stable-offset
+reads also wait behind these appends. A five-run block profile accumulated
+7.15 seconds in `GetStableOffset` and 3.98 seconds in `writeOffsetSnapshot`.
+These are overlapping goroutine wait totals, not elapsed time or CPU percentages.
+Eager consumption amortizes writes with asynchronous interval commits, so its
+throughput advantage cannot be attributed to the rebalance algorithm alone.
+
+The extended TCP test compares eager, single synchronous cooperative commits
+and coalesced synchronous cooperative commits in the same build on main
+`9c43d39`. Single mode disables auto-commit and calls the existing public
+`Commit` after every eight successful records. Both cooperative modes wait for
+commit completion before the next batch. The final five non-race repetitions
+use the same six-partition/960-record workload and two-CPU limit described below.
+Raw per-run results are in
+[the measurement artifact](../measurements/consumer-cooperative-commit-2026-10-24.json).
+
+| Measurement | Cooperative single | Cooperative coalesced | Eager |
+| --- | ---: | ---: | ---: |
+| Median handler records/s | 1,533.5 | 1,935.9 | 3,488.0 |
+| Handler records/s range | 786.5–1,557.9 | 1,845.3–2,037.1 | 2,308.1–3,614.6 |
+| Median drain after join | 580 ms | 450 ms | 240 ms |
+| Duplicate handler records | 7–16 | 0–16 | 96–144 |
+| Duplicate payload bytes | 896–2,048 | 0–2,048 | 12,288–18,432 |
+| Median metadata records | 126 | 52 | 42 |
+| Median metadata replay payload bytes | 50,284 | 26,368 | 13,836 |
+| Median maximum retained-partition gap | 39 ms | 29 ms | 13 ms |
+
+Coalescing improved median throughput by 26.2%, reduced metadata record count
+by 58.7% and replay payload bytes by 47.6%. The original synchronous replay
+window and token fences remain; duplicate reduction relative to eager is
+preserved. It still trails eager throughput. Absolute rates vary with host
+load, and the first single-commit run was slower; this small backlog test is
+not a production capacity claim. Metadata measurements include membership and
+shutdown records and exclude compaction, record headers and broker replication
+bytes. The per-record snapshot remains O(P).
+
+Linux race checks passed for the affected SDK/runtime and recovery paths,
+including failed/duplicate commits, stale grant isolation, transaction barriers,
+cancel-before-send, revoke during commit, and a lost response retried with the
+same token/offset. Current main's existing cooperative/history/index/strict
+recovery and disk tests passed before integration. Combined activation restore
+and marker 13-to-14 upgrade checks passed after integration. Native Windows
+filesystem tests require the Linux fixture for atomic replacement, and local
+TCP tests require permission beyond the desktop sandbox.
+
+The three-broker fault run passed join, graceful leave, client process kill,
+coordinator stop/start and all three rolling restarts. All six committed offsets
+reached log end. Phase times were 13.358 s for join, 13.405 s after process kill,
+17.804/30.868 s for coordinator stop/start, and 10.033/8.914/8.142 s for rolling
+restarts. These include readiness checks and overlapped static/race validation.
+The main consumer constructed 12 workers total; broker restarts added none.
+It fetched/delivered 194 records / 25,951 payload bytes; the parent and graceful
+peer observed zero duplicates. The killed child's deliveries are excluded, so
+this is not an exactly-once claim. Maximum retained-partition gap was 10.916 s.
+
+## Original measurements before commit batching
 
 The paired TCP test uses six partitions, 160 records per partition, 128-byte
 payloads, batches of eight, a one-millisecond handler, and a second consumer

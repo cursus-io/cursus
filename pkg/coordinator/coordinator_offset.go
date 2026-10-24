@@ -178,6 +178,10 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 	if gm.Cooperative != nil {
 		return errCooperativeProtocolRequired
 	}
+	return c.commitAuthorizedOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
+}
+
+func (c *Coordinator) commitAuthorizedOffsetsBulkForGroupLocked(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
 	}

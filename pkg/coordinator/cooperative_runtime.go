@@ -227,6 +227,15 @@ func (c *Coordinator) ValidateCooperativeRead(groupName string, registration uin
 }
 
 func (c *Coordinator) CommitCooperative(groupName string, registration uint64, grant CooperativeGrant, offset uint64) error {
+	return c.CommitCooperativeBatch(groupName, []protocol.CooperativeToken{{RegistrationEpoch: registration, Grant: grant}}, []OffsetItem{{Partition: grant.Partition.Partition, Offset: offset}})
+}
+
+// CommitCooperativeBatch validates every original grant before publishing one
+// durable topic snapshot. No offset is published if validation or append fails.
+func (c *Coordinator) CommitCooperativeBatch(groupName string, tokens []protocol.CooperativeToken, offsets []OffsetItem) error {
+	if len(tokens) == 0 || len(tokens) != len(offsets) || len(tokens) > protocol.MaxCooperativeCommitPartitions {
+		return fmt.Errorf("ERROR: invalid_cooperative_payload")
+	}
 	release, err := c.admitConsumerOperation()
 	if err != nil {
 		return err
@@ -235,18 +244,27 @@ func (c *Coordinator) CommitCooperative(groupName string, registration uint64, g
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	group := c.groups[groupName]
-	if err := c.validateCooperativePendingLocked(groupName, registration, grant); err != nil {
-		return err
-	}
 	if group == nil || group.Cooperative == nil {
 		return fmt.Errorf("ERROR: cooperative_fenced")
 	}
-	if err := group.Cooperative.ValidateGrant(registration, grant); err != nil {
-		return fmt.Errorf("ERROR: cooperative_fenced")
+	first := tokens[0]
+	seen := make(map[int]bool, len(tokens))
+	for i, token := range tokens {
+		grant := token.Grant
+		if token.RegistrationEpoch != first.RegistrationEpoch || grant.Partition.Topic != first.Grant.Partition.Topic || grant.Member != first.Grant.Member || grant.Session != first.Grant.Session || grant.Partition.Partition != offsets[i].Partition || seen[offsets[i].Partition] {
+			return fmt.Errorf("ERROR: invalid_cooperative_payload")
+		}
+		seen[offsets[i].Partition] = true
+		if err := c.validateCooperativePendingLocked(groupName, token.RegistrationEpoch, grant); err != nil {
+			return err
+		}
+		if err := group.Cooperative.ValidateGrant(token.RegistrationEpoch, grant); err != nil {
+			return fmt.Errorf("ERROR: cooperative_fenced")
+		}
 	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
-	return c.commitAuthorizedOffsetForGroupLocked(group, groupName, grant.Partition.Topic, grant.Partition.Partition, offset)
+	return c.commitAuthorizedOffsetsBulkForGroupLocked(group, groupName, first.Grant.Partition.Topic, offsets)
 }
 
 // IsCooperativeGroup is a synchronized mode query for legacy admission.

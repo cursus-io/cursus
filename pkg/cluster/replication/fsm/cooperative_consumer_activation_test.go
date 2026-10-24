@@ -12,7 +12,7 @@ import (
 
 func registerCooperativeConsumerBroker(t *testing.T, f *BrokerFSM, id, status string, version int) {
 	t.Helper()
-	require.Nil(t, f.Apply(&raft.Log{Data: []byte(fmt.Sprintf(`REGISTER:{"id":%q,"addr":"localhost:7000","status":%q,"incarnation_id":%q,"lifecycle_protocol":10,"recovery_protocol":%d}`, id, status, id+"-process", version))}))
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte(fmt.Sprintf(`REGISTER:{"id":%q,"addr":"localhost:7000","status":%q,"incarnation_id":%q,"lifecycle_protocol":%d,"recovery_protocol":%d}`, id, status, id+"-process", CooperativeConsumerProtocolVersion, version))}))
 }
 
 func TestCooperativeConsumerActivationRequiresAllBrokersAndPersists(t *testing.T) {
@@ -25,6 +25,7 @@ func TestCooperativeConsumerActivationRequiresAllBrokersAndPersists(t *testing.T
 	require.Error(t, resultError(activate(`["new"]`)))
 	require.False(t, f.CooperativeConsumerEnabled())
 	registerCooperativeConsumerBroker(t, f, "old", "inactive", 2)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte(`CONSUMER_HISTORY_ACTIVATE:{"voters":["new"]}`)}))
 	require.Error(t, resultError(activate(`["new","missing"]`)))
 	require.Error(t, resultError(activate(`["new","new"]`)))
 	require.Nil(t, activate(`["new"]`))
@@ -37,6 +38,7 @@ func TestCooperativeConsumerActivationRequiresAllBrokersAndPersists(t *testing.T
 	restored := NewBrokerFSM(nil, nil)
 	require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(buffer.Bytes()))))
 	require.True(t, restored.CooperativeConsumerEnabled())
+	require.True(t, restored.ConsumerHistoryEnabled(), "both activation barriers survive the combined snapshot")
 	require.Error(t, resultError(restored.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"late","incarnation_id":"late-process","lifecycle_protocol":10,"recovery_protocol":0}`)})))
 	require.Nil(t, restored.GetBroker("late"))
 	var state BrokerFSMState
@@ -47,9 +49,18 @@ func TestCooperativeConsumerActivationRequiresAllBrokersAndPersists(t *testing.T
 	require.NoError(t, err)
 	require.ErrorContains(t, NewBrokerFSM(nil, nil).Restore(io.NopCloser(bytes.NewReader(wrongVersion))), "requires snapshot version 13")
 	state.Version = SnapshotVersionCooperativeRuntime
-	require.Error(t, resultError(restored.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"old-lifecycle","incarnation_id":"old-process","lifecycle_protocol":9,"recovery_protocol":2}`)})))
+	require.Error(t, resultError(restored.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"old-lifecycle","incarnation_id":"old-process","lifecycle_protocol":10,"recovery_protocol":2}`)})))
 	state.Brokers["old"].RecoveryProtocol = 0
 	invalid, err := json.Marshal(state)
 	require.NoError(t, err)
 	require.ErrorContains(t, NewBrokerFSM(nil, nil).Restore(io.NopCloser(bytes.NewReader(invalid))), "complete recovery capability")
+}
+
+func TestCooperativeConsumerRejectsHistoryOnlyBroker(t *testing.T) {
+	f := NewBrokerFSM(nil, nil)
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"history","incarnation_id":"history-process","lifecycle_protocol":10,"recovery_protocol":2}`)}))
+	require.Nil(t, f.Apply(&raft.Log{Data: []byte(`CONSUMER_HISTORY_ACTIVATE:{"voters":["history"]}`)}))
+	require.Error(t, resultError(f.Apply(&raft.Log{Data: []byte(`COOPERATIVE_CONSUMER_ACTIVATE:{"voters":["history"]}`)})))
+	require.True(t, f.ConsumerHistoryEnabled())
+	require.False(t, f.CooperativeConsumerEnabled())
 }

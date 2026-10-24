@@ -49,27 +49,36 @@ type cooperativeWorker struct {
 
 // CooperativeStats counts actual worker construction and payload work. Replay
 // and processing gaps require application record identities/timestamps.
-type CooperativeStats struct{ WorkerStarts, WorkerStops, FetchedRecords, FetchedPayloadBytes, DeliveredRecords uint64 }
+type CooperativeStats struct {
+	WorkerStarts, WorkerStops, FetchedRecords, FetchedPayloadBytes, DeliveredRecords uint64
+	AutoCommitRequests, AutoCommitPartitions, AutoCommitWaitNanos                    uint64
+}
 
 // CooperativeConsumer is explicitly opted in and requires a capable broker.
 // Run uses per-partition workers in both polling and streaming modes. Revocation
 // cancels a handler's context and waits for its return before acknowledging it;
 // handlers must not leave untracked background work running after returning.
 type CooperativeConsumer struct {
-	membershipRPC cooperativeRPC
-	operationsRPC cooperativeRPC
-	transport     *Consumer
-	mu            sync.Mutex
-	membership    protocol.CooperativeMembership
-	workers       map[int]*cooperativeWorker
-	started       atomic.Bool
-	closed        atomic.Bool
-	starts        atomic.Uint64
-	stops         atomic.Uint64
-	fetched       atomic.Uint64
-	bytes         atomic.Uint64
-	delivered     atomic.Uint64
-	failures      chan error
+	membershipRPC    cooperativeRPC
+	operationsRPC    cooperativeRPC
+	transport        *Consumer
+	mu               sync.Mutex
+	membership       protocol.CooperativeMembership
+	workers          map[int]*cooperativeWorker
+	started          atomic.Bool
+	closed           atomic.Bool
+	starts           atomic.Uint64
+	stops            atomic.Uint64
+	fetched          atomic.Uint64
+	bytes            atomic.Uint64
+	delivered        atomic.Uint64
+	failures         chan error
+	commitMu         sync.Mutex
+	commitPending    []*cooperativeCommitRequest
+	commitRunning    bool
+	commitRequests   atomic.Uint64
+	commitPartitions atomic.Uint64
+	commitWait       atomic.Uint64
 }
 
 func NewCooperativeConsumer(cfg *ConsumerConfig) (*CooperativeConsumer, error) {
@@ -93,7 +102,7 @@ func NewCooperativeConsumer(cfg *ConsumerConfig) (*CooperativeConsumer, error) {
 }
 
 func (c *CooperativeConsumer) Stats() CooperativeStats {
-	return CooperativeStats{c.starts.Load(), c.stops.Load(), c.fetched.Load(), c.bytes.Load(), c.delivered.Load()}
+	return CooperativeStats{c.starts.Load(), c.stops.Load(), c.fetched.Load(), c.bytes.Load(), c.delivered.Load(), c.commitRequests.Load(), c.commitPartitions.Load(), c.commitWait.Load()}
 }
 
 // Run is single-use. Cancel ctx to stop; it returns only after handlers finish
@@ -523,7 +532,7 @@ func (c *CooperativeConsumer) runPartition(ctx context.Context, w *cooperativeWo
 			if cfg.EnableAutoCommit && message.Offset == messages[len(messages)-1].Offset {
 				commitRetry := newBackoff(max(cfg.CommitRetryBackoff, 100*time.Millisecond), time.Second)
 				for {
-					err = c.Commit(ctx, record, message.Offset+1)
+					err = c.commitProcessedBatch(ctx, record)
 					if err == nil {
 						break
 					}

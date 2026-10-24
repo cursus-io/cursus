@@ -244,8 +244,9 @@ func TestCooperativeGoTransactionOffsets(t *testing.T) {
 // A fixed backlog and handler cost make protocol overhead and replay comparable.
 // This is a local TCP measurement, not a production capacity benchmark.
 func TestCooperativeGoEagerComparison(t *testing.T) {
-	for _, cooperative := range []bool{false, true} {
-		t.Run(fmt.Sprintf("cooperative=%t", cooperative), func(t *testing.T) {
+	for _, mode := range []string{"eager", "cooperative-single", "cooperative-batched"} {
+		t.Run(mode, func(t *testing.T) {
+			cooperative := mode != "eager"
 			cfg, _, tm := cooperativeWireFixture(t, true)
 			cfg.Mode = sdk.ModePolling
 			cfg.BatchSize = 8
@@ -285,14 +286,25 @@ func TestCooperativeGoEagerComparison(t *testing.T) {
 				done := make(chan error, 1)
 				copyCfg := *cfg
 				if cooperative {
+					if mode == "cooperative-single" {
+						copyCfg.EnableAutoCommit = false
+					}
 					c, err := sdk.NewCooperativeConsumer(&copyCfg)
 					require.NoError(t, err)
 					go func() {
-						done <- c.Run(ctx, func(_ context.Context, m sdk.CooperativeMessage) error { return handler(m.Message) })
+						done <- c.Run(ctx, func(workerCtx context.Context, m sdk.CooperativeMessage) error {
+							if err := handler(m.Message); err != nil {
+								return err
+							}
+							if mode == "cooperative-single" && (m.Offset+1)%8 == 0 {
+								return c.Commit(workerCtx, m, m.Offset+1)
+							}
+							return nil
+						})
 					}()
 					return done, func() {
 						stats := c.Stats()
-						t.Logf("worker_starts=%d fetched_records=%d fetched_payload_bytes=%d", stats.WorkerStarts, stats.FetchedRecords, stats.FetchedPayloadBytes)
+						t.Logf("worker_starts=%d fetched_records=%d fetched_payload_bytes=%d commit_requests=%d commit_partitions=%d commit_worker_wait_ms=%d", stats.WorkerStarts, stats.FetchedRecords, stats.FetchedPayloadBytes, stats.AutoCommitRequests, stats.AutoCommitPartitions, stats.AutoCommitWaitNanos/uint64(time.Millisecond))
 					}
 				}
 				c, err := sdk.NewConsumerWithContext(ctx, &copyCfg)
@@ -316,6 +328,23 @@ func TestCooperativeGoEagerComparison(t *testing.T) {
 			<-doneB
 			finishA()
 			finishB()
+			metadataRecords, metadataBytes := 0, 0
+			for p := 0; p < tm.GetTopic(config.ConsumerOffsetsTopicName).Definition().Partitions; p++ {
+				var offset uint64
+				for {
+					messages, err := tm.ReadCommittedConsumerMetadata(config.ConsumerOffsetsTopicName, p, offset, 256)
+					require.NoError(t, err)
+					if len(messages) == 0 {
+						break
+					}
+					metadataRecords += len(messages)
+					for _, m := range messages {
+						metadataBytes += len(m.Payload)
+					}
+					offset = messages[len(messages)-1].Offset + 1
+				}
+			}
+			t.Logf("metadata_records=%d metadata_replay_payload_bytes=%d", metadataRecords, metadataBytes)
 			mu.Lock()
 			defer mu.Unlock()
 			duplicates := 0

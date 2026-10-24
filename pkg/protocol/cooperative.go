@@ -6,6 +6,9 @@ import (
 	"fmt"
 )
 
+// MaxCooperativeCommitPartitions bounds one synchronous commit snapshot request.
+const MaxCooperativeCommitPartitions = 64
+
 // CooperativePartition identifies a physical topic lifecycle, not merely its
 // reusable name. The caller must supply the authoritative lifecycle epoch.
 type CooperativePartition struct {
