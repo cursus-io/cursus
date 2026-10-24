@@ -2,41 +2,16 @@ package coordinator
 
 import (
 	"fmt"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"math"
 	"slices"
 )
 
-// CooperativePartition identifies a physical topic lifecycle, not merely its
-// reusable name. The caller must supply the authoritative lifecycle epoch.
-type CooperativePartition struct {
-	Topic          string `json:"topic"`
-	Partition      int    `json:"partition"`
-	LifecycleEpoch uint64 `json:"lifecycle_epoch"`
-}
-
-type CooperativeMember struct {
-	ID      string `json:"id"`
-	Session uint64 `json:"session"`
-}
-
-type CooperativeTarget struct {
-	Partition CooperativePartition `json:"partition"`
-	Member    string               `json:"member"`
-}
-
-type CooperativeGrant struct {
-	Partition      CooperativePartition `json:"partition"`
-	Member         string               `json:"member"`
-	Session        uint64               `json:"session"`
-	Epoch          uint64               `json:"epoch"`
-	RevokeRevision uint64               `json:"revoke_revision,omitempty"`
-}
-
-type CooperativeRevocation struct {
-	Partition      CooperativePartition `json:"partition"`
-	GrantEpoch     uint64               `json:"grant_epoch"`
-	RevokeRevision uint64               `json:"revoke_revision"`
-}
+type CooperativePartition = protocol.CooperativePartition
+type CooperativeMember = protocol.CooperativeMember
+type CooperativeGrant = protocol.CooperativeGrant
+type CooperativeRevocation = protocol.CooperativeRevocation
+type CooperativeTarget = protocol.CooperativeTarget
 
 // CooperativeAssignment is a candidate state machine, not an installed lease.
 // Persist a returned candidate before publishing its grants or fencing tokens.

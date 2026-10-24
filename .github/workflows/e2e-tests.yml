@@ -422,3 +422,30 @@ jobs:
         if: always()
         working-directory: test/e2e-cluster
         run: docker compose -f docker-compose.yml down -v --remove-orphans
+
+  cooperative-broker-go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
+      - name: Verify cooperative broker and Go client fault recovery
+        env:
+          RUN_E2E_COOPERATIVE: "1"
+        run: |
+          set -o pipefail
+          go test -v -timeout 20m ./test/e2e-cluster -run '^TestCooperativeBrokerGoFaultRecovery$' -count=1 | tee cooperative-go.log
+      - name: Upload fault recovery measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cooperative-broker-go
+          path: cooperative-go.log
+          if-no-files-found: ignore

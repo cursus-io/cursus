@@ -113,6 +113,7 @@ type Config struct {
 	MaxTransactionOffsets        int   `yaml:"max_transaction_offsets" json:"max.transaction.offsets"`
 
 	// consumer
+	ConsumerCooperativeEnabled       bool                  `yaml:"consumer_cooperative_enabled" json:"consumer.cooperative.enabled"`
 	ConsumerHistoryCompactionEnabled bool                  `yaml:"consumer_history_compaction_enabled" json:"consumer.history.compaction.enabled"`
 	ConsumerRecoveryIndexEnabled     bool                  `yaml:"consumer_recovery_index_enabled" json:"consumer.recovery.index.enabled"`
 	ConsumerSessionTimeoutMS         int                   `yaml:"consumer_session_timeout_ms" json:"consumer.session.timeout.ms"`
@@ -357,6 +358,7 @@ func LoadConfig() (*Config, error) {
 	flag.IntVar(&cfg.MaxTransactionOffsets, "max-transaction-offsets", cfg.MaxTransactionOffsets, "Maximum staged offsets in one transaction")
 
 	// consumer
+	flag.BoolVar(&cfg.ConsumerCooperativeEnabled, "consumer-cooperative-enabled", cfg.ConsumerCooperativeEnabled, "Enable cooperative consumer groups after cluster capability activation")
 	flag.IntVar(&cfg.ConsumerSessionTimeoutMS, "consumer-session-timeout", cfg.ConsumerSessionTimeoutMS, "Session timeout")
 	flag.BoolVar(&cfg.ConsumerHistoryCompactionEnabled, "consumer-history-compaction", cfg.ConsumerHistoryCompactionEnabled, "Activate certified consumer history compaction after all brokers support it")
 	flag.BoolVar(&cfg.ConsumerRecoveryIndexEnabled, "consumer-recovery-index", cfg.ConsumerRecoveryIndexEnabled, "Enable the disposable local consumer replay index")
@@ -542,6 +544,7 @@ func LoadConfig() (*Config, error) {
 	overrideEnvInt64(&cfg.MaxTransactionBytes, "MAX_TRANSACTION_BYTES")
 	overrideEnvInt(&cfg.MaxTransactionOffsets, "MAX_TRANSACTION_OFFSETS")
 
+	overrideEnvBool(&cfg.ConsumerCooperativeEnabled, "CONSUMER_COOPERATIVE_ENABLED")
 	overrideEnvInt(&cfg.ConsumerSessionTimeoutMS, "CONSUMER_SESSION_TIMEOUT")
 	overrideEnvBool(&cfg.ConsumerHistoryCompactionEnabled, "CONSUMER_HISTORY_COMPACTION_ENABLED")
 	overrideEnvBool(&cfg.ConsumerRecoveryIndexEnabled, "CONSUMER_RECOVERY_INDEX_ENABLED")

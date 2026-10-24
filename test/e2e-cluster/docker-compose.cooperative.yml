@@ -1,0 +1,25 @@
+services:
+  broker-1:
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.cooperative
+    environment:
+      ADVERTISED_CLIENT_HOST: "127.0.0.1"
+      CONSUMER_COOPERATIVE_ENABLED: "true"
+      CONSUMER_SESSION_TIMEOUT: "12000"
+      CONSUMER_HEARTBEAT_CHECK: "1000"
+  broker-2:
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.cooperative
+    environment:
+      ADVERTISED_CLIENT_HOST: "127.0.0.1"
+      CONSUMER_COOPERATIVE_ENABLED: "true"
+      CONSUMER_SESSION_TIMEOUT: "12000"
+      CONSUMER_HEARTBEAT_CHECK: "1000"
+  broker-3:
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.cooperative
+    environment:
+      ADVERTISED_CLIENT_HOST: "127.0.0.1"
+      CONSUMER_COOPERATIVE_ENABLED: "true"
+      CONSUMER_SESSION_TIMEOUT: "12000"
+      CONSUMER_HEARTBEAT_CHECK: "1000"

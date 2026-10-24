@@ -623,7 +623,13 @@ func (c *Coordinator) persistAndApplyLifecycle(groupName string, group, candidat
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.lifecyclePending, groupName)
+	delete(c.cooperativePending, groupName)
 	if err != nil {
+		if candidate.Cooperative != nil {
+			c.lifecyclePending[groupName] = true
+			generation := c.BeginConsumerRestore()
+			c.FinishConsumerRestore(generation, nil)
+		}
 		return fmt.Errorf("persist group lifecycle: %w", err)
 	}
 	if c.groups[groupName] != group {

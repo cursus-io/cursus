@@ -96,6 +96,9 @@ func buildErrorRegistry() map[string]ErrorClassification {
 	)
 	register(ErrorClassValidation, false,
 		"cooperative_protocol_required",
+		"cooperative_fenced",
+		"cooperative_not_enabled",
+		"invalid_cooperative_payload",
 		"invalid_expected_instance", "truncate_receipt_unsupported",
 		"UNSUPPORTED_FEATURE", "UNSUPPORTED_PROTOCOL_VERSION", "batch_decode_failed", "decode_failed",
 		"consumer_group_subscriptions_feature_required", "distribution_not_enabled", "distribution_required", "duplicate_partition", "empty_command", "empty_messages", "invalid_aggregate_version", "invalid_expected_version", "missing_min_in_sync_replicas",

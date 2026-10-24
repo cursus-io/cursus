@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
@@ -491,9 +492,29 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 			return fmt.Sprintf("ERROR: transaction_offset_prepare_failed reason=%q", epochErr.Error())
 		}
 	}
+	var ownerships []protocol.CooperativeToken
+	if args["ownerships"] != "" {
+		if err := protocol.DecodeCooperative(args["ownerships"], &ownerships); err != nil {
+			return err.Error()
+		}
+		if len(ownerships) != len(offsetPairs) {
+			return "ERROR: invalid_cooperative_payload"
+		}
+	}
+	tokens := make(map[int]*protocol.CooperativeToken, len(ownerships))
+	for i := range ownerships {
+		token := &ownerships[i]
+		if token.RegistrationEpoch != registrationEpoch || token.Grant.Member != memberID || token.Grant.Partition.Topic != offsetTopic || tokens[token.Grant.Partition.Partition] != nil {
+			return "ERROR: cooperative_fenced"
+		}
+		tokens[token.Grant.Partition.Partition] = token
+	}
 	ops := make([]transaction.OffsetOperation, 0, len(offsetPairs))
 	for _, pair := range offsetPairs {
-		op := transaction.OffsetOperation{Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: pair.Partition, Offset: pair.Offset, RegistrationEpoch: registrationEpoch}
+		if len(ownerships) > 0 && tokens[pair.Partition] == nil {
+			return "ERROR: cooperative_fenced"
+		}
+		op := transaction.OffsetOperation{Ownership: tokens[pair.Partition], Topic: offsetTopic, Group: groupID, Member: memberID, Generation: generation, Partition: pair.Partition, Offset: pair.Offset, RegistrationEpoch: registrationEpoch}
 		if err := ch.validateTransactionOffset(op, false); err != nil {
 			return err.Error()
 		}
@@ -1161,6 +1182,9 @@ func (ch *CommandHandler) validateTransactionOffset(op transaction.OffsetOperati
 		if op.RegistrationEpoch != 0 {
 			cmd += fmt.Sprintf(" registration_epoch=%d", op.RegistrationEpoch)
 		}
+		if op.Ownership != nil {
+			cmd += " ownership=" + protocol.EncodeCooperative(op.Ownership)
+		}
 		if !checkRegression {
 			cmd += " ownership_only=true"
 		}
@@ -1176,7 +1200,11 @@ func (ch *CommandHandler) validateTransactionOffset(op transaction.OffsetOperati
 	if op.RegistrationEpoch != 0 && ch.Coordinator.GetRegistrationEpoch(op.Group) != op.RegistrationEpoch {
 		return fmt.Errorf("ERROR: group_epoch_mismatch group=%s expected=%d actual=%d", op.Group, op.RegistrationEpoch, ch.Coordinator.GetRegistrationEpoch(op.Group))
 	}
-	if errResp := ch.Coordinator.ValidateTopicPartitionOwnershipFailure(op.Group, op.Member, op.Generation, op.Topic, op.Partition); errResp != "" {
+	if op.Ownership != nil {
+		if err := ch.validateCooperativeToken(op.Group, op.Ownership); err != nil {
+			return err
+		}
+	} else if errResp := ch.Coordinator.ValidateTopicPartitionOwnershipFailure(op.Group, op.Member, op.Generation, op.Topic, op.Partition); errResp != "" {
 		return fmt.Errorf("%s", errResp)
 	}
 	if checkRegression {

@@ -145,7 +145,7 @@ func TestReadCommittedPagePreservesFilteredScanPosition(t *testing.T) {
 		{Offset: 2, Payload: "visible"},
 	}
 	for i := range records {
-		storage.On("ReadMessages", uint64(i), len(records)-i).Return(records[i:], nil)
+		storage.On("ReadMessages", uint64(i), 1).Return(records[i:i+1], nil)
 	}
 	partition := NewPartition(0, "orders", storage, nil, config.DefaultConfig())
 	partition.SetHWM(3)
@@ -162,4 +162,53 @@ func TestReadCommittedPagePreservesFilteredScanPosition(t *testing.T) {
 		}
 		offset = next
 	}
+}
+
+type countingVisibilityStorage struct {
+	visibilityBenchmarkStorage
+	reads, decoded int
+}
+
+func (s *countingVisibilityStorage) ReadMessages(offset uint64, max int) ([]types.Message, error) {
+	records, err := s.visibilityBenchmarkStorage.ReadMessages(offset, max)
+	s.reads++
+	s.decoded += len(records)
+	return records, err
+}
+
+func TestReadCommittedPageBoundsRepeatedDecodeWork(t *testing.T) {
+	storage := &countingVisibilityStorage{}
+	for i := range 1600 {
+		storage.messages = append(storage.messages, types.Message{Offset: uint64(i), Payload: "visible"})
+	}
+	p := NewPartition(0, "orders", storage, nil, config.DefaultConfig())
+	p.SetHWM(1600)
+	var offset uint64
+	for range 200 {
+		messages, bytes, next, err := p.ReadCommittedPage(offset, 8, 1<<20, true)
+		require.NoError(t, err)
+		require.Len(t, messages, 8)
+		require.Positive(t, bytes)
+		require.Equal(t, offset+8, next)
+		offset = next
+	}
+	require.Equal(t, 200, storage.reads)
+	require.Equal(t, 1600, storage.decoded, "visible records must not be decoded repeatedly for later pages")
+}
+
+func TestReadCommittedPageGrowsAcrossFilteredPrefix(t *testing.T) {
+	storage := &countingVisibilityStorage{}
+	for i := range 4096 {
+		storage.messages = append(storage.messages, types.Message{Offset: uint64(i), Payload: "aborted", TransactionalID: "tx", TransactionState: types.TransactionStateAborted})
+	}
+	storage.messages = append(storage.messages, types.Message{Offset: 4096, Payload: "visible"})
+	p := NewPartition(0, "orders", storage, nil, config.DefaultConfig())
+	p.SetHWM(4097)
+	messages, _, next, err := p.ReadCommittedPage(0, 1, 1<<20, true)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "visible", messages[0].Payload)
+	require.Equal(t, uint64(4097), next)
+	require.LessOrEqual(t, storage.reads, 14, "filtered runs must grow to the existing scan cap")
+	require.Equal(t, 4097, storage.decoded)
 }

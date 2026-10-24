@@ -601,6 +601,9 @@ func (ch *CommandHandler) groupAdmissionPartitionCount(topicName string) (int, s
 // handleJoinGroup processes JOIN_GROUP command
 func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string {
 	args := parseKeyValueArgs(cmd[11:])
+	if args["protocol"] == "cooperative" {
+		return ch.handleCooperativeMembership(args, "join")
+	}
 
 	topicName := args["topic"]
 	groupName, ok := args["group"]
@@ -610,6 +613,9 @@ func (ch *CommandHandler) handleJoinGroup(cmd string, ctx *ClientContext) string
 	consumerID, ok := args["member"]
 	if !ok || consumerID == "" {
 		return "ERROR: missing_member command=JOIN_GROUP"
+	}
+	if ch.Coordinator != nil && ch.Coordinator.IsCooperativeGroup(groupName) {
+		return "ERROR: cooperative_protocol_required"
 	}
 	multiTopic := topicName == "" && ch.Coordinator != nil && ch.Coordinator.IsSubscriptionGroup(groupName)
 	if topicName == "" && !multiTopic {
@@ -788,6 +794,9 @@ func formatTopicAssignments(assignments []coordinator.TopicPartition) string {
 // handleLeaveGroup processes LEAVE_GROUP command
 func (ch *CommandHandler) handleLeaveGroup(cmd string) string {
 	args := parseKeyValueArgs(cmd[12:])
+	if args["protocol"] == "cooperative" {
+		return ch.handleCooperativeMembership(args, "leave")
+	}
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -895,6 +904,9 @@ func (ch *CommandHandler) handleListOffsets(cmd string, ctx *ClientContext) stri
 // handleFetchOffset processes FETCH_OFFSET command
 func (ch *CommandHandler) handleFetchOffset(cmd string) string {
 	args := parseKeyValueArgs(cmd[13:])
+	if args["cooperative_check"] == "true" {
+		return ch.handleCooperativeReadCheck(args)
+	}
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -1006,6 +1018,9 @@ func (ch *CommandHandler) handleGroupStatus(cmd string) string {
 // handleHeartbeat processes HEARTBEAT command
 func (ch *CommandHandler) handleHeartbeat(cmd string) string {
 	args := parseKeyValueArgs(cmd[10:])
+	if args["protocol"] == "cooperative" {
+		return ch.handleCooperativeMembership(args, "heartbeat")
+	}
 
 	topicName, ok := args["topic"]
 	if !ok || topicName == "" {
@@ -1103,6 +1118,9 @@ func (ch *CommandHandler) handleCommitOffset(cmd string) string {
 			return fmt.Sprintf("ERROR: group_epoch_mismatch group=%s", groupID)
 		}
 	}
+	if args["ownership"] != "" {
+		return ch.handleCooperativeCommit(args, partition, offset)
+	}
 	memberID := args["member"]
 	if memberID == "" {
 		return "ERROR: missing_member command=COMMIT_OFFSET"
@@ -1145,6 +1163,9 @@ func (ch *CommandHandler) handleBatchCommit(cmd string, contexts ...*ClientConte
 	args := parseKeyValueArgs(cmd[13:])
 	if args["reservation_action"] != "" {
 		return ch.handleTransactionReservationCommand(cmd, firstClientContext(contexts))
+	}
+	if args["ownerships"] != "" {
+		return ch.handleCooperativeBatchCommit(args)
 	}
 
 	topicName := args["topic"]
