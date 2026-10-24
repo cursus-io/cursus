@@ -37,3 +37,20 @@ leader change, and rerun the unchanged three-node indexed tail/crash fixture.
 Measure bytes and CPU/memory in the integration run; do not turn a request count
 into a physical I/O claim. Existing process-crash and guest-power-cut evidence
 remains separate from device power-loss guarantees.
+
+## Results
+
+The deterministic three-failure regression fails at the baseline with **40**
+requests where **13** are expected. The corrected code uses 13. Direct FSM
+tests additionally reject missing local proof, changed leadership/lifecycle/
+incarnation/capability, changed storage and cancellation without mutation.
+
+The unchanged three-broker indexed-tail CI passed on `011ed0f`:
+[retained-bootstrap job](https://github.com/cursus-io/cursus/actions/runs/40073096656/job/120810582606).
+It repaired 10,000 divergent records using **25** exchanges including failed
+turns, below the unchanged bound of 52, and **4,785,016** incremental response
+bytes. The sampled per-node lineage read deltas were 2,159,249 / 4,797,672 /
+2,496,905 bytes, with 11,533 / 22,505 / 11,563 record visits. Receiver retained
+scan work was 140 bytes / one record. These instrumented stage counters are
+not physical-device I/O or a claim of no repeated hashing. The test took
+263.71 seconds including its full generation-change/crash/rebuild fixture.

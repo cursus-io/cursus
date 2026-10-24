@@ -69,6 +69,7 @@ func TestReplicaPrefixRefinementRejectsChangedAuthorityAndStorage(t *testing.T) 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			p := request.localAuthority.partition
+			require.NoError(t, receiver.ValidateReplicaPrefixContinuationContext(context.Background(), request))
 			switch change {
 			case "leader":
 				receiver.partitionMetadata["orders-0"].LeaderEpoch++
@@ -86,8 +87,28 @@ func TestReplicaPrefixRefinementRejectsChangedAuthorityAndStorage(t *testing.T) 
 			leo, hwm := p.NextOffset(), p.GetHWM()
 			_, err = receiver.RefineReplicaPrefixContext(ctx, request, batch)
 			require.Error(t, err)
+			require.Error(t, receiver.ValidateReplicaPrefixContinuationContext(ctx, request))
 			require.Equal(t, leo, p.NextOffset())
 			require.Equal(t, hwm, p.GetHWM())
+		})
+	}
+}
+
+func TestReplicaPrefixContinuationRequiresLocalProof(t *testing.T) {
+	_, receiver, original := prefixRefinementPair(t, 1, 3)
+	for _, missing := range []string{"indexed protocol", "local authority", "storage witness"} {
+		t.Run(missing, func(t *testing.T) {
+			request := original
+			switch missing {
+			case "indexed protocol":
+				request.RecoveryProtocol = 0
+			case "local authority":
+				request.localAuthority = nil
+			case "storage witness":
+				request.LocalWitness = nil
+			}
+			require.ErrorContains(t, receiver.ValidateReplicaPrefixContinuationContext(context.Background(), request), "original recovery witness")
+			require.Equal(t, uint64(3), original.localAuthority.partition.NextOffset())
 		})
 	}
 }
