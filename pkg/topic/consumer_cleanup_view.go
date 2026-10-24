@@ -143,12 +143,18 @@ func (view *consumerCleanupView) Read(partition int, offset uint64, cursor types
 	if !ok {
 		return page, fmt.Errorf("bounded physical consumer metadata reader unavailable")
 	}
-	if reader, ok := p.dh.(interface {
+	var err error
+	if contextual, ok := p.dh.(interface {
 		ReadReplayPageContext(context.Context, uint64, uint64, types.ReplayCursor, int, int) (types.ReplayPage, error)
 	}); ok {
-		return reader.ReadReplayPageContext(view.ctx, offset, bounds.End, cursor, maxRecords, maxBytes)
+		page, err = contextual.ReadReplayPageContext(view.ctx, offset, bounds.End, cursor, maxRecords, maxBytes)
+	} else {
+		page, err = reader.ReadReplayPage(offset, bounds.End, cursor, maxRecords, maxBytes)
 	}
-	return reader.ReadReplayPage(offset, bounds.End, cursor, maxRecords, maxBytes)
+	if err != nil {
+		return page, err
+	}
+	return consumerCleanupEvidenceFault(page, bounds.End)
 }
 
 func cleanupViewWaiting(reason string) error {

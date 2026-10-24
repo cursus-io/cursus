@@ -98,7 +98,7 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	}
 	t.Setenv("TRANSACTION_TIMEOUT_MS", "60000")
 	const input, output, group = "prepared-input", "prepared-output", "prepared-workers"
-	ctx := GivenClusterRestart(t).WithClusterSize(3).WithTopic(output).WithPartitions(1).WithAcks("all")
+	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml").WithClusterSize(3).WithTopic(output).WithPartitions(1).WithAcks("all")
 	ctx.WhenCluster().StartCluster()
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer client.Close()
@@ -138,7 +138,7 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 		}
 	}
 	require.NotZero(t, offline)
-	stopComposeBroker(t, offline)
+	cleanupBrokerCommand(t, "stop", offline)
 	survivors := survivorNodes(offline)
 	waitForSingleRaftLeader(t, survivors, offline)
 	waitForPreparedTransactionQuorum(t, survivors)
@@ -164,12 +164,26 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	require.Error(t, err)
 	require.True(t, errors.As(err, &brokerErr))
 	require.Equal(t, "unstable_offset_commit", brokerErr.Code)
+	// A departed member does not release a prepared reservation. Check both
+	// lifecycle operations through every surviving seed in this three-node
+	// fixture before allowing its existing failover/recovery sequence to finish.
+	for _, addr := range clusterBrokerAddrsForNodes(survivors) {
+		admin := e2e.NewBrokerClient([]string{addr})
+		for _, command := range []string{"TRUNCATE topic=" + input + " expected_revision=1", "DELETE topic=" + input} {
+			_, lifecycleErr := admin.SendCommand("admin", command, 15*time.Second)
+			require.Error(t, lifecycleErr, command)
+			require.Contains(t, lifecycleErr.Error(), "blocked")
+		}
+		admin.Close()
+	}
+	requireClusterDefinitionEventually(t, clusterBrokerAddrsForNodes(survivors), input, map[string]string{"revision": "1", "lifecycle_epoch": "1"})
 	currentOwner, err := client.FindTransactionCoordinator(txnID)
 	require.NoError(t, err)
 	failedCoordinator := coordinatorNode(t, currentOwner)
 	require.NotEqual(t, offline, failedCoordinator)
-	ctx.WhenCluster().KillBroker(failedCoordinator)
-	startComposeBroker(t, offline)
+	cleanupBrokerCommand(t, "kill", failedCoordinator)
+	ctx.GetClient().Close()
+	cleanupBrokerCommand(t, "start", offline)
 	newSurvivors := survivorNodes(failedCoordinator)
 	waitForSingleRaftLeader(t, newSurvivors, failedCoordinator)
 	waitForPreparedTransactionQuorum(t, newSurvivors)
@@ -180,7 +194,7 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 		status, statusErr := recoveryClient.GetTransactionStatus(txnID)
 		return findErr == nil && statusErr == nil && owner != currentOwner && status.State == "prepare_commit", fmt.Sprintf("owner=%s state=%s find=%v status=%v", owner, status.State, findErr, statusErr), nil
 	}))
-	startComposeBroker(t, failedCoordinator)
+	cleanupBrokerCommand(t, "start", failedCoordinator)
 	waitForAllBrokerReadiness(t, []int{1, 2, 3})
 	waitForFullISRAndZeroUnderReplicated(t, ctx, "prepared coordinator restart")
 	require.NoError(t, eventually(t, "departed member transaction finishes with its durable reservation", clusterReadyTimeout, func() (bool, string, error) {

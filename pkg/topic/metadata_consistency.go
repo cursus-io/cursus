@@ -155,6 +155,23 @@ func (tm *TopicManager) PersistedTopicStorageNames() ([]string, error) {
 	store := &topicMetadataStore{path: filepath.Join(tm.cfg.LogDir, TopicMetadataFileName)}
 	return store.orphanedTopicDirectories(nil)
 }
+
+// LocalTopicStoragePresent checks for unopened storage without reading records
+// or inferring its identity from a historical replay definition.
+func (tm *TopicManager) LocalTopicStoragePresent(name string) (bool, error) {
+	if err := ValidateName(name); err != nil {
+		return false, err
+	}
+	if tm == nil || tm.cfg == nil || strings.TrimSpace(tm.cfg.LogDir) == "" {
+		return false, nil
+	}
+	_, err := os.Lstat(filepath.Join(tm.cfg.LogDir, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func hasPersistedPartitionLog(path string) (bool, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
