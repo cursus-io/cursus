@@ -131,6 +131,22 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	}()
 	t.Cleanup(func() { cancel(); <-publishDone })
 	var mu sync.Mutex
+	phase := "initial"
+	setPhase := func(next string) {
+		mu.Lock()
+		phase = next
+		mu.Unlock()
+		t.Logf("fault_phase_start=%s", next)
+	}
+	type delivery struct {
+		phase  string
+		member string
+		epoch  uint64
+	}
+	previousDelivery := make(map[string]delivery)
+	duplicatesByPhase := make(map[string]int)
+	duplicatesByGrant := make(map[string]int)
+	sameGrantDuplicates := 0
 	counts := make(map[int]int)
 	seen := make(map[string]int)
 	last := make(map[int]time.Time)
@@ -144,7 +160,16 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 		key := fmt.Sprintf("%d/%d", p, m.Offset)
 		if seen[key] > 0 {
 			replayBytes += uint64(len(m.Payload))
+			previous := previousDelivery[key]
+			duplicatesByPhase[phase]++
+			duplicatesByGrant[fmt.Sprintf("%s/%d/%d", m.Ownership.Grant.Member, m.Ownership.Grant.Epoch, p)]++
+			sameGrant := previous.member == m.Ownership.Grant.Member && previous.epoch == m.Ownership.Grant.Epoch
+			if sameGrant {
+				sameGrantDuplicates++
+			}
+			t.Logf("duplicate phase=%s partition=%d offset=%d bytes=%d previous_phase=%s previous_member=%s previous_grant=%d member=%s grant=%d same_grant=%t", phase, p, m.Offset, len(m.Payload), previous.phase, previous.member, previous.epoch, m.Ownership.Grant.Member, m.Ownership.Grant.Epoch, sameGrant)
 		}
+		previousDelivery[key] = delivery{phase, m.Ownership.Grant.Member, m.Ownership.Grant.Epoch}
 		seen[key]++
 		if previous := last[p]; !previous.IsZero() && now.Sub(previous) > gaps[p] {
 			gaps[p] = now.Sub(previous)
@@ -194,6 +219,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	defer cancelB()
 	doneB := make(chan error, 1)
 	joinStart := time.Now()
+	setPhase("member_join")
 	go func() {
 		err := b.Run(ctxB, handler)
 		t.Logf("consumer B exit: %v stats=%+v", err, b.Stats())
@@ -204,6 +230,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	waitProgress("member join")
 	require.Equal(t, uint64(6), a.Stats().WorkerStarts)
 	t.Logf("phase=join convergence_ms=%d moved_partitions=3 retained_worker_restarts=0", time.Since(joinStart).Milliseconds())
+	setPhase("member_leave")
 	cancelB()
 	require.ErrorIs(t, <-doneB, context.Canceled)
 	require.Eventually(t, func() bool { return a.Stats().WorkerStarts == 9 }, 20*time.Second, 50*time.Millisecond)
@@ -216,6 +243,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	child.Env = append(os.Environ(), "CURSUS_COOPERATIVE_CHILD=1", "CURSUS_COOPERATIVE_ADDRS="+strings.Join(addrs, ","), "CURSUS_COOPERATIVE_READY="+ready)
 	child.Stdout = childLog
 	child.Stderr = childLog
+	setPhase("crash_client_join")
 	require.NoError(t, child.Start())
 	defer func() {
 		if child.ProcessState == nil {
@@ -225,6 +253,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	}()
 	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 25*time.Second, 100*time.Millisecond)
 	crashStart := time.Now()
+	setPhase("client_crash")
 	require.NoError(t, child.Process.Kill())
 	require.Error(t, child.Wait())
 	waitProgress("client crash, retained partitions")
@@ -232,6 +261,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	t.Logf("phase=client_crash recovery_ms=%d rebuilt_workers=3", time.Since(crashStart).Milliseconds())
 	oldCoordinator := coordinatorNode(t, findGroupCoordinator(t, 1, cfg.GroupID))
 	failoverStart := time.Now()
+	setPhase("coordinator_failover")
 	cleanupBrokerCommand(t, "stop", oldCoordinator)
 	survivors := survivorNodes(oldCoordinator)
 	waitForSingleRaftLeader(t, survivors, oldCoordinator)
@@ -239,11 +269,13 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	waitProgress("coordinator failover")
 	t.Logf("phase=coordinator_failover progress_recovery_ms=%d", time.Since(failoverStart).Milliseconds())
 	restartStart := time.Now()
+	setPhase("coordinator_restart")
 	cleanupBrokerCommand(t, "start", oldCoordinator)
 	waitForAllBrokerReadiness(t, []int{1, 2, 3})
 	waitProgress("coordinator restart")
 	t.Logf("phase=coordinator_restart progress_recovery_ms=%d", time.Since(restartStart).Milliseconds())
 	for node := 1; node <= 3; node++ {
+		setPhase(fmt.Sprintf("rolling_restart_%d", node))
 		restartStart := time.Now()
 		cleanupBrokerCommand(t, "restart", node)
 		waitForAllBrokerReadiness(t, []int{1, 2, 3})
@@ -272,6 +304,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	err = <-doneA
 	require.True(t, errors.Is(err, context.Canceled), "%v", err)
 	stats := a.Stats()
+	peerStats := b.Stats()
 	mu.Lock()
 	duplicates := 0
 	for _, n := range seen {
@@ -279,6 +312,10 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 			duplicates += n - 1
 		}
 	}
-	t.Logf("scope=parent_and_graceful_peer delivered_records=%d fetched_records=%d fetched_payload_bytes=%d duplicate_deliveries=%d replay_payload_bytes=%d retained_partition_0_max_gap_ms=%d worker_starts=%d", stats.DeliveredRecords, stats.FetchedRecords, stats.FetchedPayloadBytes, duplicates, replayBytes, gaps[0].Milliseconds(), stats.WorkerStarts)
+	t.Logf("scope=parent_and_graceful_peer delivered_records=%d fetched_records=%d fetched_payload_bytes=%d duplicate_deliveries=%d replay_payload_bytes=%d retained_partition_0_max_gap_ms=%d worker_starts=%d duplicates_by_phase=%v same_grant_duplicates=%d", stats.DeliveredRecords+peerStats.DeliveredRecords, stats.FetchedRecords+peerStats.FetchedRecords, stats.FetchedPayloadBytes+peerStats.FetchedPayloadBytes, duplicates, replayBytes, gaps[0].Milliseconds(), stats.WorkerStarts, duplicatesByPhase, sameGrantDuplicates)
+	assert.Zero(t, sameGrantDuplicates, "connection recovery must not redeliver within an unchanged grant")
+	for grant, n := range duplicatesByGrant {
+		assert.LessOrEqual(t, n, cfg.BatchSize, "a transferred partition must retain the one-batch replay bound: %s", grant)
+	}
 	mu.Unlock()
 }

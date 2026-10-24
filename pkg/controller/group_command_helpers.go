@@ -104,6 +104,11 @@ func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cA
 		return 0, err
 	}
 	if found {
+		// Preserve a cooperative worker's explicit resume position without
+		// advancing its durable offset or bypassing transaction stability.
+		if cArgs.Ownership != nil && cArgs.HasOffset && cArgs.Offset > savedOffset {
+			return cArgs.Offset, nil
+		}
 		if resetOffset, reset := resetRetainedOffset(savedOffset, p.OffsetRange(), cArgs.AutoOffsetReset); reset {
 			util.Warn("Committed offset %d for group %s topic %s partition %d is outside the readable range; resetting to %d (%s)",
 				savedOffset, cArgs.GroupName, topicName, cArgs.PartitionID, resetOffset, cArgs.AutoOffsetReset)

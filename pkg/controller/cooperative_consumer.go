@@ -252,13 +252,21 @@ func (ch *CommandHandler) handleCooperativeBatchCommit(args map[string]string) s
 	if err != nil || len(tokens) == 0 || len(tokens) != len(pairs) || len(tokens) > protocol.MaxCooperativeCommitPartitions {
 		return "ERROR: invalid_cooperative_payload"
 	}
+	// A batch names one topic. Resolve its lifecycle once; the coordinator
+	// validates every original grant under the fence held through durable append.
+	// Repeating that group validation here adds lock acquisitions without making
+	// the later write authoritative.
+	definition, err := ch.cooperativeTopic(args["topic"])
+	if err != nil {
+		return err.Error()
+	}
 	offsets := make([]coordinator.OffsetItem, len(pairs))
 	for i, token := range tokens {
 		if token.Grant.Member != args["member"] || token.Grant.Partition.Topic != args["topic"] || token.Grant.Partition.Partition != pairs[i].Partition {
 			return "ERROR: cooperative_fenced"
 		}
-		if err := ch.validateCooperativeToken(args["group"], &token); err != nil {
-			return err.Error()
+		if token.Grant.Partition.LifecycleEpoch != definition.LifecycleEpoch || token.Grant.Partition.Partition < 0 || token.Grant.Partition.Partition >= definition.Partitions {
+			return "ERROR: cooperative_fenced"
 		}
 		offsets[i] = coordinator.OffsetItem{Partition: pairs[i].Partition, Offset: pairs[i].Offset}
 	}

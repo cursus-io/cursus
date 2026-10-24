@@ -414,29 +414,31 @@ func (c *CooperativeConsumer) fetchPartition(ctx context.Context, w *cooperative
 			activeConn := conn
 			stop := context.AfterFunc(ctx, func() { _ = activeConn.Close() })
 			release = func() { stop() }
-			response, err := c.command(ctx, fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s include_found=true", cfg.Topic, pid, cfg.GroupID), false)
-			if err != nil {
-				closeConn()
-				if !cooperativeRetryable(err) {
+			if !initialized {
+				response, err := c.command(ctx, fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s include_found=true", cfg.Topic, pid, cfg.GroupID), false)
+				if err != nil {
+					closeConn()
+					if !cooperativeRetryable(err) {
+						return err
+					}
+					if !cooperativeWait(ctx, retry.duration()) {
+						break
+					}
+					continue
+				}
+				if _, err = parseOKResponse(response); err != nil {
 					return err
 				}
-				if !cooperativeWait(ctx, retry.duration()) {
-					break
+				offset, err = parseFetchOffsetResponse(response)
+				if err != nil {
+					return err
 				}
-				continue
+				initialized = true
 			}
-			_, err = parseOKResponse(response)
-			if err != nil {
-				return err
-			}
-			stable, err := parseFetchOffsetResponse(response)
-			if err != nil {
-				return err
-			}
-			if !initialized || stable > offset {
-				offset = stable
-			}
-			initialized = true
+			// A retained worker already has its fetch position. CONSUME/STREAM
+			// recheck stable offsets and reservations at the coordinator before
+			// delivery, so reconnect need not queue another FETCH_OFFSET behind
+			// the synchronous commit on the operations connection.
 			if cfg.Mode == ModeStreaming {
 				_ = conn.SetWriteDeadline(time.Now().Add(c.transport.requestTimeout()))
 				if err := WriteWithLength(conn, []byte(c.fetchCommand("STREAM", w.token, offset))); err != nil {

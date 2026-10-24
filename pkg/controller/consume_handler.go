@@ -187,6 +187,13 @@ func (ch *CommandHandler) readFromTopicBounded(topicName string, cArgs CommonArg
 	} else if !found {
 		currentOffset = resetConsumerOffset(p, cArgs)
 	}
+	// A cooperative worker retains its fetch position across connections.
+	// The committed offset can lag while its previous batch is being persisted;
+	// using only that offset on reconnect would deliver the same batch twice.
+	// Stability was checked above and ownership is checked before delivery.
+	if cArgs.Ownership != nil && cArgs.HasOffset && cArgs.Offset > currentOffset {
+		currentOffset = cArgs.Offset
+	}
 
 	messages, decodedBytes, nextScan, err := readPartitionPage(p, currentOffset, batchSize, maxBytes, allowOversizedFirst, cArgs.ReadIsolation)
 	if err != nil {

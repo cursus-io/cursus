@@ -639,3 +639,117 @@ consumer plus graceful peer observed one duplicate / 133 replay payload bytes.
 The killed subprocess's deliveries are excluded from those duplicate counters;
 no end-to-end exactly-once claim is made. Broker replication/recovery traffic is
 not included in fetched payload bytes.
+
+## Reconnect duplicate investigation (2026-10-24)
+
+The historical CI counts, zero on `6e78a23` and 16 / 2,144 replay payload
+bytes on `9f04d42`, did not contain per-offset attribution. They cannot establish
+that all 16 duplicates had the same cause. The instrumented three-broker test
+now records phase, partition, offset, payload bytes, original/new member and
+grant, rejects duplicates within an unchanged grant, and bounds replay on each
+transferred partition to one configured batch. Delivered/fetched totals now
+include the graceful peer as their scope label promises; the old totals only
+included the parent. Duplicate counters already included both. Killed-child
+deliveries remain excluded.
+
+A same-harness local run reproduced one same-grant duplicate / 134 bytes on
+`6e78a23`, and four / 536 bytes on `9f04d42`, all during coordinator restart.
+Both failed the new assertion despite draining every committed offset to log
+end. The counts are timing-sensitive; the bug is not harmless timing variation.
+Both polling's fresh connection and streaming's initialization ignored an
+explicit cooperative fetch position whenever a committed offset existed.
+Reconnecting between handling a batch and completing its commit could therefore
+read that batch again. The committed-read window introduced an additional
+reproducible exposure while a write was already in flight.
+
+The controlled regression holds commit 16 at the durable writer while a new
+connection requests position 16 under the original grant and committed offset
+8. Three repetitions in each mode showed `6e78a23` waiting for commit completion
+then returning 16, but `9f04d42` returning eight records starting at 8 before the
+commit completed. This distinguishes a specific behavioral regression from the
+pre-existing reconnect bug. The test records replay work and payload bytes,
+and also asserts that the held commit cannot acknowledge early.
+
+### Kafka comparison and selected changes
+
+[Kafka 4.1.0 AbstractFetch](https://github.com/apache/kafka/blob/4.1.0/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractFetch.java)
+constructs partition fetch requests from the current `FetchPosition`, separate
+from committed group offsets. Cursus adopts that separation for cooperative
+resume positions. It retains its existing committed-offset lower bound,
+connection cursor, transaction-reservation lookup on every read, HWM/LSO and
+retention behavior, and final original-grant validation. Eager cursor semantics
+are unchanged. Reading ahead never publishes a commit; the Go worker still
+waits for synchronous durable success before handling the next batch. A new
+owner still starts from the committed position and may replay uncommitted work.
+
+[Kafka 4.1.0 OffsetMetadataManager](https://github.com/apache/kafka/blob/4.1.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java)
+validates the group for a commit request before generating its partition records.
+Cursus resolves the single batch topic's lifecycle once and leaves original
+registration/session/grant validation for every partition in
+`CommitCooperativeBatch`, under the same coordinator fence held through durable
+append. This removes repeated preliminary group lock acquisitions and topic
+lookups; it does not remove the authoritative ownership validation or change
+snapshot formats, all-or-nothing rejection, reservations or synchronous ACKs.
+
+Regression checks cover polling/streaming reconnect during a held commit,
+explicit and cached cursor precedence, unchanged eager behavior, reads beyond
+log end without advancing a commit, transaction reservations, and rejection of
+an invalid second token without publishing the first partition. Existing stale
+grant, delayed revocation ACK, failed append and response-loss/replay tests remain
+required. Availability improves because a reconnect can read its correct next
+position while the prior commit is pending; recovery avoids replaying already
+handled batches and their bytes. Membership transfer and hard-crash replay are
+still bounded at-least-once behavior, not exactly-once delivery.
+
+An initialized Go worker also reuses its fetch position on reconnect rather
+than sending another `FETCH_OFFSET` through the operations connection occupied
+by a synchronous commit. The broker still consults the authoritative stable
+offset/reservation on every CONSUME/STREAM read and validates ownership before
+delivery. A new grant creates a new worker and performs the initial offset
+lookup. A real-socket SDK regression holds the operations gate across a forced
+data-connection loss and requires the next page at offset 16, with just one
+initial offset lookup; polling and streaming each pass five race repetitions.
+The SDK and server full race suites and `go vet` also pass with this change.
+
+The broker cursor/validation version passed the full controller, server,
+coordinator and SDK race suites and vet. Its instrumented local three-broker
+fault run drained all partitions with zero duplicates/replay bytes and 12 parent
+worker starts. Local restart timings were slow and variable; those are not used
+as throughput evidence. The original same-grant failures are retained as failed
+measurements rather than counted as passes.
+
+A 96-case, six-rotation exploration compared baseline, cursor/batch-validation
+with the existing 2 ms collection limit, and 4/8 ms limits. All passed the
+original safety bounds. Longer collection did not give a consistent throughput
+gain: 4 ms increased join duplicates to 3–24 (median 16.5), while 8 ms increased
+the long-workload median partition-0 gap from 52.5 to 109 ms. Both candidates
+are rejected. The production collection limit remains 2 ms, with early flush
+when all workers are waiting. The selected implementation and eager control
+are compared separately after the SDK reconnect change.
+
+The final 48-case confirmation alternated baseline `9f04d42` and the selected
+code six times, each with eager/cooperative and 960-record join/9,600-record
+backlog workloads. All passed, keeping the original one-batch transfer bound
+and zero duplicates without membership changes. Durable backlog throughput
+median was **2,657.8 → 2,744.4 records/s (+3.26%)**; the median of per-run
+cooperative/eager ratios was **67.51% → 69.93%**. Join throughput was
+2,169.45 → 2,193.65 records/s (+1.12%), with its paired ratio essentially
+unchanged at 69.87%. These are modest local observations: ranges overlap and the
+host is shared, so they do not establish a guaranteed capacity increase.
+
+Long-workload commit requests fell from a median 254.5 to 212, cumulative worker
+commit wait from 8,398.5 to 7,916 ms, and metadata replay payload from 88,861.5
+to 74,512 bytes (257.5 → 215 records). All long cases fetched exactly 1,228,800
+payload bytes with zero duplicates. Join duplicates were 3–22 for the selected
+code, 3–24 for baseline, and 144 for its eager control; normal membership
+handoff can still replay one uncommitted batch per moved partition. A held
+operations-connection regression fails on the baseline and passes on the new
+SDK, directly proving that reconnect no longer waits on that extra offset query.
+
+[Raw observations and fault attribution](../measurements/consumer-cooperative-resume-2026-10-24.json)
+include all 96 exploratory and 48 confirmation cases, rejected settings, the
+older/current/fixed cluster outcomes and controlled regressions. As before,
+cooperative commits are synchronous while eager uses a 10 ms asynchronous
+interval. Test completion waits for every unique handler delivery and all
+committed offsets to reach log end. Own race/fault jobs finished before capacity
+measurement; other sessions' jobs were present on the shared Windows/WSL host.
