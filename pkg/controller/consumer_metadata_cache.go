@@ -116,6 +116,9 @@ func (ch *CommandHandler) ConfigureConsumerMetadataRecovery(ctx context.Context,
 	c.constructStore = topic.NewDetachedMetadataStore
 	ch.consumerRecoveryCache = c
 	ch.SetConsumerMetadataRecoveryProvider(c.stage)
+	if ch.Coordinator != nil {
+		ch.Coordinator.SetConsumerCleanupProvider(ch.prepareConsumerCleanup)
+	}
 	// This one process-lifetime observer never owns a stage or a staged lease.
 	go func() { <-ownerCtx.Done(); _ = c.close() }()
 	return nil

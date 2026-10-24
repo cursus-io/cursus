@@ -109,20 +109,6 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 		ctx = givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml")
 	}
 	defer ctx.Cleanup()
-	stopBroker := func(node int) {
-		if os.Getenv("RUN_E2E_CONSUMER_HISTORY") == "1" {
-			historyMeasureDocker(t, "stop", cleanupContainerName(node))
-		} else {
-			cleanupBrokerCommand(t, "stop", node)
-		}
-	}
-	startBroker := func(node int) {
-		if os.Getenv("RUN_E2E_CONSUMER_HISTORY") == "1" {
-			historyMeasureDocker(t, "start", cleanupContainerName(node))
-		} else {
-			cleanupBrokerCommand(t, "start", node)
-		}
-	}
 	ctx.WithClusterSize(3).WithTopic(output).WithPartitions(1).WithAcks("all")
 	ctx.WhenCluster().StartCluster()
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())

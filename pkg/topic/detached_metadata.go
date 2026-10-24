@@ -10,6 +10,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 const detachedMetadataPageBytes = 1 << 20
@@ -392,6 +393,52 @@ func (l *DetachedMetadataLease) ReadCommittedMetadata(ctx context.Context, offse
 // It shares the same scratch budget and actual-work accounting as replay.
 func (l *DetachedMetadataLease) ReadRawMetadata(ctx context.Context, offset uint64, maxRecords int) ([]types.Message, error) {
 	return l.readMetadata(ctx, offset, maxRecords, nil, true)
+}
+
+// ReadCleanupPage reuses the certified raw store and its decode reservation.
+// Remote cleanup never uses transaction-filtered omissions as lifecycle proof.
+func (l *DetachedMetadataLease) ReadCleanupPage(ctx context.Context, offset uint64, maxRecords, maxBytes int) (page types.ReplayPage, resultErr error) {
+	if ctx == nil {
+		return page, fmt.Errorf("detached cleanup requires context")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return types.ReplayPage{}, disk.ErrDetachedBootstrapClosed
+	}
+	if err := l.store.budget.acquireScratch(ctx); err != nil {
+		return types.ReplayPage{}, err
+	}
+	defer func() { <-l.store.budget.scratch }()
+	before := l.raw.Work()
+	defer func() {
+		after := l.raw.Work()
+		work := disk.DetachedRawWork{ReadBytes: after.ReadBytes - before.ReadBytes, IndexReadBytes: after.IndexReadBytes - before.IndexReadBytes, DecodedRecords: after.DecodedRecords - before.DecodedRecords}
+		if n, ok := util.SafeUint64ToInt(work.ReadBytes + work.IndexReadBytes); ok {
+			page.ReadBytes = n
+		}
+		l.store.workMu.Lock()
+		addDetachedRawWork(&l.store.work.Reads, work)
+		l.store.workMu.Unlock()
+		l.store.budget.addWork(work)
+	}()
+	raw, err := l.raw.ReadRaw(ctx, offset, maxRecords, maxBytes)
+	if errors.Is(err, disk.ErrRetainedPageLimit) {
+		probe, probeErr := readDetachedOne(ctx, l.raw, offset)
+		if probeErr != nil {
+			return types.ReplayPage{}, probeErr
+		}
+		return types.ReplayPage{Next: offset}, &types.ReplayByteBudget{Size: probe.DecodedBytes, Budget: maxBytes}
+	}
+	if err != nil {
+		return types.ReplayPage{}, err
+	}
+	page = types.ReplayPage{Next: raw.NextOffset, Records: len(raw.Messages), Bytes: raw.DecodedBytes,
+		Cursor: types.ReplayCursor{Initialized: true}}
+	for _, m := range raw.Messages {
+		page.Messages = append(page.Messages, detachedMetadataMessage(m))
+	}
+	return page, nil
 }
 
 func (l *DetachedMetadataLease) readMetadata(ctx context.Context, offset uint64, maxRecords int, resolver TransactionDecisionResolver, rawRead bool) ([]types.Message, error) {

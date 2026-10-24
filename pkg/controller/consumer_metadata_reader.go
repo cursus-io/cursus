@@ -46,6 +46,14 @@ func (s *stagedConsumerMetadata) ReadRawConsumerHistory(p int, next uint64, max 
 	return lease.ReadRawMetadata(s.ctx, next, max)
 }
 
+func (s *stagedConsumerMetadata) ReadConsumerCleanupPage(p int, next uint64, maxRecords, maxBytes int) (types.ReplayPage, error) {
+	lease, err := s.lease(config.ConsumerOffsetsTopicName, p)
+	if err != nil {
+		return types.ReplayPage{}, err
+	}
+	return lease.ReadCleanupPage(s.ctx, next, maxRecords, maxBytes)
+}
+
 func (s *stagedConsumerMetadata) Sources() map[int]ConsumerMetadataRecoverySource {
 	copy := make(map[int]ConsumerMetadataRecoverySource, len(s.sources))
 	for p, source := range s.sources {
