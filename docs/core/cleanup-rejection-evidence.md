@@ -265,8 +265,9 @@ after the reservation checks passed, the returning coordinator exited from
 required=3`, preventing full ISR recovery. This run is a failure, not superseded
 by the passing CI timing. A prior local attempt also timed out negotiating the
 group-owner connection before LEAVE; the diagnostic rerun passed that point.
-The deterministic startup retry correction and its validation remain a required
-follow-up layer. The acceptance reconciliation still requires the
+The dependent [startup retry correction](prepared-startup-recovery.md) now has
+deterministic baseline/fix tests, a passing full server race suite and a passing
+rerun of the same real-broker scenario. The acceptance reconciliation still requires the
 unmerged SDK receipt validation in PR 312 and the independent prefix retry fix
 in PR 314 to be delivered alongside this correction. The original unlimited
 same-revision wording must explicitly retain the legacy compatibility exception
