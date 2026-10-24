@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -159,6 +160,14 @@ func TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure(t *test
 	leaveClient := e2e.NewBrokerClient([]string{fmt.Sprintf("localhost:%d", brokerPort(coordinatorNode(t, leaveOwner)))})
 	defer leaveClient.Close()
 	_, err = leaveClient.SendCommand("", fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d", input, group, member, generation), 10*time.Second)
+	if err != nil && os.Getenv("CURSUS_E2E_DUMP_STACKS") == "1" {
+		// Diagnose only this already-failed disposable fixture before its
+		// registered cleanup collects logs and removes the containers.
+		for _, node := range survivors {
+			out, dumpErr := exec.Command("docker", "kill", "--signal=QUIT", cleanupContainerName(node)).CombinedOutput()
+			t.Logf("failed-fixture stack dump node=%d: %s err=%v", node, out, dumpErr)
+		}
+	}
 	require.NoError(t, err)
 	_, err = leaveClient.FetchCommittedOffset(input, 0, group)
 	require.Error(t, err)
@@ -231,6 +240,12 @@ func waitForPreparedTransactionQuorum(t *testing.T, nodes []int) {
 				return false, fmt.Sprintf("broker-%d invalid readiness report: %v", node, err)
 			}
 			for check, result := range report.Checks {
+				// HealthState repeats failed checks in observation. Accept only
+				// the exact expected topology failure, never stale/deadline or
+				// another dependency failure hidden in that aggregate.
+				if check == "observation" && result == "cluster_topology: "+report.Checks["cluster_topology"] {
+					continue
+				}
 				if check != "cluster_topology" && result != "ok" {
 					return false, fmt.Sprintf("broker-%d %s: %s", node, check, result)
 				}

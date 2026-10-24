@@ -90,7 +90,7 @@ contains the original requirement-to-code/test matrix and merge-state inventory.
 Reuse it together with the official-main source above. Its missing integration
 and operation-cost evidence are the focus here; its SDK receipt validation is
 still a separate, unmerged change in PR 312. The prefix retry fix is independent
-and reviewed in PR 314. No history compaction implementation from PR 313 is
+and submitted separately in PR 314. No history compaction implementation from PR 313 is
 copied into this change.
 
 | Contract | Implementation / evidence | Current interpretation |
@@ -114,3 +114,162 @@ revision-only client: it cannot distinguish a newly recreated topic with the
 same counter. Preserve that legacy behavior and explicitly scope the safe retry
 contract to instance proof and receipt lifetime. Issue closure must account for
 this compatibility interpretation and the remaining unmerged dependencies.
+
+## Reproduction and evidence boundaries
+
+The production correction was tested at
+`9b657f11893b8b7f66740a139b41e43ef3cc2c89` (official main plus this change).
+`TestHistoricalTruncateCannotResetRecreatedInstance` fails on the original
+truncate and restore paths and passes with the identity guard. The unchanged
+`TestColdTruncateReplayPreservesRecreatedTopic` also fails for both log-only
+and snapshot-plus-log replay when copied onto `011ed0f` (main plus only the
+independent prefix retry fix); both variants pass with deferred opening.
+`TestHistoricalTruncateReplayPreservesRecreatedTopic` covers the warm registry.
+The Linux Go 1.25 race run passed the complete `pkg/topic`, replication FSM and
+Raft replication packages (146.819 s, 95.937 s and 26.876 s respectively).
+These are process-level test durations, not recovery latency measurements.
+
+The prepared-reservation fixture deliberately keeps output minISR=3 with one
+replica unavailable. The readiness reporter repeats its topology failure in
+the aggregate `observation` check. The fixture accepts that aggregate only when
+it exactly equals the separately reported topology failure; stale observations,
+timeouts and every other dependency failure remain rejected. Full readiness
+and full ISR are required again after all brokers return. This is a correction
+to the test's interpretation of the current health response, not an admission
+or durability change.
+
+Run the isolated broker fixtures with an unused port offset and disposable
+test volumes. Never point these compose projects at an operational data path:
+
+```sh
+RUN_E2E_CLEANUP_REJECTION=1 CURSUS_CLEANUP_PORT_OFFSET=33000 \
+  go test -v -count=1 -timeout 20m ./test/e2e-cluster \
+  -run '^(TestConsumerCleanupRejectsInvalidEvidenceOnThreeBrokers|TestTopicLifecycleRejectsSubscriptionsOnThreeBrokers)$'
+RUN_E2E_CLEANUP_PROFILE=1 CURSUS_CLEANUP_PORT_OFFSET=33000 \
+  CURSUS_CLEANUP_PROFILE_OUTPUT=/tmp/cleanup-profile.json \
+  go test -v -count=1 -timeout 15m ./test/e2e-cluster \
+  -run '^TestTruncateRecoveryCostWithForegroundTraffic$'
+python3 test/e2e-cluster/analyze_cleanup_profile.py /tmp/cleanup-profile.json
+RUN_E2E_CHAOS=1 CURSUS_CLEANUP_PORT_OFFSET=33000 \
+  go test -v -count=1 -timeout 15m ./test/e2e-cluster \
+  -run '^TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure$'
+```
+
+Process I/O is `/proc/1/io`, while cgroup CPU and block accounting include the
+test tracer and collection processes. Network counters include replication,
+normal traffic, readiness and metrics requests. Per-node samples are sequential,
+not simultaneous: preserve their start/completion timestamps and the wider
+trace windows. RSS/heap peaks are sampled, and `VmHWM` is a process-lifetime
+high-water mark. Cgroup v1 without a blkio controller reports unavailable block
+accounting, not zero bytes. Kernel-accounted writes do not measure physical
+media write amplification or prove power-loss persistence. These controls make
+the live-operation profile auditable without assigning every byte to TRUNCATE.
+
+## Completed three-broker evidence
+
+[CI at `9b657f1`](https://github.com/cursus-io/cursus/actions/runs/40073952746/job/120813208596)
+passed the exact-current-epoch, exact-rejection-reason matrix (258.24 s), all
+three subscription modes (111.07 s), the live cost profile (65.28 s) and the
+departed-member prepared-reservation/coordinator-failure scenario (33.37 s).
+These durations include fixture work; use the phase timestamps below for
+recovery latency. Every executable CI check passed at this commit. An automatic
+CodeRabbit status reported a review rate limit, which is not a completed review.
+
+The negative matrix verifies that the selected follower actually observed each
+fault, kept its pending cleanup fence, rejected three successive offset reads,
+and recovered after removing the hook and restarting. The out-of-cut case is
+an uncommitted *read response*, not an actual uncommitted Raft append. Topic
+recreation between cases also checks that the fresh record survives startup.
+An unrelated active membership, record and producer sequence survive every case.
+Subscription guards run through all three seeds; prepared reservations are
+checked through both surviving seeds while the third replica is intentionally
+offline. No successful cleanup test is counted as rejection evidence.
+
+## Full live-operation cost
+
+Raw samples and independently reproducible summaries are retained for both
+runs at production commit `9b657f1`:
+
+- CI Ubuntu, cgroup v2: [raw](../benchmarks/cleanup-live-ci-2026-10-24.json),
+  [summary](../benchmarks/cleanup-live-ci-summary-2026-10-24.json).
+- Windows host / Docker Desktop Linux, cgroup v1:
+  [raw](../benchmarks/cleanup-live-desktop-2026-10-24.json),
+  [summary](../benchmarks/cleanup-live-desktop-summary-2026-10-24.json).
+
+Each broker was limited to 2 CPUs / 1536 MiB in the profiling compose overlay.
+Both broker images use Go 1.25.0; the CI driver uses Go 1.26.2 and the Windows
+driver uses Go 1.25.0. Raw-file SHA-256 values (before any newline conversion):
+CI `d4ee0ea6f516598552e256ae1274fd085647fdb950cfbd55122e9e3148d50158`;
+Desktop `84055868fd28399949cb8d2a455cac81831fc8c4530eacaaa99702deca159ea2`.
+The fault image adds `strace`; its ptrace capability is confined to this fixture.
+The workload creates 100 target records and 256 pre-profile offset commits,
+restarts a follower before measurement, then holds its cleanup read fault until
+at least three failed attempts. Concurrent successful iterations each publish a
+record with `acks=all`, commit its offset and heartbeat an unrelated membership.
+All acknowledged payloads, final offset, membership identity and generation are
+verified after convergence; a new target write restarts at producer sequence 1.
+
+| Phase / useful work | CI | Docker Desktop |
+|---|---:|---:|
+| Setup, outside operation | 25.486 s | 244.393 s |
+| Request to response (responding broker completion, not all replicas) | 0.019 s | 0.170 s |
+| Request to fault-release start | 16.460 s | 27.530 s |
+| Fault-release start to all replicas materialized | 19.465 s | 17.895 s |
+| Entire live operation | 35.926 s | 45.426 s |
+| Acknowledged publish/commit/heartbeat iterations | 163 | 82 |
+| Iteration latency p50 / p99 / maximum | 201.682 / 240.864 / 241.844 ms | 516.474 / 798.957 / 974.432 ms |
+
+CI per-node deltas below span the raw before/after sample windows, slightly
+wider than the operation. Sync counts span their separately recorded trace
+windows. Do not add network receive and transmit as distinct useful payloads,
+or add process and cgroup write accounting as distinct writes.
+
+| Counter | Broker 1 | Broker 2 (held follower) | Broker 3 |
+|---|---:|---:|---:|
+| Cleanup serialized bytes / records | 14,111 / 32 | 72,714 / 169 | 4,771 / 10 |
+| Cleanup read attempts / scan initializations-or-invalidations | 4 / 1 | 6 / 1 | 2 / 1 |
+| Process `rchar` / `wchar` bytes | 1,123,255 / 9,295,429 | 1,003,172 / 9,006,122 | 818,591 / 9,422,898 |
+| Process kernel-accounted read / write bytes | 0 / 14,581,760 | 0 / 14,581,760 | 0 / 14,577,664 |
+| Cgroup block read / write bytes | 0 / 10,563,584 | 0 / 10,244,096 | 0 / 10,588,160 |
+| `eth0` received / transmitted bytes | 1,495,481 / 2,842,713 | 1,077,525 / 2,151,968 | 1,167,966 / 2,972,248 |
+| Traced `fsync` / `fdatasync` calls (zero errors) | 2,884 / 656 | 2,885 / 656 | 3,205 / 656 |
+| Broker process CPU / cgroup CPU seconds | 5.970 / 10.430 | 4.470 / 7.875 | 6.150 / 10.837 |
+| Sampled peak RSS / Go allocated heap bytes | 138,739,712 / 365,358,080 | 121,430,016 / 348,464,888 | 123,985,920 / 430,498,560 |
+
+Zero kernel reads in the CI run reflect warm cache accounting, not zero replay:
+the cleanup counters report **91,596 serialized bytes and 211 record visits**.
+Read attempts include the three injected failures, and the invalidation counter
+also counts initial scan creation. Appends during the scan can require another
+bounded pass before the proof applies; that repeated work and normal traffic
+remain included. Aggregate background lineage failure counters increased by
+443 / 447 / 448; their generic classification includes rebuild-required
+refusals, so these are not counts of corrupt records or authenticated prefix
+searches. No absent label is silently converted to zero by the analyzer.
+
+The local run measured 606,208 process read bytes and 16,015,360 process write
+bytes; cgroup block accounting was unavailable. Both runs include tracing and
+collection overhead and are observations, not throughput or recovery SLOs.
+The Desktop host also ran independent test workloads; it was not a dedicated
+performance host. Use the separately retained CI run when comparing environments.
+The profile covers the entire live cleanup operation, not an unmeasured device
+power-loss recovery or an all-history snapshot export. Previously recorded
+process-crash, full snapshot and QEMU guest-cut evidence remains separate.
+
+## Completion decision
+
+The remaining three-broker rejection and live-operation cost evidence for
+cleanup is now present, and the recreated-instance replay defect has a paired
+baseline/fix regression. An additional local run exposed a startup-order gap:
+after the reservation checks passed, the returning coordinator exited from
+`RecoverPreparedTransactions` with `insufficient_in_sync_replicas current=2
+required=3`, preventing full ISR recovery. This run is a failure, not superseded
+by the passing CI timing. A prior local attempt also timed out negotiating the
+group-owner connection before LEAVE; the diagnostic rerun passed that point.
+The deterministic startup retry correction and its validation remain a required
+follow-up layer. The acceptance reconciliation still requires the
+unmerged SDK receipt validation in PR 312 and the independent prefix retry fix
+in PR 314 to be delivered alongside this correction. The original unlimited
+same-revision wording must explicitly retain the legacy compatibility exception
+described above. Therefore this change uses `Refs`, not a whole-issue closing
+reference. Merging remains an operator/reviewer decision; a bot rate-limit
+success does not satisfy the initial-review requirement.
