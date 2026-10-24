@@ -2,13 +2,22 @@
 
 ## Design and evidence
 
-The original audit inspected official main
-`a49138e7922aa66b14cb4482a8b084e5b9c1b8cd`; implementation is rebased onto
-official main `17fa455` on 2026-10-23 (including the cooperative ownership and
-recovery scheduling changes). Distributed internal-topic
-compaction is disabled in `pkg/disk/compaction.go`. Strict startup reads every
-committed metadata partition. Cleanup checkpoints and detached transfer staging
-do not replace this scan. No end-to-end cold-start speedup has been measured.
+The original audit of official main
+`a49138e7922aa66b14cb4482a8b084e5b9c1b8cd` found distributed internal-topic
+compaction disabled and strict startup replaying every committed metadata
+partition. Cleanup checkpoints and detached transfer staging did not replace
+that scan, and the audit did not establish an end-to-end cold-start speedup.
+
+The integration base is official main
+`b754bddbf37ce17cc0100c78c2c8dd97f9631a7d` (2026-10-24). It already contains
+the derived ordinary recovery index and separately gated certified ordinary
+history maintenance introduced after that audit. The generic distributed
+internal-topic compaction guard remains in `pkg/disk/compaction.go`. Full replay
+is the safe index-miss path; a valid index replays the committed suffix.
+This document specifies that index protocol. The
+[transaction extension](consumer-transaction-history-format.md) adds v2 raw
+transaction evidence and current-view visibility checks. Neither an index hit
+nor a cleanup checkpoint proves authoritative history has been reduced.
 
 The updated base includes cooperative ownership metadata v6 and conditional
 Raft snapshot v12. Original lifecycle records retain member sessions, current
@@ -50,13 +59,13 @@ regressions. Deleting old revisions changes what corruption it can detect.
    rules and crash-safe replacement. Layer 1 does not authorize deletion and
    does not close the history-growth issue.
 
-The first format deliberately falls back for legacy records, inferred groups,
+The original v1 format deliberately falls back for legacy records, inferred groups,
 unknown compatibility authority, remote staged partitions, and physical
 transaction records. Reservation and decision snapshots stored as ordinary
 metadata remain in the projection. Transaction-bearing partitions must keep
-using full replay until a projection can certify both raw pending records and
-the receiver's current transaction decisions. This is an availability/cost
-limitation, not permission to omit those records.
+using full replay with v1. V2 certifies both raw pending records and the
+receiver's current transaction decisions; incompatible transaction ranges still
+fall back. This is an availability/cost limitation, not permission to omit records.
 
 Identity includes topic instance/lifecycle, partition count, durable local
 content generation, retained start and exact exclusive committed ends, and a
