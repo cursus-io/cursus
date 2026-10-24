@@ -78,7 +78,7 @@ func testConsumerHistoryController(t *testing.T, mode string) {
 	require.NoError(t, err)
 	t.Cleanup(c.Stop)
 	state := fsm.NewBrokerFSM(tm, c)
-	require.Nil(t, state.Apply(&raft.Log{Data: []byte(`REGISTER:{"id":"local","addr":"127.0.0.1:7000","status":"active","incarnation_id":"local-process","lifecycle_protocol":11,"recovery_protocol":2}`)}))
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte(fmt.Sprintf(`REGISTER:{"id":"local","addr":"127.0.0.1:7000","status":"active","incarnation_id":"local-process","lifecycle_protocol":%d,"recovery_protocol":2}`, fsm.ConsumerTransactionHistoryProtocolVersion))}))
 	definition := topic.DefaultDefinition(config.ConsumerOffsetsTopicName, cfg)
 	definition.Partitions, definition.ReplicationFactor = 4, 1
 	definition.Policy = topic.ConsumerMetadataPolicy()
