@@ -21,6 +21,7 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 	}
 	require.NotZero(t, cleanupPortOffset())
 	t.Setenv("CURSUS_HISTORY_MEASURE_COMPACTION", "true")
+	t.Setenv("CURSUS_HISTORY_MEASURE_ROLL_MS", "1000")
 	t.Setenv("CURSUS_HISTORY_TRACE_SYNC", "false")
 	t.Setenv("TRANSACTION_TIMEOUT_MS", "60000")
 	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-history.yml", "docker-compose.history-measure.yml").WithClusterSize(3).WithTopic("history-transactions").WithPartitions(1).WithAcks("all")
