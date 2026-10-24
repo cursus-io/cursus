@@ -49,7 +49,7 @@
 {{- if ne (.Values.compatibility.brokerProtocol | toString) "12" }}
 {{- fail "compatibility.brokerProtocol must remain 12 for this chart" }}
 {{- end }}
-{{- if ne (.Values.compatibility.snapshotFormat | toString) "12" }}
+{{- if ne (.Values.compatibility.snapshotFormat | toString) "11" }}
 {{- fail "compatibility.snapshotFormat must remain 11 for this chart" }}
 {{- end }}
 {{- if ne (.Values.compatibility.recordFormat | toString) "CDM6" }}
