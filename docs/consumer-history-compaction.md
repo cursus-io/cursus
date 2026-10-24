@@ -365,6 +365,36 @@ recovery's producer fences and unresolved boundaries; equality of coordinator
 state alone is insufficient. The distributed internal compaction guard remains
 in place.
 
+The real-disk comparison uses baseline `9c43d39` and source `7e91c69`, Linux
+Go 1.25.0, two CPUs/3 GiB and no container network. Four groups/four partitions
+remain fixed. Each source is measured once on a shared host; another race run
+overlapped the beginning of the baseline. OS caches are warm, initial history
+construction and closing old handlers are excluded, and reopening handlers is
+included in `reopen_full`. The [raw JSONL](benchmarks/consumer-history-scan-linux-2026-10-24.jsonl)
+records all modes and both revisions, including the slower samples.
+
+| Revisions/group | Certification source records baseline → fix | Source key/payload bytes baseline → fix | Retained log bytes before → after (both) |
+| ---: | ---: | ---: | ---: |
+| 100 | 3,066 → 3,066 | 785,982 → 785,982 | 162,752 → 3,632 |
+| 1,000 | 30,066 → 30,066 | 7,779,078 → 7,779,078 | 1,617,160 → 3,640 |
+| 10,000 | 304,158 → 300,066 | 79,308,330 → 78,249,174 | 16,233,168 → 3,648 |
+
+At 10,000 revisions, certification/rewrite wall time was 12,469.89 → 33,695.86 ms,
+CPU 16,464.93 → 19,395.06 ms, sampled peak heap 78,351,872 → 79,792,144 bytes,
+and allocations 2,857,618,464 → 2,853,238,048 bytes. Cache-free warm reopen was
+67.71 → 650.87 ms. These noisy single samples **do not demonstrate a wall-time,
+CPU or cold recovery speedup**; the verified improvement is fewer duplicate
+decoded records/bytes. The certification cost still dominates this workload.
+
+Both 10,000-revision runs removed 39,996 records and recovered eight retained
+records. They read 16,232,632 rewrite frame bytes, wrote 3,388 instrumented file
+bytes and 81,920 kernel-accounted bytes, and used at most 815 temporary bytes
+in the measured per-segment rewrite. Both observed 16 source sync and 24 rewrite
+sync boundaries (partial instrumentation, not all fsync syscalls). Physical
+read bytes and transfer bytes were zero. These local figures exclude network,
+Raft replay, full broker startup and request latency; the existing cluster E2E
+and its CI result remain separate correctness evidence.
+
 ## Verified cache-absent cluster restart
 
 The strengthened fixture passed in [CI run 39917076635](https://github.com/cursus-io/cursus/actions/runs/39917076635)
