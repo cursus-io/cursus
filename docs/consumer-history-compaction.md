@@ -1,5 +1,10 @@
 # Consumer history compaction
 
+The [acceptance evidence](consumer-history-acceptance-evidence.md) maps the
+current tests to recovery and durability requirements and labels historical
+measurements by source commit. The experiments below retain earlier failures
+and partial results; they are not all measurements of the current head.
+
 ## Remaining-work design and regression contract
 
 The follow-up compares against Apache Kafka release commit
@@ -586,6 +591,26 @@ costs. The [raw rows](benchmarks/consumer-history-one-second-roll-2026-10-24.jso
 retain this failed experiment. No 10,000-revision result was reached in that run.
 Failed maintenance now emits its collected costs before failing the assertion.
 
+The later local 60 s roll experiment at `7c85be9` passed every 100- and
+1,000-revision scenario, but failed the interrupted restart at 10,000 before
+reaching compaction. The four ordinary 10,000-revision startup modes took
+49.754 / 47.144 / 46.592 / 47.022 s (absent / valid / corrupt / old index).
+During the interrupted restart, node 3 exhausted the ordinary per-node 30 s
+health wait while Raft replay was advancing from applied index 11,345 to
+29,702 toward 40,092. See the [partial raw data](benchmarks/consumer-history-local-partial-2026-10-24.jsonl),
+[resource CSV](benchmarks/consumer-history-local-partial-2026-10-24.summary.csv)
+and [failure excerpt](benchmarks/consumer-history-local-partial-failure-2026-10-24.txt).
+It is not a complete large-history comparison.
+
+The measurement now uses one shared two-minute readiness budget starting at
+the timed start command, independent of which broker is slowest. The former
+per-node helper could allow a 50 s cluster start after waiting for earlier
+nodes, then reject an equally slow start when those nodes became ready quickly.
+Readiness failures emit their elapsed time and error before the test fails.
+All waiting remains in wall time; exact-offset, ISR, five-minute reclamation
+and retained-byte assertions are unchanged. The general Linux CI scaling job
+runs all three history levels and uploads partial measurements even on failure.
+
 The test-only image traces fsync/fdatasync with strace's seccomp BPF filter and samples the broker's `/proc` CPU,
 RSS and I/O counters and exported Go heap. Physical `read_bytes`/`write_bytes`
 are distinct from logical rchar/wchar, replay payload bytes and transfer metrics.
@@ -619,6 +644,11 @@ retains pages read by the last interrupted process; it is not a cold-page-cache
 measurement. Each wrapper report carries a new process token, and restart
 removes its predecessor's exit report so a killed wrapper cannot expose stale
 accounting as a successful new sample.
+
+The [measured replay-crash report](consumer-history-replay-crash-results.md)
+records the tested source/merge commits, all three interrupted processes, final
+recovery, survivor deltas and shutdown-inclusive accounting. It includes raw
+JSONL and does not treat the final warm-page-cache restart as cold recovery.
 
 Each interrupted process records its logical recovery counters, Linux `/proc`
 I/O, CPU, peak RSS and current Go heap before writing the diagnostic result.

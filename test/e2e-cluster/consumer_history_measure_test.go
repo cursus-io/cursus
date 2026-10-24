@@ -53,7 +53,8 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 		"source_diff_sha256": fmt.Sprintf("%x", sha256.Sum256(diff)), "driver_go": runtime.Version(),
 		"broker_cpus": 2, "broker_memory_bytes": 1 << 30, "trace": "strace -f --seccomp-bpf -e trace=fsync,fdatasync",
 		"logical_groups": 4, "metadata_partitions": 4, "replication_factor": 3,
-		"segment_roll_ms": rollMS, "segment_bytes": 65536, "index_bytes": 1 << 20, "maintenance_interval_ms": 1000})
+		"readiness_budget_seconds": 120,
+		"segment_roll_ms":          rollMS, "segment_bytes": 65536, "index_bytes": 1 << 20, "maintenance_interval_ms": 1000})
 	levels := []int{100, 1000, 10000}
 	if value := os.Getenv("CURSUS_HISTORY_MEASURE_LEVELS"); value != "" {
 		levels = nil
@@ -76,6 +77,14 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 			compose := func(args ...string) {
 				data, err := e2e.RunCompose(composeCommandArgs(project, isolated, args...)...).CombinedOutput()
 				require.NoError(t, err, string(data))
+			}
+			ready := func(began time.Time, phase, variant, index string) {
+				err := historyMeasureWaitReady(actions, began.Add(2*time.Minute))
+				if err != nil {
+					emit(map[string]any{"history": history, "phase": phase, "variant": variant, "index": index,
+						"wall_seconds": time.Since(began).Seconds(), "error": err.Error()})
+				}
+				require.NoError(t, err)
 			}
 			emit(map[string]any{"history": history, "phase": "initial_cluster_setup", "wall_seconds": time.Since(setup).Seconds()})
 			sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-measure partitions=1 replication_factor=3")
@@ -138,7 +147,7 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 					t.Setenv("CURSUS_HISTORY_MEASURE_COMPACTION", "true")
 					began := time.Now()
 					compose("up", "-d", "--no-build", "--force-recreate")
-					require.NoError(t, actions.checkAllNodesHealth())
+					ready(began, "maintenance_including_recreate", variant, "")
 					stopProbe := historyMeasureReadProbe(t, ctx.GetBrokerAddrs(), uint64(history))
 					sweepErr := eventually(t, "history sweep on every replica", 5*time.Minute, func() (bool, string, error) {
 						for node := 1; node <= 3; node++ {
@@ -185,7 +194,7 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 					}
 					began := time.Now()
 					compose("start")
-					require.NoError(t, actions.checkAllNodesHealth())
+					ready(began, "whole_cluster_start", variant, mode)
 					waitForStableFullISRAndZeroUnderReplicated(t, ctx, "whole history restart")
 					exact(ctx.GetBrokerAddrs())
 					wall := time.Since(began).Seconds()
@@ -209,7 +218,7 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 				compose("start")
 				compose("kill", "-s", "SIGKILL")
 				compose("start")
-				require.NoError(t, actions.checkAllNodesHealth())
+				ready(began, "interrupted_start_then_restart", variant, "")
 				exact(ctx.GetBrokerAddrs())
 				emit(map[string]any{"history": history, "variant": variant, "phase": "interrupted_start_then_restart", "wall_seconds": time.Since(began).Seconds(), "resources_last_process_only": historyMeasureResources(t), "metrics": historyMeasureMetrics(t)})
 				oldID := findGroupCoordinator(t, 1, "history-measure-0")
@@ -230,8 +239,9 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 				}))
 				exact(clusterBrokerAddrsForNodes(survivors))
 				emit(map[string]any{"history": history, "variant": variant, "phase": "coordinator_failover", "wall_seconds": time.Since(began).Seconds(), "stopped_node": oldNode, "before": before, "before_metrics": beforeMetrics, "after_survivors": historyMeasureResourcesFor(t, survivors), "metrics_survivors": historyMeasureMetricsFor(t, survivors)})
+				returnStart := time.Now()
 				historyMeasureDocker(t, "start", cleanupContainerName(oldNode))
-				require.NoError(t, actions.checkAllNodesHealth())
+				ready(returnStart, "failover_node_return", variant, "")
 				waitForStableFullISRAndZeroUnderReplicated(t, ctx, "history failover return")
 			}
 		})
@@ -239,6 +249,23 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 			return
 		} // Do not seed larger histories after a failed level.
 	}
+}
+
+// A shared deadline makes the experiment independent of which broker is slowest.
+// The ordinary per-node 30 s helper can admit a 50 s cluster start when earlier
+// nodes consume the wait, then reject an equally slow restart when they recover
+// quickly. Keep all waiting in the reported timer and keep the budget bounded.
+func historyMeasureWaitReady(actions *ClusterActions, deadline time.Time) error {
+	for node, address := range clusterHealthCheckAddrs(actions.ctx.clusterSize) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("whole history readiness deadline exceeded before node %d", node+1)
+		}
+		if err := actions.waitForNodeHealthWithin(node+1, address, remaining); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func historyMeasureDocker(t *testing.T, args ...string) []byte {

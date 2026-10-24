@@ -1,0 +1,10 @@
+Source: 7c85be902f8e07c532e918be7d2afc5309ac35f4
+Selected lines from the failed local experiment; full log retained in task artifacts.
+        	            	timed out waiting for node 3 health at http://localhost:47083/ready: health endpoint status=503 body={"status":"not_ready","checks":{"broker_startup":"broker initialization is in progress","consumer_metadata":"consumer metadata recovery phase=awaiting_cluster_recovery","observation":"broker_startup: broker initialization is in progress\nconsumer_metadata: consumer metadata recovery phase=awaiting_cluster_recovery","storage":"ok","topic_metadata":"ok"},"observation":{"completed_at":"2026-10-24T12:53:38.061075359Z","started_at":"2026-10-24T12:53:38.061032073Z","in_progress":false,"timed_out":false,"stale":false,"stopped":false,"error":"broker_startup: broker initialization is in progress\nconsumer_metadata: consumer metadata recovery phase=awaiting_cluster_recovery","failures":38}}
+        cursus-truncate-38000-broker-3  | 2026/10/24 12:53:13 [INFO] Waiting for recovered partition Raft replay on broker broker-3-9000: snapshot_index=0 commit_index=40093 last_log_index=40093 applied_index=11345 target_index=40092
+        cursus-truncate-38000-broker-3  | 2026/10/24 12:53:23 [INFO] Waiting for recovered partition Raft replay on broker broker-3-9000: snapshot_index=0 commit_index=40093 last_log_index=40093 applied_index=17437 target_index=40092
+        cursus-truncate-38000-broker-3  | 2026/10/24 12:53:33 [INFO] Waiting for recovered partition Raft replay on broker broker-3-9000: snapshot_index=0 commit_index=40093 last_log_index=40093 applied_index=29702 target_index=40092
+--- FAIL: TestConsumerHistoryWholeBrokerLadder (4705.15s)
+    --- PASS: TestConsumerHistoryWholeBrokerLadder/100 (472.36s)
+    --- PASS: TestConsumerHistoryWholeBrokerLadder/1000 (669.23s)
+    --- FAIL: TestConsumerHistoryWholeBrokerLadder/10000 (3563.22s)

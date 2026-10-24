@@ -1,0 +1,45 @@
+=== RUN   TestConsumerHistoryTransactionsAcrossCoordinatorMove
+    fixture.go:132: Cluster startup initiated. Size: 3, MinISR: 2
+    actions.go:80: Waiting for node 1 health check
+    actions.go:80: Waiting for node 2 health check
+    actions.go:80: Waiting for node 3 health check
+    fixture.go:139: Waiting for Raft leader to be elected...
+    fixture.go:138: Initialized BrokerClient with nodes: [localhost:47001 localhost:47002 localhost:47003]
+    fixture.go:149: Raft leader elected, cluster ready.
+    fixture.go:219: Cluster size configured to: 3
+    actions.go:31: Waiting for 3 cluster nodes to register...
+    fixture.go:138: Initialized BrokerClient with nodes: [localhost:47001 localhost:47002 localhost:47003]
+2026/10/24 20:24:39 [DEBUG] Coordinator moved to localhost:47003, retrying (0/5)
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 1
+2026/10/24 20:24:41 [DEBUG] Coordinator moved to localhost:47003, retrying (0/5)
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 10
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 20
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 30
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 40
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 50
+2026/10/24 20:28:52 [DEBUG] Retryable broker error on idempotent command, retrying (0/5): broker error coordinator_not_available (availability)
+2026/10/24 20:28:52 [DEBUG] Coordinator moved to localhost:47001, retrying (1/5)
+    actions.go:80: Waiting for node 1 health check
+    actions.go:80: Waiting for node 2 health check
+    actions.go:80: Waiting for node 3 health check
+2026/10/24 20:28:58 [DEBUG] Write error on idempotent command, retrying: write Wire v2 frame: write tcp [::1]:54142->[::1]:47001: wsasend: An established connection was aborted by the software in your host machine.
+2026/10/24 20:29:09 [DEBUG] Coordinator moved to localhost:47003, retrying (0/5)
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 60
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 70
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 80
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 90
+    consumer_history_transaction_e2e_test.go:50: processing transaction epoch 100
+    consumer_history_transaction_e2e_test.go:96: 100 committed transaction epochs including ownership move wall=7m28.5748231s admission_retries=207
+    actions.go:80: Waiting for node 1 health check
+2026/10/24 20:32:45 [DEBUG] Write error on idempotent command, retrying: write Wire v2 frame: write tcp [::1]:65229->[::1]:47002: wsasend: An established connection was aborted by the software in your host machine.
+2026/10/24 20:32:59 [DEBUG] Coordinator moved to localhost:47002, retrying (0/5)
+    actions.go:80: Waiting for node 2 health check
+2026/10/24 20:33:28 [DEBUG] Read error on idempotent command, retrying: read Wire v2 header: consumed=0 expected=32: read tcp [::1]:52788->[::1]:47002: wsarecv: An established connection was aborted by the software in your host machine.
+2026/10/24 20:33:28 [DEBUG] Coordinator moved to localhost:47001, retrying (1/5)
+    actions.go:80: Waiting for node 3 health check
+2026/10/24 20:33:44 [DEBUG] Read error on idempotent command, retrying: read Wire v2 header: consumed=0 expected=32: read tcp [::1]:53931->[::1]:47003: wsarecv: An established connection was aborted by the software in your host machine.
+    fixture.go:302: Cleaning up test resources...
+    fixture.go:338: Topic history-transactions deleted
+--- PASS: TestConsumerHistoryTransactionsAcrossCoordinatorMove (599.06s)
+PASS
+ok  	github.com/cursus-io/cursus/test/e2e-cluster	604.659s
