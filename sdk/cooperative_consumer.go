@@ -76,6 +76,7 @@ type CooperativeConsumer struct {
 	commitMu         sync.Mutex
 	commitPending    []*cooperativeCommitRequest
 	commitRunning    bool
+	commitWake       chan struct{}
 	commitRequests   atomic.Uint64
 	commitPartitions atomic.Uint64
 	commitWait       atomic.Uint64

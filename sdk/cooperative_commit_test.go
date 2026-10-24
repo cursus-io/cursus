@@ -128,3 +128,54 @@ func TestCooperativeCommitLostResponseRetriesOriginalOffsets(t *testing.T) {
 	require.NoError(t, c.commitProcessedBatch(context.Background(), record))
 	require.Equal(t, first, requireSDKCommand(t, commands), "response loss cannot substitute newer offsets or ownership")
 }
+
+func TestCooperativeCommitCollectionWakesWhenAllWorkersAreWaiting(t *testing.T) {
+	c, server := cooperativeCommitFixture(t)
+	c.starts.Store(2)
+	c.commitWake = make(chan struct{}, 1)
+	t.Cleanup(func() {
+		c.stops.Store(2)
+		select {
+		case c.commitWake <- struct{}{}:
+		default:
+		}
+	})
+	first := &cooperativeCommitRequest{ctx: context.Background(), queued: time.Now().Add(time.Hour), record: cooperativeCommitRecord(0), done: make(chan error, 1)}
+	c.commitPending, c.commitRunning = []*cooperativeCommitRequest{first}, true
+	flushed := make(chan struct{})
+	go func() { defer close(flushed); c.flushProcessedBatches() }()
+	// An intentionally distant collection deadline makes early completion
+	// observable without relying on the scheduler meeting a two-ms threshold.
+	select {
+	case <-first.done:
+		t.Fatal("a partial batch bypassed collection")
+	case <-time.After(20 * time.Millisecond):
+	}
+	second := make(chan error, 1)
+	go func() { second <- c.commitProcessedBatch(context.Background(), cooperativeCommitRecord(1)) }()
+	request, err := server.ReadFrame()
+	require.NoError(t, err, "the final worker must wake collection before its deadline")
+	command, err := decodeWireTestCommand(request)
+	require.NoError(t, err)
+	require.Contains(t, command, "offsets=P0:8,P1:8")
+	select {
+	case <-second:
+		t.Fatal("a worker passed the durable response barrier")
+	default:
+	}
+	require.NoError(t, writeWireTestResponse(server, request, "OK batched=2"))
+	require.NoError(t, <-first.done)
+	require.NoError(t, <-second)
+	<-flushed
+}
+
+func TestCooperativeCommitCollectionDoesNotWaitForIdleWorkers(t *testing.T) {
+	c, server := cooperativeCommitFixture(t)
+	c.starts.Store(6)
+	done := make(chan error, 1)
+	go func() { done <- c.commitProcessedBatch(context.Background(), cooperativeCommitRecord(0)) }()
+	request, err := server.ReadFrame()
+	require.NoError(t, err, "partial batches must still flush after the collection deadline")
+	require.NoError(t, writeWireTestResponse(server, request, "OK batched=1"))
+	require.NoError(t, <-done)
+}

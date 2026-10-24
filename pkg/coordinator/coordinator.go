@@ -119,6 +119,7 @@ func (c *Coordinator) SetTransactionalOffsetResolver(resolver TransactionalOffse
 
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
+	offsetReadWindow     offsetReadWindow
 	mu                   sync.RWMutex               // Per-group lock for offset operations
 	TopicName            string                     // Topic this group consumes
 	Topics               []string                   // Explicit v1 subscription topics

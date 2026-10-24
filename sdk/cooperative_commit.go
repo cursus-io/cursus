@@ -26,7 +26,14 @@ func (c *CooperativeConsumer) commitProcessedBatch(ctx context.Context, record C
 	started := time.Now()
 	r := &cooperativeCommitRequest{ctx: ctx, queued: started, record: record, done: make(chan error, 1)}
 	c.commitMu.Lock()
+	if c.commitWake == nil {
+		c.commitWake = make(chan struct{}, 1)
+	}
 	c.commitPending = append(c.commitPending, r)
+	select {
+	case c.commitWake <- struct{}{}:
+	default:
+	}
 	if !c.commitRunning {
 		c.commitRunning = true
 		go c.flushProcessedBatches()
@@ -43,15 +50,7 @@ func (c *CooperativeConsumer) commitProcessedBatch(ctx context.Context, record C
 
 func (c *CooperativeConsumer) flushProcessedBatches() {
 	for {
-		// Collect for two milliseconds from the oldest queued request.
-		// Time spent behind an in-flight append already counts toward this
-		// window; do not sleep again when that append completes.
-		c.commitMu.Lock()
-		readyAt := c.commitPending[0].queued.Add(2 * time.Millisecond)
-		c.commitMu.Unlock()
-		if delay := time.Until(readyAt); delay > 0 {
-			time.Sleep(delay)
-		}
+		c.waitForCommitBatch()
 		c.commitMu.Lock()
 		n := min(len(c.commitPending), protocol.MaxCooperativeCommitPartitions)
 		batch := append([]*cooperativeCommitRequest(nil), c.commitPending[:n]...)
@@ -77,6 +76,39 @@ func (c *CooperativeConsumer) flushProcessedBatches() {
 			return
 		}
 		c.commitMu.Unlock()
+	}
+}
+
+// Keep the bounded collection window for staggered workers, but stop waiting
+// when every running worker has submitted its completed batch. Worker counts
+// are only a batching hint: tokens, offsets and durable acknowledgements still
+// follow the same broker validation and per-worker barrier.
+func (c *CooperativeConsumer) waitForCommitBatch() {
+	c.commitMu.Lock()
+	readyAt := c.commitPending[0].queued.Add(2 * time.Millisecond)
+	wake := c.commitWake
+	c.commitMu.Unlock()
+	remaining := time.Until(readyAt)
+	if remaining <= 0 {
+		return
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	for {
+		// Load stops first so concurrent worker completion cannot underflow.
+		stopped, started := c.stops.Load(), c.starts.Load()
+		workers := max(uint64(1), started-stopped)
+		c.commitMu.Lock()
+		full := uint64(len(c.commitPending)) >= min(workers, uint64(protocol.MaxCooperativeCommitPartitions))
+		c.commitMu.Unlock()
+		if full {
+			return
+		}
+		select {
+		case <-timer.C:
+			return
+		case <-wake:
+		}
 	}
 }
 

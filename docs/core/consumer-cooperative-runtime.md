@@ -73,9 +73,10 @@ write/membership locks and excluding groups with reservations. Blocked append,
 failed append, response loss/restart, blocked resolver, and concurrent reservation
 tests passed. It reduced read-lock wait in a diagnostic profile, but its added
 throughput benefit was inconsistent across the paired runs, including lower
-join throughput. **The window was discarded and is not implemented in this PR.**
-The original group lock, synchronous acknowledgement, admission and ownership
-checks, and transaction barriers all remain unchanged.
+join throughput. The first broker follow-up (`6e78a23`) discarded that window.
+The subsequent contention investigation below revisits it together with the
+read-only timeout scan and commit-collection changes; write/membership locks,
+synchronous acknowledgement, admission and transaction barriers remain.
 
 Profiling also exposed repeated decode work in the broker's committed-page
 reader. Every request started with 1,024 raw records even when the caller wanted
@@ -138,6 +139,105 @@ numeric evidence. After adding failure diagnostics without changing deadlines,
 five baseline and five selected-version large-backlog rechecks passed. The
 earlier stall's root cause is not established. No passing subset is presented
 as a completed INFO performance comparison or proof of a narrower eager gap.
+
+### TCP stall and commit contention follow-up
+
+The historical INFO failure contained 51 heartbeat retry lines and 210 response
+write errors; requests timed out and late responses found closed connections.
+It did not capture disk latency or goroutine stacks during the stall. Eight
+instrumented repetitions on `6e78a23` (32 cases) passed with periodic stack
+samples, CPU, mutex and blocking profiles. They accumulated 48.52 seconds of
+`GetStableOffset` blocking across concurrent goroutines; this is not elapsed
+time. The original trigger remains unconfirmed, rather than being attributed
+to TCP, disk or host load without evidence.
+
+A deterministic paused-writer test exposed an amplification mechanism:
+ordinary commits retain `c.mu.RLock` and `group.mu` during durable append.
+`checkSingleGroupTimeout` requested `c.mu.Lock` even for a read-only scan with no
+expired member. A queued Go RWMutex writer then blocked subsequent readers,
+including readers of an otherwise available committed-offset window. The first
+window-only slow-writer test failed one of three repetitions through this path.
+Heartbeat requests also timed out during the injected append pause and produced
+the same late-response/closed-connection symptom after release. This establishes
+a causal lock-convoy mechanism, **not the cause of the historical append delay**.
+
+The selected design follows Kafka's committed-state/durable-response distinction
+described above while preserving Cursus's serialization and persisted formats:
+
+- Session timeout inspection and an already-established owner grace-period
+  lookup use shared locks. Installing/removing the owner clock and actual
+  expiration retain the mutation lock; cooperative expiration rechecks current
+  session identities and heartbeat timestamps.
+- During an ordinary cooperative offset append, a temporary read window borrows
+  the last acknowledged offsets only if the entire group has no transaction
+  reservations. Readers hold the window through the transaction resolver lookup.
+  Closing it drains readers before publishing offsets or allowing a reservation
+  mutation. It is not a durable cache, does not expose the candidate offset and
+  does not release the commit's membership or group mutation locks.
+- Go workers still wait for durable success before handling their next batch.
+  The two-millisecond collection deadline ends early when every running worker
+  has queued its completed batch, or the protocol batch cap is reached. Worker
+  counts only guide batching; every original token is still validated. Partial
+  batches retain the deadline, so idle partitions cannot block progress.
+
+Regression checks cover append success/failure, lost response and replay,
+transaction-resolver drain, reservation fencing, established distributed owner
+grace, unexpired scans during append, early/full and timed/partial batches,
+cancelled requests and revocation waiting for in-flight commits. The real TCP
+slow-writer test checks old-offset visibility, no premature acknowledgement,
+heartbeat timeout while mutation remains fenced, and recovery after release.
+Recovery checks count serialized metadata records and payload bytes. No new
+record type, protocol number, ownership grant or recovery state is introduced.
+
+Availability remains bounded by real storage delays: membership mutation and
+fresh ownership observations can still wait for a durable append. This change
+removes unnecessary read-side contention, not the durability boundary. A future
+separation of membership clocks or append sequencing needs a different design
+and its own fencing/recovery checks.
+
+Eight rotated repetitions of four variants (baseline `6e78a23`, broker only,
+collection only, and both), each with eager/cooperative and short/long workloads,
+passed all 128 cases. Go 1.26.2 ran in one Linux container limited to two CPUs
+with GOMAXPROCS=2; broker logging used the same INFO overlay and SDK logging was
+unchanged. The host was shared, not dedicated benchmark hardware. All cases
+waited for every unique delivery and all six durable offsets at log end.
+[Raw observations](../measurements/consumer-cooperative-contention-2026-10-24.json)
+retain outliers, variant controls, recovery work and the differing commit policies.
+
+| Measurement, median unless a range | Baseline | Combined change |
+| --- | ---: | ---: |
+| Join / 960-record durable records/s | 768.7 | 991.5 |
+| Long / 9,600-record durable records/s | 1,362.45 | 1,648.85 |
+| Join cooperative/eager per-run ratio | 62.56% | 71.45% |
+| Long cooperative/eager per-run ratio | 46.56% | 51.57% |
+| Long cumulative worker commit wait | 26,220.5 ms | 19,994.5 ms |
+| Long metadata replay records | 382 | 310 |
+| Long metadata replay payload | 130,235 B | 106,352 B |
+| Join duplicate deliveries, range | 0–24 | 0–12 |
+| Long duplicate deliveries | 0 | 0 |
+
+The combined long-backlog median was 21.0% higher, but the 772.7–2,113.6
+records/s range overlapped baseline's 1,135.2–2,017.7. Eager controls also varied;
+the ratio is the median of each run's cooperative/eager rates, not the ratio of
+medians. These are observed local improvements, not a guaranteed performance
+margin. Every long cooperative case fetched exactly 9,600 records / 1,228,800
+payload bytes. Replay-byte reductions reflect fewer existing-format snapshots,
+not a smaller snapshot format; payload counts exclude headers and replication.
+
+A separate three-run blocking profile reduced cumulative `GetStableOffset`
+wait from 21.210 s to 0.088 s and worker commit wait from 78.713 s to 54.988 s.
+Append wait was 13.679 versus 10.687 s. These overlapping goroutine totals must
+not be added together or interpreted as wall-clock percentages.
+
+The combined variant's fifth long run had one in-run heartbeat I/O timeout,
+then recovered with a 1.880 s maximum partition-0 delivery gap and zero
+duplicates. It remains in the reported results. A subsequent 20-run diagnostic
+with 250 ms goroutine snapshots passed with no I/O timeout; cancellation-time
+closed-connection messages are not counted as stalls. Samples showed metadata
+append waiting for the disk flush loop's fsync, but cannot establish that a
+particular fsync caused the earlier timeout. The original long stall's initiating
+cause therefore remains unconfirmed. Diagnostic runs with stack/profiling
+overhead are excluded from throughput comparisons.
 
 ### Runtime regression checks
 
@@ -202,8 +302,9 @@ stop the consumer without committing that record. Session fencing stops `Run`;
 create a new consumer to explicitly rejoin after diagnosing the interruption.
 
 `EnableAutoCommit` commits the last successfully processed offset of each batch
-synchronously. Concurrent completed partitions share a commit, collected for
+synchronously. Concurrent completed partitions share a commit, collected for up to
 two milliseconds from the oldest queued request and capped at 64 partitions per request.
+Collection ends early when every running worker has submitted its batch.
 Time already spent behind an in-flight append counts toward this window. Each worker waits for
 the durable response before processing its next batch. This API does not use
 the eager consumer's `AutoCommitInterval`
@@ -236,8 +337,8 @@ per-batch completion and full topic offset snapshots. It does not substitute
 current membership authority for an old record or adopt interval auto-commit.
 The persisted format and O(P) snapshot size remain unchanged; fewer appends also
 mean fewer replay records/bytes before compaction. One slow partition does not
-hold up collection. A one-partition workload pays the short collection window
-without a batching benefit.
+hold up collection. A one-worker workload can flush immediately instead of
+paying a collection delay without a batching benefit.
 
 Checks defined for this optimization: all-or-nothing stale-token and reservation
 rejection; failed append leaves every offset unchanged; replay-safe duplicate

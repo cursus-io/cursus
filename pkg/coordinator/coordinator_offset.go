@@ -208,7 +208,7 @@ func (c *Coordinator) commitAuthorizedOffsetsBulkForGroupLocked(gm *GroupMetadat
 		}
 		items := mergedOffsetSnapshot(gm, topic, offsets)
 		revision := gm.OffsetRevisions[topic] + 1
-		if err := c.writeOffsetSnapshot(groupName, topic, gm.RegistrationEpoch, revision, items); err != nil {
+		if err := c.writeOffsetSnapshotWithReadWindow(gm, groupName, topic, revision, items); err != nil {
 			return err
 		}
 		for _, item := range offsets {

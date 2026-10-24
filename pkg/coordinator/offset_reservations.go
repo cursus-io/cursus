@@ -424,14 +424,28 @@ func (c *Coordinator) GetStableOffset(groupName, topic string, partition int) (u
 	if group == nil {
 		return 0, false, nil
 	}
+	w := &group.offsetReadWindow
+	w.mu.RLock()
+	if w.active && w.topic == topic {
+		defer w.mu.RUnlock()
+		offset, found := w.offsets[partition]
+		return c.resolveStableOffset(groupName, topic, partition, group.RegistrationEpoch, offset, found)
+	}
+	w.mu.RUnlock() // Never acquire group.mu while holding the window lock.
 	group.mu.RLock()
 	defer group.mu.RUnlock()
 	if err := reservedOffsetError(group, groupName, topic, partition); err != nil {
 		return 0, false, err
 	}
 	offset, found := group.getOffsetSafe(topic, partition)
+	return c.resolveStableOffset(groupName, topic, partition, group.RegistrationEpoch, offset, found)
+}
+
+// Caller holds c.mu and either group.mu or an active offset read window, so a
+// transaction reservation cannot appear between its check and this lookup.
+func (c *Coordinator) resolveStableOffset(groupName, topic string, partition int, registration uint64, offset uint64, found bool) (uint64, bool, error) {
 	if c.transactionalOffsets != nil {
-		if committed, ok := c.transactionalOffsets.CommittedOffset(groupName, topic, partition, group.RegistrationEpoch); ok && (!found || committed > offset) {
+		if committed, ok := c.transactionalOffsets.CommittedOffset(groupName, topic, partition, registration); ok && (!found || committed > offset) {
 			offset, found = committed, true
 		}
 	}
