@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestAdminClientRetriesLostTruncateInstanceReply verifies that response loss
+// preserves the original instance/revision pair when trying the next broker.
 func TestAdminClientRetriesLostTruncateInstanceReply(t *testing.T) {
 	first, firstResult := startAdminCommandDropServer(t)
 	second, secondResult := startAdminTestServer(t, "OK topic=orders truncated=true revision=8 lifecycle_epoch=3 leo=0 hwm=0 instance_id=instance-original-1234 replayed=true")
@@ -21,6 +23,8 @@ func TestAdminClientRetriesLostTruncateInstanceReply(t *testing.T) {
 	require.Equal(t, command, receiveAdminTestCommand(t, secondResult))
 }
 
+// TestAdminTruncateInstanceRejectsInvalidSuccessReceipt checks that matching
+// identity fields cannot turn an inconsistent reset result into success.
 func TestAdminTruncateInstanceRejectsInvalidSuccessReceipt(t *testing.T) {
 	for _, response := range []string{
 		"OK topic=another-topic truncated=true revision=8 lifecycle_epoch=3 leo=0 hwm=0",
@@ -42,6 +46,8 @@ func TestAdminTruncateInstanceRejectsInvalidSuccessReceipt(t *testing.T) {
 	}
 }
 
+// TestAdminTruncateInstanceLostReplyRetryBound exhausts every allowed attempt
+// and leaves an additional successful server available to detect excess retries.
 func TestAdminTruncateInstanceLostReplyRetryBound(t *testing.T) {
 	for _, retries := range []int{0, 2} {
 		t.Run(fmt.Sprintf("retries_%d", retries), func(t *testing.T) {
@@ -70,6 +76,8 @@ func TestAdminTruncateInstanceLostReplyRetryBound(t *testing.T) {
 	}
 }
 
+// TestAdminTruncateInstanceRejectsMismatchedReceipt protects against accepting
+// another incarnation's result even when its revision is the expected successor.
 func TestAdminTruncateInstanceRejectsMismatchedReceipt(t *testing.T) {
 	addr, commands := startAdminTestServer(t, "OK topic=orders truncated=true revision=8 lifecycle_epoch=3 leo=0 hwm=0 instance_id=instance-recreated-5678 replayed=true")
 	client, err := NewAdminClient(&AdminConfig{BrokerAddrs: []string{addr}})

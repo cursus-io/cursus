@@ -220,6 +220,10 @@ func (c *AdminClient) TruncateTopic(topic string, options TruncateTopicOptions) 
 	return c.TruncateTopicContext(context.Background(), topic, options)
 }
 
+// TruncateTopicContext requests a revision-guarded reset within ctx's lifetime.
+// ExpectedInstance enables bounded retries of the saved pair and validates the
+// historical reset receipt. CleanupPending reports unfinished local cleanup;
+// a successful return does not certify materialization on every replica.
 func (c *AdminClient) TruncateTopicContext(ctx context.Context, topic string, options TruncateTopicOptions) (TruncateTopicResult, error) {
 	if ctx == nil {
 		return TruncateTopicResult{}, fmt.Errorf("admin context is nil")

@@ -208,8 +208,10 @@ in **28.494 s**. The complete SDK race suite passes in **5.949 s**; SDK vet and
 broker build also pass. The container used two CPUs, a 3-GiB limit and a private
 compiler cache; the existing dependency volume was mounted read-only.
 
-The QEMU guest-power-cut evidence is reused from #283, not rerun or relabeled
-as current-source physical-device testing. Its six journal boundaries and
+The QEMU guest-power-cut evidence is reused from #283, not rerun locally or
+relabeled as physical-device testing. The PR's regular
+`standalone-guest-power-loss` CI also passed at `3c4139d`; final-head CI results
+are tracked separately in the PR. Its six journal boundaries and
 ext4/writeback fault model remain documented in `test/power-loss/README.md`.
 The #298 paired baseline/fix registration scenarios are likewise reused at
 `0ea2372`; this SDK/documentation patch does not alter their cleanup algorithm.
