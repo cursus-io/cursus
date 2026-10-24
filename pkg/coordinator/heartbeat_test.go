@@ -1,7 +1,6 @@
 package coordinator
 
 import (
-	"sync"
 	"testing"
 	"time"
 
@@ -23,7 +22,6 @@ func (tc *testCoordinator) triggerRebalance(groupName string) {
 func TestHeartbeatMonitor_TimeoutRemovesMember(t *testing.T) {
 	c := &testCoordinator{
 		Coordinator: &Coordinator{
-			mu: sync.RWMutex{},
 			groups: map[string]*GroupMetadata{
 				"testGroup": {
 					Members: map[string]*MemberMetadata{

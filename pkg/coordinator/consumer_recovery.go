@@ -326,8 +326,10 @@ func (c *Coordinator) ImportStateWithRecovery(groups map[string]*GroupStateSnaps
 	// Restore may hold FSM transition locks while a lifecycle publisher is
 	// waiting for Raft with lifecycleMu held. Do not wait for that publisher;
 	// its existing group identity checks fence completion against this import.
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Cooperative commits similarly recheck map identity/import generation;
+	// waiting for their commit fence here could deadlock the Raft restore.
+	c.mu.state.Lock()
+	defer c.mu.state.Unlock()
 	if err := c.importStateLocked(groups); err != nil {
 		return err
 	}
