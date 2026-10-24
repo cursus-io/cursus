@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
 )
@@ -30,19 +32,28 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 	defer client.Close()
 	start := time.Now()
+	availabilityRetries := 0
 	for epoch := 1; epoch <= 100; epoch++ {
 		if epoch == 1 || epoch%10 == 0 {
 			t.Logf("processing transaction epoch %d", epoch)
 		}
-		producer, err := client.InitTransactionProducer(id)
-		require.NoError(t, err)
+		var producer e2e.TransactionProducer
+		availabilityRetries += retryHistoryAdmission(t, func() error {
+			var err error
+			producer, err = client.InitTransactionProducer(id)
+			return err
+		})
 		require.NoError(t, client.BeginTransaction(id, producer))
-		require.NoError(t, client.SendOffsetsToTransaction(id, "history-transactions", group, member, generation, producer, map[int]uint64{0: uint64(epoch)}))
+		availabilityRetries += retryHistoryAdmission(t, func() error {
+			return client.SendOffsetsToTransaction(id, "history-transactions", group, member, generation, producer, map[int]uint64{0: uint64(epoch)})
+		})
 		require.NoError(t, eventually(t, "transaction commit during history maintenance", 30*time.Second, func() (bool, string, error) {
 			err := client.EndTransaction(id, producer, "commit")
 			return err == nil, fmt.Sprint(err), nil
 		}))
-		require.NoError(t, client.EndTransaction(id, producer, "commit"), "terminal retry must remain idempotent")
+		availabilityRetries += retryHistoryAdmission(t, func() error {
+			return client.EndTransaction(id, producer, "commit")
+		})
 		consumerHistoryCommand(t, reader, fmt.Sprintf("HEARTBEAT topic=history-transactions group=%s member=%s generation=%d", group, member, generation))
 		require.Equal(t, uint64(epoch), fetchCommittedOffset(t, reader, "history-transactions", group))
 		if epoch == 50 {
@@ -56,14 +67,14 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 				next, err := survivor.FindTransactionCoordinator(id)
 				return err == nil && next != owner, fmt.Sprintf("owner=%s err=%v", next, err), nil
 			}))
-			require.Equal(t, uint64(epoch), fetchCommittedOffset(t, survivor, "history-transactions", group))
+			requireHistoryCommittedOffset(t, survivor, "history-transactions", group, uint64(epoch))
 			survivor.Close()
 			historyMeasureDocker(t, "start", cleanupContainerName(node))
 			require.NoError(t, actions.checkAllNodesHealth())
 			waitForStableFullISRAndZeroUnderReplicated(t, ctx, "transaction history owner return")
 		}
 	}
-	t.Logf("100 committed transaction epochs including ownership move wall=%s", time.Since(start))
+	t.Logf("100 committed transaction epochs including ownership move wall=%s admission_retries=%d", time.Since(start), availabilityRetries)
 	require.NoError(t, eventually(t, "retired transaction intents actually leave every replica", 2*time.Minute, func() (bool, string, error) {
 		consumerHistoryCommand(t, reader, fmt.Sprintf("HEARTBEAT topic=history-transactions group=%s member=%s generation=%d", group, member, generation))
 		for node := 1; node <= 3; node++ {
@@ -85,6 +96,40 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 		historyMeasureDocker(t, "start", cleanupContainerName(node))
 		require.NoError(t, actions.waitForNodeHealth(node, fmt.Sprintf("http://localhost:%d/ready", healthPort(node))))
 		waitForStableFullISRAndZeroUnderReplicated(t, ctx, "transaction cache miss")
-		require.Equal(t, uint64(100), fetchCommittedOffset(t, client, "history-transactions", group))
+		requireHistoryCommittedOffset(t, client, "history-transactions", group, 100)
 	}
+}
+
+// Retry only the pre-admission maintenance rejection. Epoch/member failures and
+// transport ambiguity must fail the test instead of silently reinitializing.
+func retryHistoryAdmission(t *testing.T, operation func() error) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for retries := 0; ; retries++ {
+		err := operation()
+		if err == nil {
+			return retries
+		}
+		var rejected *wire.BrokerError
+		if !errors.As(err, &rejected) || rejected.Code != "consumer_metadata_recovering" || time.Now().After(deadline) {
+			require.NoError(t, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Transaction-shard election can precede group-owner recovery. Count that wait
+// as failover time, and reject a successful response with any changed offset.
+func requireHistoryCommittedOffset(t *testing.T, client *e2e.BrokerClient, topic, group string, expected uint64) {
+	t.Helper()
+	require.NoError(t, eventually(t, "exact history offset after ownership recovery", clusterReadyTimeout, func() (bool, string, error) {
+		offset, err := client.FetchCommittedOffset(topic, 0, group)
+		if err != nil {
+			return false, fmt.Sprint(err), nil
+		}
+		if offset != expected {
+			return false, "committed offset changed", fmt.Errorf("got=%d want=%d", offset, expected)
+		}
+		return true, "exact committed offset", nil
+	}))
 }

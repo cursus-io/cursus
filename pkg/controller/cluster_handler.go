@@ -14,6 +14,7 @@ import (
 	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	replicationFSM "github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -290,6 +291,9 @@ func (ch *CommandHandler) checkCoordinatorKey(coordKey string, findCmd string) (
 		return addr, isCoordinator, resolveErr
 	}
 	if err := ch.ensureGroupRecovery(partition, epoch); err != nil {
+		if err == coordinator.ErrConsumerMetadataRecovering {
+			return AdvertisedAddr{}, false, err
+		}
 		return AdvertisedAddr{}, false, fmt.Errorf("reload coordinator state: %w", err)
 	}
 	if err := ch.validateRecoveredCoordinatorRoute(coordKey, partition, epoch); err != nil {

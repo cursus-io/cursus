@@ -97,6 +97,16 @@ func formatJoinAdmissionError(err error, fallbackCode string) string {
 	return fmt.Sprintf("ERROR: %s reason=%q", fallbackCode, err.Error())
 }
 
+// Routing performs another readiness check after command preflight. A history
+// publication can close admission between those checks, before any mutation.
+// Preserve only that direct sentinel; a wrapped persistence error is ambiguous.
+func formatCoordinatorRouteError(err error) string {
+	if err == coordinator.ErrConsumerMetadataRecovering {
+		return err.Error()
+	}
+	return coordinatorUnavailableResponse
+}
+
 // resolveOffset determines the starting offset for a consumer.
 func (ch *CommandHandler) resolveOffset(p *topic.Partition, topicName string, cArgs CommonArgs) (uint64, error) {
 	savedOffset, found, err := ch.stableGroupOffset(cArgs.GroupName, topicName, cArgs.PartitionID)

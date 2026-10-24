@@ -488,6 +488,11 @@ The full history ladder and resource measurements remain required separately.
 
 ## Whole-broker experiment
 
+Publication temporarily closes consumer admission. If it starts between command
+preflight and coordinator routing, routing preserves the same retryable
+`consumer_metadata_recovering` response. The tests count these retries in request
+completion latency; they do not rejoin members or retry epoch/ownership failures.
+
 `RUN_E2E_CONSUMER_HISTORY_MEASURE=1 CURSUS_CLEANUP_PORT_OFFSET=34000`
 with `CURSUS_HISTORY_MEASURE_OUTPUT` set to a new JSONL file runs
 `TestConsumerHistoryWholeBrokerLadder`. It requires Docker and uses only that

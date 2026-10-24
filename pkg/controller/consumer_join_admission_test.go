@@ -15,3 +15,9 @@ func TestJoinAdmissionRejectionDistinguishesAmbiguousPersistence(t *testing.T) {
 		require.Equal(t, fmt.Sprintf("ERROR: %s reason=%q", fallback, ambiguous.Error()), formatJoinAdmissionError(ambiguous, fallback))
 	}
 }
+
+func TestConsumerHistoryRoutingAdmissionRejection(t *testing.T) {
+	require.Equal(t, coordinator.ErrConsumerMetadataRecovering.Error(), formatCoordinatorRouteError(coordinator.ErrConsumerMetadataRecovering))
+	require.Equal(t, coordinatorUnavailableResponse, formatCoordinatorRouteError(fmt.Errorf("persistence: %w", coordinator.ErrConsumerMetadataRecovering)))
+	require.Equal(t, coordinatorUnavailableResponse, formatCoordinatorRouteError(ErrConsumerRecoveryPending))
+}

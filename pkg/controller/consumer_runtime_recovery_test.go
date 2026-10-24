@@ -43,6 +43,34 @@ func TestConsumerRequirementBlocksCachedOwnershipAndSemantics(t *testing.T) {
 	require.Contains(t, h.handlePublish("PUBLISH topic=__consumer_offsets message=x producerId=p", internal), "consumer_metadata_recovering")
 }
 
+func TestConsumerHistoryAdmissionClosesAfterCommandPreflight(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	c, err := coordinator.NewCoordinatorWithRecovery(context.Background(), cfg, &coordinatorRoutingTopicHandler{})
+	require.NoError(t, err)
+	t.Cleanup(c.Stop)
+	state := fsm.NewBrokerFSM(nil, c)
+	registerRoutingBroker(t, state, "node-1")
+	installRoutingOffsetsTopology(t, state, "node-1")
+	h := newCoordinatorRoutingHandler("node-1", state, c)
+	require.NoError(t, h.CaptureGroupRecoveryOwnership())
+	require.NoError(t, h.consumerReadinessError())
+	release, err := c.BeginConsumerMetadataRecovery(context.Background())
+	require.NoError(t, err)
+	defer release()
+	// Call the handlers after successful preflight to reproduce publication
+	// winning the race before coordinator routing performs its second check.
+	for _, run := range []func() string{
+		func() string {
+			return h.handleCommitOffset("COMMIT_OFFSET topic=orders partition=0 group=workers offset=1 generation=1 member=m")
+		},
+		func() string { return h.handleHeartbeat("HEARTBEAT topic=orders group=workers member=m generation=1") },
+		func() string { return h.handleFetchOffset("FETCH_OFFSET topic=orders partition=0 group=workers") },
+	} {
+		require.Equal(t, coordinator.ErrConsumerMetadataRecovering.Error(), run())
+	}
+}
+
 func TestStartupDriverRequiresAuthoritativeFSMInsteadOfLocalHWM(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
