@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -281,6 +282,16 @@ func runCooperativeGoComparison(t *testing.T, records int, join bool) {
 			var mu sync.Mutex
 			seen := map[string]int{}
 			counts := map[int]int{}
+			defer func() {
+				if t.Failed() {
+					mu.Lock()
+					t.Logf("comparison stalled: unique=%d partition_deliveries=%v", len(seen), counts)
+					mu.Unlock()
+					stacks := make([]byte, 1<<20)
+					n := runtime.Stack(stacks, true)
+					t.Logf("goroutines before cancellation (truncated=%v):\n%s", n == len(stacks), stacks[:n])
+				}
+			}()
 			last := map[int]time.Time{}
 			gaps := map[int]time.Duration{}
 			handler := func(m sdk.Message) error {

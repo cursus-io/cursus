@@ -51,6 +51,96 @@ work; this change's end-to-end acceptance applies to the broker and Go SDK.
 
 ## Validation defined before implementation
 
+### Broker read work and synchronous append experiments
+
+The broker follow-up targets the group offset lock held across durable append.
+With the bounded SDK pipeline already installed, three 9,600-record runs at
+`c7f19f6` accumulated 9.39 s in `GetStableOffset` lock waits and 9.04 s in offset
+snapshot append waits. These are cumulative goroutine waits, not elapsed-time
+percentages or independent costs that can be added together.
+
+[Kafka 4.1.0 CoordinatorRuntime](https://github.com/apache/kafka/blob/4.1.0/coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java)
+separates committed-state reads from write responses held until commitment.
+[OffsetMetadataManager](https://github.com/apache/kafka/blob/4.1.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java)
+uses timeline lookups and rejects stable offset requests for pending
+transactional offsets. Cursus adopts committed-state visibility and keeps its
+transaction barrier. It does not introduce Kafka's event processor or timeline
+storage: its existing group and membership locks still serialize writes,
+reservations, and ownership changes.
+
+A temporary committed-offset read window was prototyped while keeping the
+write/membership locks and excluding groups with reservations. Blocked append,
+failed append, response loss/restart, blocked resolver, and concurrent reservation
+tests passed. It reduced read-lock wait in a diagnostic profile, but its added
+throughput benefit was inconsistent across the paired runs, including lower
+join throughput. **The window was discarded and is not implemented in this PR.**
+The original group lock, synchronous acknowledgement, admission and ownership
+checks, and transaction barriers all remain unchanged.
+
+Profiling also exposed repeated decode work in the broker's committed-page
+reader. Every request started with 1,024 raw records even when the caller wanted
+eight visible records, then discarded the unreturned tail. The following
+request decoded that tail again. The new scan starts with the visible demand,
+grows geometrically only across completely filtered pages, and retains the
+1,024-record scan cap. After visible progress it returns to the remaining demand.
+Byte budgets, oversized-first progress, fixed HWM/LSO limits, marker filtering,
+and the cursor through empty filtered pages are unchanged.
+
+[Kafka 4.1.0 LogSegment.read](https://github.com/apache/kafka/blob/4.1.0/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java)
+bounds the returned file slice by the requested byte size and maximum readable
+position, with an explicit first-batch size exception. Cursus stores individual
+records and filters them on the broker, so it also bounds the initial raw record
+demand rather than copying Kafka's batch representation. Regression checks count
+records read across 200 eight-record pages, verify progress across 4,096 aborted
+records, and retain the existing byte-budget and transaction visibility tests.
+This changes read work, not persisted bytes or the durable commit policy.
+The selected change adds no log record, background goroutine, persistent cache,
+or recovery state. Full topic snapshots and ownership checkpoints retain their
+existing recovery costs. Acceptance measures metadata payload bytes and records,
+waits for every committed offset to reach log end, and preserves the existing
+duplicate bound and three-broker fault checks.
+
+The real-disk `BenchmarkReadCommittedSmallPage` reads eight 128-byte records
+from a 1,600-record committed backlog. Three 100-iteration runs at INFO logging,
+Go 1.26.2, two container CPUs and GOMAXPROCS=2 measured:
+
+| Per-page metric | Baseline `c7f19f6` | Selected scan change |
+| --- | ---: | ---: |
+| Decoded storage bytes | 235,520 | 1,840 |
+| Allocations | 2,070 | 34 |
+| Allocated bytes, median | 848,438 | 11,719 |
+| Read time, median | 1.030 ms | 0.043 ms |
+
+This isolates page reading; it is **not** a 24-fold consumer throughput claim.
+The existing broker group lock still covers durable append, and cooperative
+workers still wait for each batch's durable commit. These remain costs that
+eager's asynchronous interval commits do not pay in the same way.
+
+[All observations and limitations](../measurements/consumer-cooperative-broker-2026-10-24.json)
+include the four-variant DEBUG comparison: five repetitions, both 960-record
+join and 9,600-record single-member workloads, eager and cooperative modes
+(80 passing cases). The selected change's cooperative medians were 921.4 versus
+812.5 records/s for join, and 1,204.7 versus 883.4 records/s for the larger
+backlog. However, eager controls also varied substantially, ranges overlapped,
+and these results do not establish that the end-to-end eager gap narrowed.
+Cooperative duplicates were 0–24 at join and zero in the larger backlog; the
+existing assertions were unchanged. Long-backlog metadata replay payload
+medians were 139,193 versus 140,172 bytes (408 versus 411 records), not a material
+recovery-format saving. Both fetched exactly 9,600 records / 1,228,800 payload
+bytes in the large workload.
+
+An INFO confirmation completed 27 cases, then its fourth selected-version
+large-backlog cooperative case stalled after repeated localhost TCP timeouts
+and failed the existing 60-second delivery assertion. Twelve planned cases
+were not run. A previous three-variant INFO attempt failed without retained
+logs because the initial harness exported only on success; it is excluded from
+numeric evidence. After adding failure diagnostics without changing deadlines,
+five baseline and five selected-version large-backlog rechecks passed. The
+earlier stall's root cause is not established. No passing subset is presented
+as a completed INFO performance comparison or proof of a narrower eager gap.
+
+### Runtime regression checks
+
 - Prove write failure and response loss do not publish an uncommitted grant;
   restore pending revocations and transaction barriers from log and snapshot.
 - Delay/duplicate ACKs; return an expired member; change topic lifecycle; resolve
