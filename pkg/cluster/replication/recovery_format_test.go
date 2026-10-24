@@ -82,6 +82,20 @@ func TestEnsureRaftRecoveryFormatRejectsUnmarkedPersistedState(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(directory, raftFormatMarkerName))
 }
 
+func TestUpgradeRaftRecoveryFormatFromCooperativeRuntimeVersion(t *testing.T) {
+	directory := t.TempDir()
+	marker := filepath.Join(directory, raftFormatMarkerName)
+	require.NoError(t, os.WriteFile(marker, []byte("14\n"), 0600))
+	require.NoError(t, ensureRaftRecoveryFormat(directory))
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "14\n", string(data), "validation must not disable rollback before successful recovery")
+	require.NoError(t, upgradeRaftRecoveryFormat(directory))
+	data, err = os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "15\n", string(data), "publish the new marker before advertising protocol 12")
+}
+
 func TestEnsureRaftRecoveryFormatRejectsUnknownMarker(t *testing.T) {
 	directory := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(directory, raftFormatMarkerName), []byte("8\n"), 0o600))

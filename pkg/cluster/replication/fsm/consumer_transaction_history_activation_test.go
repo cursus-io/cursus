@@ -3,6 +3,7 @@ package fsm
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"testing"
 
@@ -56,6 +57,44 @@ func TestConsumerTransactionHistoryActivationAndRestoreGate(t *testing.T) {
 			encoded, err := json.Marshal(invalid)
 			require.NoError(t, err)
 			require.Error(t, NewBrokerFSM(nil, nil).Restore(io.NopCloser(bytes.NewReader(encoded))))
+		})
+	}
+}
+
+func TestConsumerTransactionHistoryAndCooperativeGatesRemainDistinct(t *testing.T) {
+	for _, transactionFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(transactionFirst), func(t *testing.T) {
+			f := NewBrokerFSM(nil, nil)
+			registerCooperativeConsumerBroker(t, f, "node", "active", 2)
+			require.Nil(t, f.Apply(&raft.Log{Data: []byte(`CONSUMER_HISTORY_ACTIVATE:{"voters":["node"]}`)}))
+			txn := []byte(`CONSUMER_TRANSACTION_HISTORY_ACTIVATE:{"voters":["node"]}`)
+			coop := []byte(`COOPERATIVE_CONSUMER_ACTIVATE:{"voters":["node"]}`)
+			require.Error(t, resultError(f.Apply(&raft.Log{Data: txn})), "protocol 11 must not authorize transaction history")
+			f.brokers["node"].LifecycleProtocol = ConsumerTransactionHistoryProtocolVersion
+			commands := [][]byte{coop, txn}
+			if transactionFirst {
+				commands = [][]byte{txn, coop}
+			}
+			for _, command := range commands {
+				require.Nil(t, f.Apply(&raft.Log{Data: command}))
+			}
+			snapshot, err := f.Snapshot()
+			require.NoError(t, err)
+			defer snapshot.Release()
+			var data bytes.Buffer
+			require.NoError(t, snapshot.Persist(&MockSnapshotSink{Writer: &data}))
+			var state BrokerFSMState
+			require.NoError(t, json.Unmarshal(data.Bytes(), &state))
+			require.Equal(t, SnapshotVersionTransactionHistory, state.Version)
+			restored := NewBrokerFSM(nil, nil)
+			require.NoError(t, restored.Restore(io.NopCloser(bytes.NewReader(data.Bytes()))))
+			require.True(t, restored.CooperativeConsumerEnabled())
+			require.True(t, restored.ConsumerTransactionHistoryEnabled())
+			require.True(t, restored.ConsumerHistoryEnabled())
+			state.Version = SnapshotVersionCooperativeRuntime
+			invalid, err := json.Marshal(state)
+			require.NoError(t, err)
+			require.ErrorContains(t, NewBrokerFSM(nil, nil).Restore(io.NopCloser(bytes.NewReader(invalid))), "transaction history snapshot")
 		})
 	}
 }

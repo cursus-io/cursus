@@ -26,19 +26,25 @@ transaction visibility or reset unrelated membership clocks.
 
 ## Durable activation and compatibility
 
-Protocol 11 adds `CONSUMER_TRANSACTION_HISTORY_ACTIVATE`. It requires the
+Protocol 12 adds `CONSUMER_TRANSACTION_HISTORY_ACTIVATE`. It requires the
 ordinary history gate and every registered broker (including offline entries)
-and voter to support protocol 11, bootstrap protocol 2 and durable incarnations.
+and voter to support protocol 12, bootstrap protocol 2 and durable incarnations.
 Only the leader activates it when history maintenance is configured. Registration
 rejects older protocols after activation.
 
-Activation is persisted in Raft snapshot 13. Restore rejects inconsistent flags,
+Activation is persisted in Raft snapshot 14. Restore rejects inconsistent flags,
 old snapshot versions carrying the flag, or incompatible registered brokers.
-Unactivated snapshots retain version 11/12. Local Raft recovery marker 14 is
-published atomically and synced after replay of supported marker 9 through 13
-volumes, before advertising capability. Older binaries fail closed on marker 14.
+Unactivated snapshots retain version 11/12/13. Local Raft recovery marker 15 is
+published atomically and synced after replay of supported marker 9 through 14
+volumes, before advertising capability. Older binaries fail closed on marker 15.
 In-place downgrade is unsupported; restore a complete pre-upgrade backup into
 isolated volumes. Disabling maintenance does not undo the durable gate.
+
+The cooperative runtime retains its independent protocol-11 gate and
+snapshot-13 format. Protocol 11 alone cannot activate transaction history.
+Either activation order preserves both flags; when transaction history is
+active, snapshot 14 carries both contracts. Inactive transaction history may
+still use snapshot 13 for an activated cooperative runtime.
 
 Before activation, writers emit metadata v3 and existing control identities.
 After activation, processing transactions emit v7 intents and controls with
