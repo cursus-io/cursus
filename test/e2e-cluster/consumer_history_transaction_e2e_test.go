@@ -28,9 +28,9 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-transactions partitions=1 replication_factor=3")
 	const group, id = "history-transaction-group", "history-transaction-id"
 	reader, generation, member := joinRecoveryGroup(t, ctx.GetBrokerAddrs(), "history-transactions", group)
-	defer reader.Close()
+	defer func() { reader.Close() }()
 	client := e2e.NewBrokerClient(ctx.GetBrokerAddrs())
-	defer client.Close()
+	defer func() { client.Close() }()
 	start := time.Now()
 	availabilityRetries := 0
 	for epoch := 1; epoch <= 100; epoch++ {
@@ -55,7 +55,7 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 			return client.EndTransaction(id, producer, "commit")
 		})
 		consumerHistoryCommand(t, reader, fmt.Sprintf("HEARTBEAT topic=history-transactions group=%s member=%s generation=%d", group, member, generation))
-		require.Equal(t, uint64(epoch), fetchCommittedOffset(t, reader, "history-transactions", group))
+		require.Equal(t, uint64(epoch), fetchHistoryOffset(t, reader, "history-transactions", group))
 		if epoch == 50 {
 			owner, err := client.FindTransactionCoordinator(id)
 			require.NoError(t, err)
@@ -72,6 +72,13 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 			historyMeasureDocker(t, "start", cleanupContainerName(node))
 			require.NoError(t, actions.checkAllNodesHealth())
 			waitForStableFullISRAndZeroUnderReplicated(t, ctx, "transaction history owner return")
+			// INIT is not safe to retry after an ambiguous socket read. Retire
+			// connections to the deliberately stopped process before starting
+			// the next epoch; keep the same transactional ID and group member.
+			client.Close()
+			client = e2e.NewBrokerClient(ctx.GetBrokerAddrs())
+			reader.Close()
+			reader = e2e.NewBrokerClient(ctx.GetBrokerAddrs())
 		}
 	}
 	t.Logf("100 committed transaction epochs including ownership move wall=%s admission_retries=%d", time.Since(start), availabilityRetries)
@@ -112,6 +119,9 @@ func retryHistoryAdmission(t *testing.T, operation func() error) int {
 		}
 		var rejected *wire.BrokerError
 		if !errors.As(err, &rejected) || rejected.Code != "consumer_metadata_recovering" || time.Now().After(deadline) {
+			if rejected != nil {
+				t.Logf("history command rejected code=%s fields=%v", rejected.Code, rejected.Fields)
+			}
 			require.NoError(t, err)
 		}
 		time.Sleep(10 * time.Millisecond)

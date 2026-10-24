@@ -12,6 +12,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/transaction"
 )
 
@@ -23,6 +24,15 @@ func (ch *CommandHandler) transactionGroupRegistrationEpoch(group, topic string,
 	response, err := ch.Cluster.Router.ForwardToCoordinator(group, cmd)
 	if err != nil {
 		return 0, err
+	}
+	return parseTransactionGroupRegistrationEpoch(response)
+}
+
+func parseTransactionGroupRegistrationEpoch(response string) (uint64, error) {
+	// This read precedes AddOffsets and cannot have staged transaction state.
+	// Keep a clean maintenance rejection retryable across the internal RPC.
+	if parsed, ok := protocol.ParseErrorResponse(response); ok && parsed.Code == "consumer_metadata_recovering" {
+		return 0, coordinator.ErrConsumerMetadataRecovering
 	}
 	if !strings.HasPrefix(response, "OK ") {
 		return 0, fmt.Errorf("%s", response)
