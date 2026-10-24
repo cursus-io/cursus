@@ -152,6 +152,12 @@ func (tm *TopicManager) ApplyTruncateDefinition(raw Definition) (TruncateResult,
 			return TruncateResult{}, fmt.Errorf("%w: %s", ErrTopicNotFound, target.Name)
 		}
 		definition := current.Definition()
+		// Numeric revisions and epochs are reused after DELETE + CREATE.
+		// Historical Raft replay must not reset a different local instance.
+		if definition.InstanceID != "" && target.InstanceID != definition.InstanceID {
+			tm.mu.Unlock()
+			return TruncateResult{}, fmt.Errorf("%w: topic instance mismatch for %q", ErrTopicRevisionConflict, target.Name)
+		}
 		if target.Revision != definition.Revision+1 || target.LifecycleEpoch != definition.LifecycleEpoch+1 {
 			tm.mu.Unlock()
 			return TruncateResult{}, fmt.Errorf(

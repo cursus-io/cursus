@@ -1,0 +1,228 @@
+{
+  "setup_ns": 244392902400,
+  "operation_start": "2026-10-24T07:33:08.5790402Z",
+  "intent_ack": "2026-10-24T07:33:08.7486503Z",
+  "release_start": "2026-10-24T07:33:36.1093808Z",
+  "all_materialized": "2026-10-24T07:33:54.0046568Z",
+  "recovery_ns": 17895276000,
+  "pending": {
+    "topic": "cleanup-fault-orders",
+    "partition": 1,
+    "next": 0,
+    "end": 39,
+    "records": 0,
+    "bytes": 0,
+    "read_bytes": 0,
+    "reads": 3,
+    "segment": 0,
+    "position": 0,
+    "reason": "injected consumer cleanup read failure",
+    "state": "error"
+  },
+  "nodes": [
+    {
+      "node": 1,
+      "before_at": "2026-10-24T07:33:01.7176026Z",
+      "after_at": "2026-10-24T07:33:54.2552313Z",
+      "before_completed": "2026-10-24T07:33:03.5415712Z",
+      "after_completed": "2026-10-24T07:33:56.3268085Z",
+      "trace_started": "2026-10-24T07:33:01.1984716Z",
+      "trace_stopped": "2026-10-24T07:33:56.9369382Z",
+      "cgroup_sources": {
+        "cpu": "/sys/fs/cgroup/cpuacct/cpuacct.usage",
+        "io": "unavailable"
+      },
+      "process_io_delta": {
+        "rchar": 833240,
+        "wchar": 5408307,
+        "syscr": 11186,
+        "syscw": 7137,
+        "read_bytes": 270336,
+        "write_bytes": 5316608,
+        "cancelled_write_bytes": 0
+      },
+      "kernel_block_io_delta": {},
+      "network_delta": {
+        "lo/receive_bytes": 111471,
+        "lo/transmit_bytes": 111471,
+        "eth0/receive_bytes": 851717,
+        "eth0/transmit_bytes": 2048085
+      },
+      "cgroup_cpu_delta": {
+        "usage_nsec": 28053249400
+      },
+      "counter_deltas": {
+        "consumer_cleanup_replay_bytes_total": 0,
+        "consumer_cleanup_replay_invalidations_total": 0,
+        "consumer_cleanup_replay_reads_total": 0,
+        "consumer_cleanup_replay_records_total": 0,
+        "cursus_consumer_history_removed_frame_bytes_total": 0,
+        "cursus_consumer_history_removed_records_total": 0,
+        "cursus_consumer_history_source_payload_bytes_total": 0,
+        "cursus_consumer_history_source_records_total": 0,
+        "cursus_recovery_admission_deferred_total": 0,
+        "cursus_recovery_attempts_total{outcome=\"failure\",stage=\"lineage\"}": 633,
+        "process_cpu_seconds_total": 13.520000000000001,
+        "process_network_receive_bytes_total": 877244,
+        "process_network_transmit_bytes_total": 2095040
+      },
+      "appeared_series": {},
+      "traced_syncs": {
+        "fsync": {
+          "calls": 2331,
+          "errors": 0
+        },
+        "fdatasync": {
+          "calls": 332,
+          "errors": 0
+        }
+      },
+      "phase_sampled_peaks": {
+        "go_memstats_heap_alloc_bytes": 336938208,
+        "process_resident_memory_bytes": 129273856
+      },
+      "lifetime_rss_high_water_kib": 127288
+    },
+    {
+      "node": 2,
+      "before_at": "2026-10-24T07:33:04.0177199Z",
+      "after_at": "2026-10-24T07:33:56.9369382Z",
+      "before_completed": "2026-10-24T07:33:05.7725278Z",
+      "after_completed": "2026-10-24T07:33:58.6927675Z",
+      "trace_started": "2026-10-24T07:33:03.5415712Z",
+      "trace_stopped": "2026-10-24T07:33:59.270673Z",
+      "cgroup_sources": {
+        "cpu": "/sys/fs/cgroup/cpuacct/cpuacct.usage",
+        "io": "unavailable"
+      },
+      "process_io_delta": {
+        "rchar": 911963,
+        "wchar": 5840928,
+        "syscr": 12704,
+        "syscw": 7563,
+        "read_bytes": 266240,
+        "write_bytes": 5353472,
+        "cancelled_write_bytes": 0
+      },
+      "kernel_block_io_delta": {},
+      "network_delta": {
+        "lo/receive_bytes": 155790,
+        "lo/transmit_bytes": 155790,
+        "eth0/receive_bytes": 937691,
+        "eth0/transmit_bytes": 2500335
+      },
+      "cgroup_cpu_delta": {
+        "usage_nsec": 29752842200
+      },
+      "counter_deltas": {
+        "consumer_cleanup_replay_bytes_total": 38013,
+        "consumer_cleanup_replay_invalidations_total": 1,
+        "consumer_cleanup_replay_reads_total": 6,
+        "consumer_cleanup_replay_records_total": 88,
+        "cursus_consumer_history_removed_frame_bytes_total": 0,
+        "cursus_consumer_history_removed_records_total": 0,
+        "cursus_consumer_history_source_payload_bytes_total": 0,
+        "cursus_consumer_history_source_records_total": 0,
+        "cursus_recovery_admission_deferred_total": 0,
+        "cursus_recovery_attempts_total{outcome=\"failure\",stage=\"catchup_rpc\"}": 0,
+        "cursus_recovery_attempts_total{outcome=\"failure\",stage=\"lineage\"}": 629,
+        "cursus_recovery_attempts_total{outcome=\"success\",stage=\"catchup_rpc\"}": 0,
+        "cursus_recovery_work_total{stage=\"catchup_rpc\",unit=\"transfer_bytes\"}": 0,
+        "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}": 0,
+        "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}": 0,
+        "process_cpu_seconds_total": 14.46,
+        "process_network_receive_bytes_total": 993416,
+        "process_network_transmit_bytes_total": 2577818
+      },
+      "appeared_series": {},
+      "traced_syncs": {
+        "fsync": {
+          "calls": 2357,
+          "errors": 0
+        },
+        "fdatasync": {
+          "calls": 332,
+          "errors": 0
+        }
+      },
+      "phase_sampled_peaks": {
+        "go_memstats_heap_alloc_bytes": 363726912,
+        "process_resident_memory_bytes": 125038592
+      },
+      "lifetime_rss_high_water_kib": 123820
+    },
+    {
+      "node": 3,
+      "before_at": "2026-10-24T07:33:06.383707Z",
+      "after_at": "2026-10-24T07:33:59.270673Z",
+      "before_completed": "2026-10-24T07:33:08.5790402Z",
+      "after_completed": "2026-10-24T07:34:01.5445285Z",
+      "trace_started": "2026-10-24T07:33:05.7725278Z",
+      "trace_stopped": "2026-10-24T07:34:02.1198Z",
+      "cgroup_sources": {
+        "cpu": "/sys/fs/cgroup/cpuacct/cpuacct.usage",
+        "io": "unavailable"
+      },
+      "process_io_delta": {
+        "rchar": 801817,
+        "wchar": 6099098,
+        "syscr": 16630,
+        "syscw": 9530,
+        "read_bytes": 69632,
+        "write_bytes": 5345280,
+        "cancelled_write_bytes": 0
+      },
+      "kernel_block_io_delta": {},
+      "network_delta": {
+        "lo/receive_bytes": 247754,
+        "lo/transmit_bytes": 247754,
+        "eth0/receive_bytes": 897505,
+        "eth0/transmit_bytes": 3065665
+      },
+      "cgroup_cpu_delta": {
+        "usage_nsec": 34203559200
+      },
+      "counter_deltas": {
+        "consumer_cleanup_replay_bytes_total": 3918,
+        "consumer_cleanup_replay_invalidations_total": 1,
+        "consumer_cleanup_replay_reads_total": 2,
+        "consumer_cleanup_replay_records_total": 8,
+        "cursus_consumer_history_removed_frame_bytes_total": 0,
+        "cursus_consumer_history_removed_records_total": 0,
+        "cursus_consumer_history_source_payload_bytes_total": 0,
+        "cursus_consumer_history_source_records_total": 0,
+        "cursus_recovery_admission_deferred_total": 0,
+        "cursus_recovery_attempts_total{outcome=\"failure\",stage=\"lineage\"}": 632,
+        "cursus_recovery_work_total{stage=\"retained_page\",unit=\"cache_hits\"}": 0,
+        "cursus_recovery_work_total{stage=\"retained_page\",unit=\"cache_misses\"}": 0,
+        "cursus_recovery_work_total{stage=\"retained_page\",unit=\"sync_calls\"}": 0,
+        "process_cpu_seconds_total": 16.950000000000003,
+        "process_network_receive_bytes_total": 1033425,
+        "process_network_transmit_bytes_total": 3171257
+      },
+      "appeared_series": {},
+      "traced_syncs": {
+        "fsync": {
+          "calls": 2525,
+          "errors": 0
+        },
+        "fdatasync": {
+          "calls": 332,
+          "errors": 0
+        }
+      },
+      "phase_sampled_peaks": {
+        "go_memstats_heap_alloc_bytes": 486736504,
+        "process_resident_memory_bytes": 140201984
+      },
+      "lifetime_rss_high_water_kib": 137584
+    }
+  ],
+  "traffic": {
+    "acknowledged": 82,
+    "samples": 82,
+    "p50_ns": 516474300.0,
+    "p99_ns": 798956700,
+    "max_ns": 974432100
+  }
+}

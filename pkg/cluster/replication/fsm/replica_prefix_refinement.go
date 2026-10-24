@@ -7,6 +7,18 @@ import (
 	"github.com/cursus-io/cursus/pkg/disk"
 )
 
+// ValidateReplicaPrefixContinuationContext permits reuse of a read-only search
+// only while its original metadata authority and receiver content still match.
+// It does not authorize an apply; every retried response must be fenced again.
+func (f *BrokerFSM) ValidateReplicaPrefixContinuationContext(ctx context.Context, request ReplicaCatchupRequest) error {
+	if request.RecoveryProtocol != IndexedRecoveryProtocolVersion || request.localAuthority == nil || request.LocalWitness == nil {
+		return fmt.Errorf("prefix continuation requires the original recovery witness")
+	}
+	return f.WithReplicaSnapshotRecoveryFenceContext(ctx, request, func() error {
+		return request.localAuthority.partition.ValidateReplicaRequestWitness(ctx, request.LocalWitness, request.NextOffset)
+	})
+}
+
 // ReplicaPrefixRefinement finds the next rejected candidate above the source's
 // longest match. Call only after validating the response against this request.
 // Adjacent boundaries prove that no additional common record will be removed.

@@ -227,17 +227,26 @@ RUN_E2E_CLEANUP_RECOVERY=1 CURSUS_CLEANUP_PORT_OFFSET=32000 go test -v -count=1 
 
 ## Remaining issue-level acceptance
 
-1. #272 still lacks a complete three-broker missing/malformed/conflicting/
-   uncommitted/obsolete deletion-evidence matrix and dedicated active-group
-   rejection matrix. Unit and disk-backed cases remain valid evidence at their
-   level. #298's real re-registration/replay/snapshot proof and #302's actual
-   compaction/restart proof replace their respective older gaps, but cannot
-   stand in for that separate fault matrix.
-2. A complete TRUNCATE recovery profile with normal traffic has not measured all
-   read/write/transfer bytes, replay/repeated work, fsync syscalls, CPU, memory
-   and recovery latency in one controlled run. Existing logical counters,
-   snapshot sizes, process CPU/heap and separate cleanup/history benchmarks
-   must not be combined into an invented full-system profile.
+The measurements above retain their original source commit. At the subsequent
+integration point `b754bdd`, main includes #315 (`93896ce`), #316 (`17a196f`)
+and #314 (`b754bdd`). The following assessment supersedes the original missing
+matrix/profile list without relabeling the earlier measurements.
+
+1. The three-broker rejection and subscription matrix is now supplied by #315,
+   including missing, malformed, conflicting, out-of-committed-cut, obsolete
+   and transactional evidence. #316 addresses the returning prepared
+   coordinator's insufficient-ISR startup failure. See
+   [cleanup evidence](cleanup-rejection-evidence.md) and
+   [prepared startup recovery](prepared-startup-recovery.md). Reuse #298's
+   re-registration/replay/snapshot proof and #302's compaction/restart proof;
+   snapshots without a historical cleanup cut still remain fail-closed.
+2. The live TRUNCATE profile now measures normal traffic, read/write/transfer
+   bytes, replay/repeated work, sync syscalls, CPU, memory and convergence time;
+   raw samples and measurement boundaries are recorded in the cleanup evidence.
+   It includes instrumentation and foreground traffic and does not isolate
+   recovery cost for every process-crash, guest-cut or snapshot-restore path.
+   Missing device counters remain unavailable, not zero. #314 addresses repeated
+   prefix refinement; see [prefix retry evidence](recovery-prefix-retry.md).
 3. Process exit, guest kernel/page-cache loss and physical device power loss
    are different fault models. The historical QEMU journal tests cover only
    the second on a specified ext4/writeback setup; no physical controller,

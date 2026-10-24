@@ -202,6 +202,43 @@ jobs:
         working-directory: test/e2e-cluster
         run: docker compose -p cursus-cleanup-e2e -f docker-compose.yml -f docker-compose.faults.yml -f docker-compose.consumer-cleanup.yml down -v --remove-orphans
 
+  consumer-cleanup-contract-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: false
+      - name: Verify invalid evidence and subscription rejection
+        env:
+          RUN_E2E_CLEANUP_REJECTION: "1"
+          CURSUS_CLEANUP_PORT_OFFSET: "33000"
+        run: go test -v -count=1 -timeout 20m ./test/e2e-cluster -run '^(TestConsumerCleanupRejectsInvalidEvidenceOnThreeBrokers|TestTopicLifecycleRejectsSubscriptionsOnThreeBrokers)$'
+      - name: Measure complete live truncate recovery with foreground traffic
+        env:
+          RUN_E2E_CLEANUP_PROFILE: "1"
+          CURSUS_CLEANUP_PORT_OFFSET: "33000"
+          CURSUS_CLEANUP_PROFILE_OUTPUT: ${{ runner.temp }}/cleanup-profile.json
+        run: go test -v -count=1 -timeout 15m ./test/e2e-cluster -run '^TestTruncateRecoveryCostWithForegroundTraffic$'
+      - name: Summarize recovery counters
+        run: python3 test/e2e-cluster/analyze_cleanup_profile.py "${{ runner.temp }}/cleanup-profile.json" > "${{ runner.temp }}/cleanup-profile-summary.json"
+      - name: Preserve raw recovery measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cleanup-recovery-profile
+          path: ${{ runner.temp }}/cleanup-profile*.json
+          if-no-files-found: warn
+      - name: Verify departed-member reservation protects lifecycle during recovery
+        env:
+          RUN_E2E_CHAOS: "1"
+          CURSUS_CLEANUP_PORT_OFFSET: "33000"
+        run: go test -v -count=1 -timeout 15m ./test/e2e-cluster -run '^TestPreparedOffsetsRecoverAfterMemberDepartureAndCoordinatorFailure$'
+
   raft-snapshot-restore:
     runs-on: ubuntu-latest
     timeout-minutes: 30

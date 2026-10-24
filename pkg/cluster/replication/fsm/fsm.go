@@ -116,6 +116,9 @@ type BrokerFSM struct {
 	// Raft may replay topic creation and commits after restoring a snapshot.
 	// Until that replay finishes, local data beyond the snapshot is not orphaned.
 	recoveryReplayPending bool
+	// Only FinalizeRecoveredPartitions may open deferred user-topic storage
+	// while the replay fence is still held, after the committed target is known.
+	recoveryMaterializationReady bool
 
 	tm                                         *topic.TopicManager
 	cd                                         *coordinator.Coordinator
@@ -675,6 +678,23 @@ func (f *BrokerFSM) reconcileCommittedPartitions() error {
 func (f *BrokerFSM) FinalizeRecoveredPartitions() error {
 	f.transitionMu.Lock()
 	defer f.transitionMu.Unlock()
+	f.mu.Lock()
+	replaying := f.recoveryReplayPending
+	f.recoveryMaterializationReady = true
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.recoveryMaterializationReady = false
+		f.mu.Unlock()
+	}()
+	// Open only final authoritative definitions, before checking persisted
+	// HWM floors. Historical CREATE/TRUNCATE entries must not label or reset
+	// files belonging to a subsequently recreated topic instance.
+	if replaying {
+		if err := f.reconcileTopicMaterializations(false); err != nil {
+			util.Warn("FSM: Final topic materialization remains pending: %v", err)
+		}
+	}
 
 	f.mu.RLock()
 	metadata := make(map[string]PartitionMetadata, len(f.partitionMetadata))

@@ -452,6 +452,11 @@ func (tm *TopicManager) RestoreDefinitions(definitions []Definition) error {
 	for _, definition := range normalized {
 		if existing := tm.topics[definition.Name]; existing != nil {
 			current := existing.Definition()
+			// Preflight identity before prepareTruncationRecoveryLocked can
+			// remove storage. Keep legacy unbound-to-bound restoration valid.
+			if current.InstanceID != "" && definition.InstanceID != current.InstanceID {
+				return fmt.Errorf("topic instance is immutable for topic %q", definition.Name)
+			}
 			if current.Idempotent != definition.Idempotent || current.EventSourcing != definition.EventSourcing {
 				return fmt.Errorf(
 					"topic %q mode mismatch: idempotent=%t/%t event_sourcing=%t/%t",

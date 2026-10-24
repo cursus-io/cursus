@@ -243,6 +243,9 @@ func (f *BrokerFSM) materializeTopicCreate(definition *topic.Definition) error {
 	if !reflect.DeepEqual(current, definition) {
 		return nil
 	}
+	if f.deferRecoveredTopicOpen(definition) {
+		return nil
+	}
 
 	var err error
 	operation := TopicMaterializationCreate
@@ -285,8 +288,12 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 
 	f.mu.RLock()
 	current := copyTopicDefinition(f.topicState[definition.Name])
+	replaying := f.recoveryReplayPending
 	f.mu.RUnlock()
 	if !reflect.DeepEqual(current, definition) {
+		return nil
+	}
+	if f.deferRecoveredTopicOpen(definition) {
 		return nil
 	}
 
@@ -300,7 +307,7 @@ func (f *BrokerFSM) materializeTopicRestore(definition *topic.Definition) error 
 		}
 	}
 	if err == nil {
-		err = f.reconcileMaterializedTopicHWM(definition.Name, true, false)
+		err = f.reconcileMaterializedTopicHWM(definition.Name, true, !replaying)
 	}
 	f.recordTopicMaterializationIfCurrent(definition.Name, operation, definition, err)
 	if err != nil {
@@ -383,6 +390,9 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 	if !reflect.DeepEqual(current, definition) {
 		return nil
 	}
+	if f.deferRecoveredTopicOpen(definition) {
+		return nil
+	}
 
 	var err error
 	restoredMissing := false
@@ -414,6 +424,41 @@ func (f *BrokerFSM) materializeTopicTruncate(definition *topic.Definition) error
 		return fmt.Errorf("truncate local topic %q: %w", definition.Name, err)
 	}
 	return nil
+}
+
+// Called under materializationMu. A cold distributed registry has no durable
+// identity binding until Raft replay reaches its final definition. Keep disk
+// files unopened so historical commands cannot bind or erase a newer instance.
+func (f *BrokerFSM) deferRecoveredTopicOpen(definition *topic.Definition) bool {
+	if f.tm == nil || definition.Name == config.ConsumerOffsetsTopicName || f.tm.GetTopic(definition.Name) != nil {
+		return false
+	}
+	f.mu.RLock()
+	deferOpen := f.recoveryReplayPending && !f.recoveryMaterializationReady
+	f.mu.RUnlock()
+	if !deferOpen {
+		return false
+	}
+	present, err := f.tm.LocalTopicStoragePresent(definition.Name)
+	if !present && err == nil {
+		return false
+	}
+	reason := "awaiting final replay definition before opening local storage"
+	if err != nil {
+		reason = fmt.Sprintf("inspect unopened recovery storage: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pendingSince := f.topicMaterialization[definition.Name].PendingSince
+	if pendingSince.IsZero() {
+		pendingSince = time.Now()
+	}
+	f.topicMaterialization[definition.Name] = TopicMaterializationIssue{
+		Topic: definition.Name, Operation: TopicMaterializationRestore,
+		Error:        reason,
+		PendingSince: pendingSince, Revision: definition.Revision, LifecycleEpoch: definition.LifecycleEpoch,
+	}
+	return true
 }
 
 func (f *BrokerFSM) materializeTopicDelete(name string) error {

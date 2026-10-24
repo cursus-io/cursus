@@ -253,14 +253,20 @@ evidence, changed committed cuts, later registration, generation/identity
 replacement and bounded retry progress. Those unit results are not labeled as
 three-broker fault-injection coverage.
 
-## Acceptance follow-ups at the original verification point
+## Current acceptance follow-ups
 
-- Keep #272 open for its complete three-broker invalid-evidence matrix and a
-  later registration committed while a follower is validating an older deletion
-  cut. The transient-read and delayed-network-request cases above pass; they do
-  not substitute for these different interleavings. Distributed consumer
-  metadata compaction remains disabled, so recovery through that compaction
-  path is not claimed.
+The historical run above is phase-specific evidence. The current audit and
+remaining integration work are tracked in
+[cleanup rejection and recovery cost](cleanup-rejection-evidence.md), including
+the recreated-instance replay regression found by that matrix.
+
+- The historical registration-cut gap was addressed by #298. A snapshot lacking
+  that historical cut still cannot recover it from today's HWM. Retain the
+  fail-closed boundary and use the actual Raft history or a snapshot carrying it.
+- #302 added default-off certified consumer history compaction. The generic
+  internal-topic compactor remains disabled; these are different paths. Reuse
+  its compaction/restart evidence and the ongoing history-efficiency follow-up
+  instead of duplicating that implementation here.
 - Physical power-loss/torn-sector validation depends on the deployment's
   filesystem, controller and durable-cache behavior. Process crash checks and
   the isolated Linux guest harness have explicit, narrower fault models;
@@ -272,6 +278,7 @@ three-broker fault-injection coverage.
   callers requiring a longer retry horizon need a separately designed operation
   history rather than refreshing the expected revision.
 
-These were the follow-ups at the original verification point. Use the
-[current acceptance decision](truncate-acceptance-audit.md#remaining-issue-level-acceptance)
-before deciding whether #164 is complete; do not repeat superseded gaps.
+Use the [acceptance decision](truncate-acceptance-audit.md#remaining-issue-level-acceptance)
+together with the cleanup evidence above before deciding whether #164 is
+complete. Issue-level completion must follow the current evidence and merge
+state, rather than repeating this document's historical missing-test list.

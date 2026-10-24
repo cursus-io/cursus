@@ -1,0 +1,10 @@
+# Only disposable profiling brokers permit tracing; production is unchanged.
+x-profile: &profile
+  cap_add: [SYS_PTRACE]
+  security_opt: [seccomp:unconfined]
+  cpus: 2
+  mem_limit: 1536m
+services:
+  broker-1: *profile
+  broker-2: *profile
+  broker-3: *profile

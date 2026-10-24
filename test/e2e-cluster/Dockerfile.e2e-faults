@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o 
 FROM alpine:3.20
 
 LABEL io.cursus.test-faults="true"
-RUN apk add --no-cache bash curl \
+RUN apk add --no-cache bash curl strace \
     && addgroup -g 1000 cursus \
     && adduser -D -u 1000 -G cursus cursus \
     && mkdir -p /run/cursus-e2e-faults \
