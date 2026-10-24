@@ -206,10 +206,11 @@ to full replay. A lost/corrupt/unsupported index changes recovery work, not stat
 The 32 MiB cache limit remains an explicit fallback boundary. Transaction evidence
 cost is proportional to retained transactions, not discarded ordinary revisions.
 
-No retention or large-record functionality is duplicated. The large-record issue
-is closed; retention issue #292 remains open. Only the already merged durable
-broker-time implementation (PR #300, commit `2260df1`) is a prerequisite. No
-unmerged retention follow-up or its remaining acceptance evidence is assumed.
+No retention or large-record functionality is duplicated. The large-record and
+retention issues are both closed as of 2026-10-24; closure alone is not evidence
+that a particular follow-up implementation was merged. Only the already merged
+durable broker-time implementation (PR #300, commit `2260df1`) is a prerequisite.
+No unverified retention follow-up or its acceptance evidence is assumed.
 
 Removing historical revisions necessarily removes the ability to diagnose
 conflicts with those discarded revisions later. Activation accepts that
