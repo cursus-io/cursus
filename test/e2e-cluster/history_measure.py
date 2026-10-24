@@ -65,6 +65,16 @@ def sample():
         data['container_read_bytes'], data['container_write_bytes'] = reads, writes
     if (cgroup / 'memory.peak').exists():
         data['container_peak_memory_bytes'] = int((cgroup / 'memory.peak').read_text())
+    # Interface counters include replication/control traffic and monitoring;
+    # they are distinct from application recovery payload-byte counters.
+    received = transmitted = 0
+    for line in Path('/proc/net/dev').read_text().splitlines()[2:]:
+        interface, values = line.split(':', 1)
+        if interface.strip() != 'lo':
+            fields = values.split()
+            received += int(fields[0])
+            transmitted += int(fields[8])
+    data['network_received_bytes'], data['network_transmitted_bytes'] = received, transmitted
     pid = broker_pid()
     if pid:
         fields = (pid / 'stat').read_text().split()
@@ -79,6 +89,10 @@ def sample():
             for line in response.read().decode().splitlines():
                 if line.startswith('go_memstats_heap_alloc_bytes '):
                     data['heap_bytes'] = int(float(line.split()[1]))
+                elif line.startswith('go_memstats_alloc_bytes_total '):
+                    data['allocated_bytes_total'] = int(float(line.split()[1]))
+                elif line.startswith('go_memstats_mallocs_total '):
+                    data['allocations_total'] = int(float(line.split()[1]))
     except (OSError, ValueError):
         pass
     return data

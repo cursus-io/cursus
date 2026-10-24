@@ -547,6 +547,9 @@ rows. Existing historical commit comparisons above remain a different experiment
 The test-only image traces fsync/fdatasync with strace's seccomp BPF filter and samples the broker's `/proc` CPU,
 RSS and I/O counters and exported Go heap. Physical `read_bytes`/`write_bytes`
 are distinct from logical rchar/wchar, replay payload bytes and transfer metrics.
+Go's cumulative allocated bytes/allocation counts and non-loopback container
+interface bytes are recorded too. Interface totals include control/replication
+and monitoring traffic; they are not recovery payload bytes.
 Heap and temporary/store space peaks are sampled at 1 s, not exact maxima.
 Tracing/sampling overhead remains in wall time; tracer/helper CPU and writes are
 not counted as broker-process I/O. Per-file DONTNEED is advisory, restricted to
