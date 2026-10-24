@@ -97,17 +97,23 @@ type ConsumerMetadataRecord struct {
 // metrics. Failure is intentionally retained after startup so a corrupt log
 // cannot look like a healthy empty coordinator.
 type ConsumerMetadataRecoveryStatus struct {
-	Phase               string `json:"phase"`
-	Ready               bool   `json:"ready"`
-	Failure             string `json:"failure,omitempty"`
-	RestoredGroups      int    `json:"restored_groups"`
-	RestoredOffsets     int    `json:"restored_offsets"`
-	ReplayedRecords     int    `json:"replayed_records"`
-	RegistrationRecords int    `json:"registration_records"`
-	OffsetRecords       int    `json:"offset_records"`
-	LegacyRecords       int    `json:"legacy_records"`
-	OrphanRecords       int    `json:"orphan_records"`
-	CorruptRecords      int    `json:"corrupt_records"`
+	IndexHit                bool   `json:"index_hit"`
+	IndexReadBytes          int    `json:"index_read_bytes"`
+	IndexWriteBytes         int    `json:"index_write_bytes"`
+	IndexSourceRecords      int    `json:"index_source_records"`
+	IndexSourcePayloadBytes int    `json:"index_source_payload_bytes"`
+	IndexFailure            string `json:"index_failure,omitempty"`
+	Phase                   string `json:"phase"`
+	Ready                   bool   `json:"ready"`
+	Failure                 string `json:"failure,omitempty"`
+	RestoredGroups          int    `json:"restored_groups"`
+	RestoredOffsets         int    `json:"restored_offsets"`
+	ReplayedRecords         int    `json:"replayed_records"`
+	RegistrationRecords     int    `json:"registration_records"`
+	OffsetRecords           int    `json:"offset_records"`
+	LegacyRecords           int    `json:"legacy_records"`
+	OrphanRecords           int    `json:"orphan_records"`
+	CorruptRecords          int    `json:"corrupt_records"`
 }
 
 type lifecycleCandidate struct {

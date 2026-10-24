@@ -265,6 +265,9 @@ func (ch *CommandHandler) validateConsumerRecoveryPlan(plan *consumerRecoveryPla
 // staged before the lease, reload mutex, lifecycle gates, and FSM fence.
 func (ch *CommandHandler) withConsumerRecoveryPlan(ctx context.Context, plan *consumerRecoveryPlan, target int, targetView *topic.PartitionReadView, fn func(*consumerRecoveryReader) error) error {
 	reader := &consumerRecoveryReader{ctx: ctx, views: make([]*topic.PartitionReadView, len(plan.metadata)), ends: make([]uint64, len(plan.metadata)), staged: plan.staged, metadata: plan.metadata}
+	if t := ch.TopicManager.GetTopic(config.ConsumerOffsetsTopicName); t != nil {
+		reader.indexTopicInstance = t.Definition().InstanceID
+	}
 	var visit func(int) error
 	visit = func(i int) error {
 		if err := ctx.Err(); err != nil {
