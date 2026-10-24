@@ -213,7 +213,15 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 		}
 	}
 	filtered := &historyPlanReader{ConsumerMetadataCommittedReader: source}
+	// Strict replay resumes after the last RETURNED record, which can precede
+	// the consumed page's end after filtering. Keep a separate scan cursor so
+	// removed trailing records are decoded only once in this pass. This reader
+	// belongs to this one sequential replay, never another preparation/retry.
+	scanned := make(map[int]uint64, count)
 	filtered.read = func(topic string, p int, next uint64, max int) ([]types.Message, error) {
+		if next < scanned[p] {
+			next = scanned[p]
+		}
 		// Empty filtered pages must not prematurely end replay.
 		for next < bounded.bounds[p].end {
 			messages, err := bounded.ReadTopicPartition(topic, p, next, max)
@@ -222,6 +230,7 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 				return messages, err
 			}
 			next = messages[len(messages)-1].Offset + 1
+			scanned[p] = next
 			out := make([]types.Message, 0, len(messages))
 			for _, m := range messages {
 				if p != partition || !remove[m.Offset] {

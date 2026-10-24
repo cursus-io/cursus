@@ -174,7 +174,11 @@ isolated Linux filesystem; the production reserve is not lowered to run them.
 
 The current certification deliberately replays all partitions twice and scans
 the raw committed records once **per candidate segment**. A filtered page can
-also cause repeated reads of records removed within that page. Scanning does
+end before its consumed source page: the sequential candidate reader retains
+the consumed position separately from the last returned offset, so removed
+trailing records are not read again within that pass. This cursor lives only
+inside one certification; an error or retry starts from the original bounds.
+It is not a durable checkpoint or an authority to skip validation. Scanning does
 not hold a live recovery lease; publication does and includes storage reads and
 fsync. Maintenance processes one segment per configured compaction interval with
 a one-minute attempt deadline. This bounds each attempt but does not prove that
@@ -323,6 +327,43 @@ and compaction without complete local metadata coverage remain separate acceptan
 conditions. Retaining necessary deleted-name fences
 or decisions is authoritative state growth, and is not bounded by live-group
 count alone. Do not close the history-growth issue based only on these results.
+
+## Sequential certification reads (2026-10-24)
+
+The follow-up baseline is official main `9c43d39`, which includes both recovery
+index and ordinary history compaction. Kafka comparison was checked again
+against the **4.1.0 release commit**
+[`13f70256db3c994c590e5d262a7cc50b9e973204`](https://github.com/apache/kafka/tree/13f70256db3c994c590e5d262a7cc50b9e973204).
+Its [LogCleaner](https://github.com/apache/kafka/blob/13f70256db3c994c590e5d262a7cc50b9e973204/storage/src/main/java/org/apache/kafka/storage/internals/log/LogCleaner.java)
+builds an offset map before rewriting segments, excludes the unstable tail,
+and retains producer continuity and transaction markers while needed. Adopt
+sequential progress through a fixed source view; retain Cursus's full state and
+physical-provenance comparison instead of replacing it with key-only cleaning.
+The accepted KIP remains a protocol design, not this implementation's persistent
+snapshot or deletion proof.
+
+Before changing the reader, a four-partition coordinator fixture (one populated
+group) with 100/1,000/10,000 offset revisions read 303/3,003/31,026 source records.
+The last case reread 1,023 filtered records. After separating source consumption
+from returned offsets, the counts are 303/3,003/30,003: one full committed scan,
+one raw scan and one filtered scan. These are decoded logical record counts,
+not physical I/O or startup timings. The fixture uses in-memory source pages;
+initial history construction is outside this comparison.
+
+Regression checks cover short pages of 1/3/17/1,024 records, existing offset
+gaps, retained producer witnesses between removed runs, an unchanged suffix,
+and a deadline failure in the candidate pass followed by a fresh retry. Exact
+offset recovery and the existing tombstone/epoch, reservation, cooperative
+ownership and source-generation rejection checks still apply. No on-disk format,
+activation gate, upgrade/downgrade rule or fallback behavior changes.
+
+This removes redundant page work, **not** the complete-history-per-segment
+algorithm. It does not establish a maintenance throughput bound, enable remote
+coverage, reclaim transaction history or measure cold broker startup/failover.
+In particular, transaction deletion must additionally preserve partition raw
+recovery's producer fences and unresolved boundaries; equality of coordinator
+state alone is insufficient. The distributed internal compaction guard remains
+in place.
 
 ## Verified cache-absent cluster restart
 
