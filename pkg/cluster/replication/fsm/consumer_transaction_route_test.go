@@ -84,6 +84,17 @@ func TestConsumerTransactionRouteRequiresOriginalAuthorityAndExactRecord(t *test
 	message := types.Message{Payload: string(payload), Key: key, ProducerID: producer, Epoch: epoch, TransactionalID: id, TransactionState: types.TransactionStateOpen}
 	command := types.MessageCommand{Topic: config.ConsumerOffsetsTopicName, ConsumerRoute: route, Messages: []types.Message{message}}
 	require.NoError(t, f.ValidateConsumerMetadataMessages(command))
+	historyRecord := record
+	historyRecord.Version = coordinator.ConsumerMetadataRecordVersionTransactionHistory
+	historyPayload, historyKey, err := coordinator.EncodeConsumerMetadataRecord(historyRecord)
+	require.NoError(t, err)
+	historyMessage := message
+	historyMessage.Payload, historyMessage.Key = string(historyPayload), historyKey
+	historyCommand := types.MessageCommand{Topic: config.ConsumerOffsetsTopicName, ConsumerRoute: route, Messages: []types.Message{historyMessage}}
+	require.ErrorIs(t, f.ValidateConsumerMetadataMessages(historyCommand), ErrPartitionCommitFenced)
+	f.consumerTransactionHistoryActivated = true
+	require.NoError(t, f.ValidateConsumerMetadataMessages(historyCommand))
+	f.consumerTransactionHistoryActivated = false
 	for _, mutation := range []string{"owner", "coordinator epoch", "producer epoch", "revision", "group", "offset", "ordinary"} {
 		t.Run(mutation, func(t *testing.T) {
 			copyRoute := *route

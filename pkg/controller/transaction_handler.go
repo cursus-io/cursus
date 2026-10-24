@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/transaction"
@@ -993,6 +994,9 @@ func (ch *CommandHandler) prepareTransactionOffsetRecords(tx *transaction.Transa
 	}
 	prepared := make([]preparedRecord, 0, len(records))
 	for _, record := range records {
+		if ch.consumerTransactionHistoryEnabled() {
+			record.Version = coordinator.ConsumerMetadataRecordVersionTransactionHistory
+		}
 		payload, key, encodeErr := coordinator.EncodeConsumerMetadataRecord(record)
 		if encodeErr != nil {
 			return nil, encodeErr
@@ -1018,6 +1022,7 @@ func (ch *CommandHandler) prepareTransactionOffsetRecords(tx *transaction.Transa
 		return nil, fmt.Errorf("transaction offset record set changed while preparing")
 	}
 	for i, record := range finalRecords {
+		record.Version = prepared[i].record.Version
 		payload, key, encodeErr := coordinator.EncodeConsumerMetadataRecord(record)
 		if encodeErr != nil {
 			return nil, encodeErr
@@ -1275,6 +1280,10 @@ func (ch *CommandHandler) appendTransactionMarkers(tx *transaction.Transaction, 
 			ControlBatchKey:              controlKey,
 			ControlBatchValue:            controlValue,
 		}
+		if partition.Topic == config.ConsumerOffsetsTopicName && tx.Mode == transaction.ModeProcessingV1 && ch.consumerTransactionHistoryEnabled() {
+			msg.ProducerID = fmt.Sprintf("txn-history:%s:%s", tx.ID, marker)
+			msg.SeqNum = uint64(coordinatorEpoch) // positive fenced coordinator epoch
+		}
 		if err := ch.publishTransactionMarker(partition.Topic, partition.Partition, msg); err != nil {
 			return err
 		}
@@ -1530,7 +1539,9 @@ func (ch *CommandHandler) validateTransactionMarkerPublish(tx *transaction.Trans
 	if msg.TransactionMarker != types.TransactionMarkerCommit && msg.TransactionMarker != types.TransactionMarkerAbort {
 		return fmt.Sprintf("ERROR: invalid_transaction_marker marker=%s", msg.TransactionMarker)
 	}
-	if msg.ProducerID != transactionMarkerProducerID(tx, msg.TransactionMarker) || msg.SeqNum != 1 {
+	historyMarker := topicName == config.ConsumerOffsetsTopicName && tx.Mode == transaction.ModeProcessingV1 && ch.consumerTransactionHistoryEnabled() &&
+		msg.ProducerID == fmt.Sprintf("txn-history:%s:%s", tx.ID, msg.TransactionMarker) && msg.SeqNum == uint64(expectedCoordinatorEpoch)
+	if !historyMarker && (msg.ProducerID != transactionMarkerProducerID(tx, msg.TransactionMarker) || msg.SeqNum != 1) {
 		return fmt.Sprintf("ERROR: invalid_transaction_marker_producer transactional_id=%s", tx.ID)
 	}
 	if msg.TransactionMarker == types.TransactionMarkerCommit && tx.State != transaction.StateCommitting && tx.State != transaction.StatePrepareCommit && tx.State != transaction.StateCommitted {
@@ -1701,4 +1712,8 @@ func (ch *CommandHandler) ensureTransactionCoordinator(txnID string) string {
 		return notCoordinatorResponse(coordAddr)
 	}
 	return ""
+}
+
+func (ch *CommandHandler) consumerTransactionHistoryEnabled() bool {
+	return ch.isDistributed() && ch.Cluster.RaftManager.GetFSM() != nil && ch.Cluster.RaftManager.GetFSM().ConsumerTransactionHistoryEnabled()
 }

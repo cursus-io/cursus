@@ -10,7 +10,7 @@ image:
 
 compatibility:
   wireProtocol: "2"
-  brokerProtocol: "11"
+  brokerProtocol: "12"
   snapshotFormat: "11"
   recordFormat: "CDM6"
 

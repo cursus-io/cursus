@@ -391,7 +391,7 @@ func (p *Partition) validateProducerMessageWithStage(msg *types.Message, staged 
 		return p.validateAgainstProducerState(msg, recovered.Epoch, recovered.Seq, true)
 	}
 
-	if msg.SeqNum != 1 {
+	if msg.SeqNum != 1 && !(p.topic == config.ConsumerOffsetsTopicName && types.IsEpochSequencedConsumerControl(*msg)) {
 		return false, fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
 	}
 
@@ -414,12 +414,12 @@ func (p *Partition) validateAgainstProducerState(msg *types.Message, lastEpoch i
 			metrics.SeqNumDuplicateTotal.WithLabelValues(p.topic, fmt.Sprintf("%d", p.id)).Inc()
 			return true, nil
 		}
-		if msg.SeqNum != lastSeq+1 {
+		if msg.SeqNum != lastSeq+1 && !(p.topic == config.ConsumerOffsetsTopicName && types.IsEpochSequencedConsumerControl(*msg)) {
 			return false, fmt.Errorf("idempotency gap for producer %s: expected %d, got %d", msg.ProducerID, lastSeq+1, msg.SeqNum)
 		}
 		return false, nil
 	}
-	if msg.SeqNum != 1 {
+	if msg.SeqNum != 1 && !(p.topic == config.ConsumerOffsetsTopicName && types.IsEpochSequencedConsumerControl(*msg)) {
 		return false, fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", msg.ProducerID, msg.SeqNum)
 	}
 	return false, nil

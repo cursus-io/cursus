@@ -69,7 +69,7 @@ func TestUpgradeRaftRecoveryFormatFromHistoryVersion(t *testing.T) {
 	require.NoError(t, upgradeRaftRecoveryFormat(directory))
 	data, err = os.ReadFile(marker)
 	require.NoError(t, err)
-	require.Equal(t, "14\n", string(data))
+	require.Equal(t, strconv.Itoa(raftFormatVersionCurrent)+"\n", string(data))
 }
 
 func TestEnsureRaftRecoveryFormatRejectsUnmarkedPersistedState(t *testing.T) {

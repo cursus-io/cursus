@@ -91,6 +91,8 @@ type Collector struct {
 	groupCommittedOffset            *prometheus.Desc
 	groupLag                        *prometheus.Desc
 	groupOffsetOutOfRange           *prometheus.Desc
+	consumerMetadataIndexHit        *prometheus.Desc
+	consumerMetadataIndexWork       *prometheus.Desc
 	consumerMetadataRecovery        *prometheus.Desc
 	consumerMetadataRestoredGroups  *prometheus.Desc
 	consumerMetadataRestoredOffsets *prometheus.Desc
@@ -189,6 +191,8 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		groupCommittedOffset:            prometheus.NewDesc("cursus_consumer_group_committed_offset", "Committed next offset for a consumer group partition.", []string{"group", "topic", "partition"}, nil),
 		groupLag:                        prometheus.NewDesc("cursus_consumer_group_lag", "Committed-reader lag, max(high watermark - committed next offset, 0).", []string{"group", "topic", "partition"}, nil),
 		groupOffsetOutOfRange:           prometheus.NewDesc("cursus_consumer_group_offset_out_of_range", "Whether a committed offset is outside the retained committed-readable range.", []string{"group", "topic", "partition"}, nil),
+		consumerMetadataIndexHit:        prometheus.NewDesc("cursus_consumer_metadata_index_hit", "Whether the last recovery used a validated current-state replay index.", nil, nil),
+		consumerMetadataIndexWork:       prometheus.NewDesc("cursus_consumer_metadata_index_work", "Actual index and source work during the last recovery; source bytes count keys and payloads, not physical I/O.", []string{"unit"}, nil),
 		consumerMetadataRecovery:        prometheus.NewDesc("cursus_consumer_metadata_recovery_ready", "Whether durable consumer metadata recovery completed without error.", []string{"phase"}, nil),
 		consumerMetadataRestoredGroups:  prometheus.NewDesc("cursus_consumer_metadata_restored_groups", "Consumer groups restored during startup.", nil, nil),
 		consumerMetadataRestoredOffsets: prometheus.NewDesc("cursus_consumer_metadata_restored_offsets", "Committed next-offset keys restored during startup.", nil, nil),
@@ -250,7 +254,7 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		c.groupLastRebalance, c.groupObservationFailures,
 		c.groupGeneration, c.groupAssignments, c.groupCommittedOffset,
 		c.groupLag, c.groupOffsetOutOfRange,
-		c.consumerMetadataRecovery, c.consumerMetadataRestoredGroups, c.consumerMetadataRestoredOffsets,
+		c.consumerMetadataIndexHit, c.consumerMetadataIndexWork, c.consumerMetadataRecovery, c.consumerMetadataRestoredGroups, c.consumerMetadataRestoredOffsets,
 		c.consumerMetadataReplayedRecords, c.consumerMetadataOrphanRecords, c.consumerMetadataCorruptRecords,
 		c.activeStreams, c.storageHandlers,
 		c.storageSegments, c.storageBytes, c.storageFilesystemFreeBytes, c.storageFilesystemTotalBytes,
@@ -320,6 +324,10 @@ func (c *Collector) sample(ctx context.Context) ([]prometheus.Metric, error) {
 			phase = "unknown"
 		}
 		ch(gauge(c.consumerMetadataRecovery, boolValue(status.Ready && status.Failure == ""), phase))
+		ch(gauge(c.consumerMetadataIndexHit, boolValue(status.IndexHit)))
+		for unit, value := range map[string]int{"transaction_checks": status.IndexTransactionChecks, "read_bytes": status.IndexReadBytes, "write_bytes": status.IndexWriteBytes, "source_records": status.IndexSourceRecords, "source_payload_bytes": status.IndexSourcePayloadBytes} {
+			ch(gauge(c.consumerMetadataIndexWork, float64(value), unit))
+		}
 		ch(gauge(c.consumerMetadataRestoredGroups, float64(status.RestoredGroups)))
 		ch(gauge(c.consumerMetadataRestoredOffsets, float64(status.RestoredOffsets)))
 		ch(gauge(c.consumerMetadataReplayedRecords, float64(status.ReplayedRecords)))

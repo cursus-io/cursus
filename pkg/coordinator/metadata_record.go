@@ -20,9 +20,12 @@ const (
 	ConsumerMetadataRecordVersion              = 1
 	ConsumerMetadataRecordVersionSubscriptions = 2
 	ConsumerMetadataRecordVersionTransactions  = 3
-	ConsumerMetadataRecordVersionLifecycle     = 4
-	ConsumerMetadataRecordVersionReservations  = 5
-	ConsumerMetadataRecordVersionCooperative   = 6
+	// Version 7 is emitted only after durable transaction-history activation.
+	// Its epochs obey processing initialization's materialization/release fence.
+	ConsumerMetadataRecordVersionTransactionHistory = 7
+	ConsumerMetadataRecordVersionLifecycle          = 4
+	ConsumerMetadataRecordVersionReservations       = 5
+	ConsumerMetadataRecordVersionCooperative        = 6
 
 	ConsumerMetadataRecordRegistration                = "group_registration"
 	ConsumerMetadataRecordOffsetSnapshot              = "offset_snapshot"
@@ -97,6 +100,7 @@ type ConsumerMetadataRecord struct {
 // metrics. Failure is intentionally retained after startup so a corrupt log
 // cannot look like a healthy empty coordinator.
 type ConsumerMetadataRecoveryStatus struct {
+	IndexTransactionChecks  int    `json:"index_transaction_checks"`
 	IndexHit                bool   `json:"index_hit"`
 	IndexReadBytes          int    `json:"index_read_bytes"`
 	IndexWriteBytes         int    `json:"index_write_bytes"`
@@ -321,7 +325,7 @@ func canonicalOffsetItems(offsets []OffsetItem) []OffsetItem {
 }
 
 func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
-	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionLifecycle && record.Version != ConsumerMetadataRecordVersionReservations && record.Version != ConsumerMetadataRecordVersionCooperative {
+	if record.Version != ConsumerMetadataRecordVersion && record.Version != ConsumerMetadataRecordVersionSubscriptions && record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionTransactionHistory && record.Version != ConsumerMetadataRecordVersionLifecycle && record.Version != ConsumerMetadataRecordVersionReservations && record.Version != ConsumerMetadataRecordVersionCooperative {
 		return fmt.Errorf("unsupported consumer metadata record version %d", record.Version)
 	}
 	if record.Group == "" || record.Epoch == 0 {
@@ -349,8 +353,8 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 	if record.Version == ConsumerMetadataRecordVersionReservations || len(record.Reservations) != 0 || len(record.ReservationDecisions) != 0 {
 		return fmt.Errorf("reservation metadata requires an offset reservations snapshot")
 	}
-	if record.Version == ConsumerMetadataRecordVersionTransactions && record.Type != ConsumerMetadataRecordTransactionalOffsetSnapshot {
-		return fmt.Errorf("consumer metadata version 3 requires a transactional offset snapshot")
+	if (record.Version == ConsumerMetadataRecordVersionTransactions || record.Version == ConsumerMetadataRecordVersionTransactionHistory) && record.Type != ConsumerMetadataRecordTransactionalOffsetSnapshot {
+		return fmt.Errorf("consumer metadata version %d requires a transactional offset snapshot", record.Version)
 	}
 	if record.Version == ConsumerMetadataRecordVersionLifecycle && record.Type != ConsumerMetadataRecordLifecycleSnapshot {
 		return fmt.Errorf("consumer metadata version 4 requires a lifecycle snapshot")
@@ -399,11 +403,14 @@ func validateConsumerMetadataRecord(record ConsumerMetadataRecord) error {
 			return fmt.Errorf("ordinary offset snapshot contains transaction fields")
 		}
 	case ConsumerMetadataRecordTransactionalOffsetSnapshot:
-		if record.Version != ConsumerMetadataRecordVersionTransactions || record.Topic == "" || record.Revision == 0 || len(record.Offsets) == 0 {
+		if (record.Version != ConsumerMetadataRecordVersionTransactions && record.Version != ConsumerMetadataRecordVersionTransactionHistory) || record.Topic == "" || record.Revision == 0 || len(record.Offsets) == 0 {
 			return fmt.Errorf("transactional offset snapshot is missing version, topic, revision, or offsets")
 		}
 		if record.TransactionalID == "" || record.ProducerID == "" || record.CoordinatorEpoch < 0 {
 			return fmt.Errorf("transactional offset snapshot is missing transaction identity")
+		}
+		if record.Version == ConsumerMetadataRecordVersionTransactionHistory && (record.CoordinatorEpoch == 0 || record.ProducerEpoch < 0) {
+			return fmt.Errorf("transaction history requires a positive coordinator epoch and nonnegative producer epoch")
 		}
 		if record.PartitionCount != 0 || len(record.InitialOffsets) != 0 {
 			return fmt.Errorf("transactional offset snapshot contains registration fields")
