@@ -70,6 +70,8 @@ func cloneConsumerRecoveryMetadata(metadata []fsm.PartitionMetadata) []fsm.Parti
 	return copy
 }
 
+// prepareConsumerRecoveryPlan chooses immutable local or detached sources for
+// the complete metadata cut. Legacy proof cannot authorize a remote substitute.
 func (ch *CommandHandler) prepareConsumerRecoveryPlan(ctx context.Context, metadata []fsm.PartitionMetadata, skip int, legacy bool) (*consumerRecoveryPlan, error) {
 	plan := &consumerRecoveryPlan{generation: ch.Coordinator.ConsumerRecoveryRequirement().RequiredGeneration, metadata: cloneConsumerRecoveryMetadata(metadata), local: make([]*topic.Partition, len(metadata)), ends: make([]uint64, len(metadata)), legacy: legacy}
 	if ch.TopicManager == nil || ch.Cluster.Router == nil {

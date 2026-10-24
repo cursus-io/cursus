@@ -34,6 +34,8 @@ func validateConsumerRoutingBrokers(brokers map[string]*BrokerInfo) error {
 	return nil
 }
 
+// applyConsumerRoutingActivation rechecks the complete registered process set
+// for new commands while retaining the replay contract of historical commands.
 func (f *BrokerFSM) applyConsumerRoutingActivation(data string) interface{} {
 	var command ConsumerRoutingActivation
 	if err := json.Unmarshal([]byte(data), &command); err != nil {

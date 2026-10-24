@@ -17,6 +17,8 @@ import (
 
 var ErrConsumerRecoveryPending = errors.New("consumer metadata local recovery pending")
 
+// legacyConsumerRecoveryRequired selects compatibility only for unknown proof;
+// other eligibility failures must never become permission for legacy fallback.
 func (ch *CommandHandler) legacyConsumerRecoveryRequired() bool {
 	return ch.Coordinator != nil && errors.Is(ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
 }
@@ -85,6 +87,9 @@ func (ch *CommandHandler) RecoverDistributedConsumerMetadata(ctx context.Context
 	return ch.recoverDistributedConsumerMetadata(ctx, false)
 }
 
+// recoverDistributedConsumerMetadata prepares sources before admission drains,
+// then certifies and publishes state/ownership under the final FSM fence.
+// ownershipChange allows a new owned cut after startup has already completed.
 func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context, ownershipChange bool) error {
 	if ch == nil || ch.Coordinator == nil || ch.Cluster == nil || ch.Cluster.RaftManager == nil || ch.Cluster.RaftManager.GetFSM() == nil {
 		return fmt.Errorf("consumer metadata recovery dependencies unavailable")

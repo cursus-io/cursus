@@ -6,6 +6,7 @@ import (
 	"reflect"
 )
 
+// validateLegacyCommittedProjection checks the mixed snapshot against replay.
 // A mixed legacy snapshot is a valid seed for Raft-only state, but a modern
 // acknowledged revision cannot be silently discarded or carried beyond the
 // certified committed log cut. Later lifecycle epochs/deletions supersede it.

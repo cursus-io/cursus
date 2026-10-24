@@ -35,6 +35,8 @@ func awaitRecoveryRuntime(ctx context.Context, ready <-chan struct{}) bool {
 	}
 }
 
+// localRegistrationCurrent compares the installed process with its latest
+// capability/readiness report, including readiness revocation during restore.
 func localRegistrationCurrent(sd clusterController.ServiceDiscovery, state *fsm.BrokerFSM) bool {
 	provider, ok := sd.(clusterController.LocalRegistrationProvider)
 	if !ok || state == nil {

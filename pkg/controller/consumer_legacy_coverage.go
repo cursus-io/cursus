@@ -2,6 +2,7 @@ package controller
 
 import "fmt"
 
+// ValidateFullCommittedCoverage certifies all physical sources in held views.
 // Unknown source provenance requires ALL physical partitions. An existing
 // snapshot may seed compatibility replay, but cannot certify a discarded prefix
 // or hole. Until such inputs have independently verifiable coverage, reject

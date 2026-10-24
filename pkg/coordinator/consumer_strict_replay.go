@@ -121,10 +121,15 @@ func (c *Coordinator) captureConsumerMetadataReplayStamp() (consumerMetadataRepl
 	return c.captureConsumerMetadataReplayStampForStartup(false)
 }
 
+// captureConsumerMetadataReplayStampForStartup keeps uncertified legacy replay
+// restricted to pending startup or restore generations.
 func (c *Coordinator) captureConsumerMetadataReplayStampForStartup(legacy bool) (consumerMetadataReplayStamp, error) {
 	return c.captureConsumerMetadataReplayStampForRecovery(legacy, false)
 }
 
+// captureConsumerMetadataReplayStampForRecovery binds preparation to the active
+// lease and authority/restore generations. Fenced legacy replay additionally
+// requires full coverage certification before its prepared state can be used.
 func (c *Coordinator) captureConsumerMetadataReplayStampForRecovery(legacy, fenced bool) (consumerMetadataReplayStamp, error) {
 	if c == nil || c.standalone {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataRecoveryStandalone
@@ -154,6 +159,8 @@ func (c *Coordinator) captureConsumerMetadataReplayStampForRecovery(legacy, fenc
 	return consumerMetadataReplayStamp{lease: g.lease, generation: c.stateImportGeneration, revision: c.authorityRevision, required: g.requiredGeneration, legacyStartup: legacy, legacyFenced: fenced}, nil
 }
 
+// validateConsumerMetadataReplayStamp rejects preparation invalidated by lease,
+// restore, authority or recovery-requirement changes.
 func (c *Coordinator) validateConsumerMetadataReplayStamp(stamp consumerMetadataReplayStamp) error {
 	current, err := c.captureConsumerMetadataReplayStampForRecovery(stamp.legacyStartup, stamp.legacyFenced)
 	if err != nil {
@@ -360,6 +367,9 @@ func (c *Coordinator) prepareConsumerMetadataReplay(reader ConsumerMetadataCommi
 	return c.prepareConsumerMetadataReplayIndexed(reader, scope, stamp, true)
 }
 
+// prepareConsumerMetadataReplayIndexed builds detached state from the selected
+// authority without publishing it. Only known full replay can use a derived
+// index; certified legacy replay validates its mixed snapshot against full logs.
 func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetadataCommittedReader, scope *ConsumerMetadataScope, stamp consumerMetadataReplayStamp, loadIndex bool) (*PreparedConsumerMetadataReplay, error) {
 	if err := c.validateConsumerMetadataReplayStamp(stamp); err != nil {
 		return nil, err
@@ -530,6 +540,8 @@ func (c *Coordinator) ApplyFullConsumerMetadataReplayAndComplete(p *PreparedCons
 	return c.applyConsumerMetadataReplay(p, false, true)
 }
 
+// applyConsumerMetadataReplay validates the single-use preparation and held
+// coverage before publishing state, optionally completing the recovery gate.
 func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataReplay, scoped, complete bool) error {
 	if c == nil || c.standalone {
 		return ErrConsumerMetadataRecoveryStandalone

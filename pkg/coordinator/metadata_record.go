@@ -796,10 +796,14 @@ func (c *Coordinator) recoverConsumerMetadataWithOptions(reader OffsetLogReader,
 	return c.recoverConsumerMetadataWithPolicy(reader, strict, false)
 }
 
+// recoverConsumerMetadataWithPolicy preserves ordinary replay semantics without
+// treating a live overlay as a certified legacy recovery seed.
 func (c *Coordinator) recoverConsumerMetadataWithPolicy(reader OffsetLogReader, strict, preserveSessionClocks bool) (ConsumerMetadataRecoveryStatus, error) {
 	return c.recoverConsumerMetadataWithValidation(reader, strict, preserveSessionClocks, false)
 }
 
+// recoverConsumerMetadataWithValidation materializes committed candidates before
+// publication. Legacy overlay validation is used only on detached strict replay.
 func (c *Coordinator) recoverConsumerMetadataWithValidation(reader OffsetLogReader, strict, preserveSessionClocks, validateLegacyOverlay bool) (ConsumerMetadataRecoveryStatus, error) {
 	const batchSize = 1024
 	status := ConsumerMetadataRecoveryStatus{Phase: "consumer_metadata_scan"}

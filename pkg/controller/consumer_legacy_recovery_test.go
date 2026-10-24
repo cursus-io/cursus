@@ -47,6 +47,8 @@ func TestLegacyRecoveryAcrossRoutingActivation(t *testing.T) {
 	require.Nil(t, state.Apply(&raft.Log{Data: []byte(`CONSUMER_ROUTING_ACTIVATE:{"voters":["local"]}`)}))
 	require.True(t, state.ConsumerMetadataRoutingEnabled())
 	require.False(t, h.consumerOwnershipRecovered(0, m.LeaderEpoch))
+	require.ErrorIs(t, h.ensureGroupRecovery(0, m.LeaderEpoch), coordinator.ErrConsumerMetadataRecovering)
+	require.Contains(t, h.HandleCommand("GROUP_STATUS group=legacy", NewClientContext("legacy", 0)), "consumer_metadata_recovering")
 	require.NoError(t, h.refreshLocalGroupRecovery())
 	require.True(t, h.consumerOwnershipRecovered(0, m.LeaderEpoch))
 	require.Equal(t, before, c.ExportState(), "ownership recovery must preserve offsets and group state")
