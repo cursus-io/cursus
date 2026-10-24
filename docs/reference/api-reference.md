@@ -134,6 +134,37 @@ ERROR: truncate_topic_failed topic=<name> reason="..."
 
 Do not emulate truncation with `DELETE` plus `CREATE`: deletion changes topic identity and does not provide lifecycle-epoch fencing.
 
+Legacy `TRUNCATE` conflicts on the old revision after completed success. Its
+revision-only guard cannot distinguish a deleted/recreated same-name topic
+whose revision happens to match. The Go SDK does not automatically retry an
+ambiguous legacy response. Do not fetch a fresh revision to resolve an unknown
+outcome; use the instance-bound command when retry or recreation fencing is needed.
+
+### TRUNCATE_INSTANCE
+
+```text
+TRUNCATE_INSTANCE topic=<name> expected_revision=<N> expected_instance=<instance_id>
+OK topic=<name> truncated=true revision=<N+1> lifecycle_epoch=<E+1> leo=0 hwm=0 instance_id=<id> [replayed=true] [cleanup_pending=true]
+```
+
+Wire command 61 is admin-only and has the same internal-topic, active/shared/
+pattern group, unresolved reservation and transaction protections as TRUNCATE.
+Persist the instance/revision pair from CREATE, DESCRIBE or an explicit admin
+update before submission. The first call requires a matching pair; a retry
+requires a durable receipt for that exact pair. Other instances and unproven
+old revisions return `topic_revision_conflict` without mutation. Invalid or
+missing instance syntax returns `invalid_expected_instance`; an unsupported
+cluster returns `truncate_receipt_unsupported`. There is no legacy fallback.
+
+The receipt survives restart, Raft replay and snapshots until a later definition
+revision invalidates it. A replay preserves new records, groups, offsets and
+transaction/event state. Its zero LEO/HWM are the historical reset result,
+not current offsets. `cleanup_pending` describes the responding broker only;
+neither its absence nor `replayed=true` certifies materialization on all replicas.
+Inspect per-broker readiness, topic/replica materialization and ISR before resuming
+dependent traffic. See the [acceptance matrix](../core/truncate-acceptance-audit.md)
+and [upgrade runbook](../operations/upgrade-and-recovery.md).
+
 ### LIST
 
 ```text
@@ -194,7 +225,7 @@ Transaction metadata fields are not accepted on client `PUBLISH`; use the transa
 
 `acks` belongs to the publish request or publisher configuration; it is not topic metadata. For `acks=1` or `acks=all`, success is a JSON ack response with `status:"OK"`. `acks=0` emits no external response frame. `acks=1` responds after the leader's durable local append while bounded ordered follower replication continues; a leader failure before commit can lose the record. `acks=all` and `acks=-1` are aliases: the broker first requires the current ISR to meet the topic-effective minimum, then waits for the captured ISR and lifecycle-fenced committed HWM. Read-committed consumers remain bounded by committed HWM. Non-ISR failures do not delay the success response.
 
-`PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed recovery writes snapshot version 10 and accepts version 9 only for its supported one-way recovery transition; older persistent state requires a full clean bootstrap.
+`PUBLISH` may include `partition=<N>` to target a partition explicitly; otherwise the topic partition policy selects the partition. Idempotent publish uses `(producerId, epoch, seqNum)` per partition: each new `(producerId, epoch)` sequence starts at `seqNum=1`, higher epochs fence older producer sessions, lower epochs are rejected as stale, and `seqNum=0` disables dedup for that message. Distributed recovery writes snapshot version 11 or conditional cooperative version 12; legacy snapshots are accepted only through the supported one-way recovery path. The local Raft marker is version 13. See the [upgrade runbook](../operations/upgrade-and-recovery.md) before restoring older persistent state.
 
 The effective minimum is the topic `min_in_sync_replicas` override when present and broker `min_insync_replicas` otherwise. Standalone has one replica, so `1`, `all`, and `-1` share the local durable-append completion point when the effective minimum is 1; `all`/`-1` reject when it is greater than 1. Idempotent publishers must use `all` or `-1`; `0` and `1` fail before append or sequence mutation.
 
@@ -532,7 +563,7 @@ ERROR: distribution_not_enabled
 
 `topic_materialization_pending` and `replica_materialization_pending` distinguish metadata that has not materialized locally from topology-only under-replication. `healthy=true` requires every defined partition to have its exact distinct replica count on active brokers, an active assigned leader, a full active ISR that satisfies the effective minimum, no recovery marker, and no pending local materialization.
 
-When topic cleanup is pending, `topic_materialization_issues` identifies the local topic, operation, pending time, error and (for truncate) revision/lifecycle epoch. Its optional `consumer_cleanup` entry reports group/epoch, committed scan boundary, cursor, decoded records, serialized bytes, page attempts and retry reason. The list is omitted when empty; counts and details describe this broker, not an acknowledgement from every replica. A committed administrative response does not imply that this list is empty. Read failures and records larger than the 1 MiB cleanup budget remain pending. These bounded cleanup counters exclude the existing full startup, ownership and administrative-admission replay paths; distributed internal consumer metadata compaction is currently disabled.
+When topic cleanup is pending, `topic_materialization_issues` identifies the local topic, operation, pending time, error and (for truncate) revision/lifecycle epoch. Its optional `consumer_cleanup` entry reports group/epoch, committed scan boundary, cursor, decoded records, serialized bytes, page attempts and retry reason. The list is omitted when empty; counts and details describe this broker, not an acknowledgement from every replica. A committed administrative response does not imply that this list is empty. Read failures remain pending. An intact first record exceeding the ordinary 1 MiB turn budget can progress under an exclusive reservation up to the durable format limit; malformed or over-limit records still fail closed. These counters do not describe all startup, ownership or administrative-admission replay work. Generic distributed internal-topic compaction remains disabled; separate default-off certified history compaction is supported. See [large-record progress](../core/cleanup-record-progress.md) and [history compaction](../consumer-history-compaction.md) for costs and activation requirements.
 
 Common errors are `ERROR: distribution_required command=CLUSTER_STATUS`, `ERROR: fsm_not_available command=CLUSTER_STATUS`, and `ERROR: marshal_cluster_status_failed reason="..."`.
 

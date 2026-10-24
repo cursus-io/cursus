@@ -10,7 +10,7 @@
 | Event snapshot catalog | v2 (CRC32C) | legacy snapshot files remain readable beside v2 | Preserve both snapshot files until a clean bootstrap removes the legacy boundary. |
 | Consumer metadata records | 5 | versions 1-4 remain replayable | Upgrade readers before writing offset-reservation records. |
 | Consumer history compaction | lifecycle protocol 10, local Raft marker 13 | marker 12 can be replayed and upgraded before capability advertisement; old binaries reject marker 13 | Coordinated upgrade only; durable activation requires all registered brokers and voters. See [consumer history operations](../consumer-history-compaction.md). Disabling maintenance does not permit downgrade. |
-| Raft FSM snapshot | 11 | versions 9/10 are accepted only for the supported one-way recovery transition | Older formats require a clean bootstrap; never downgrade a volume after writing version 11. |
+| Raft FSM snapshot | 11, or 12 when cooperative ownership is present | supported legacy snapshots are accepted only through the one-way recovery path | Snapshot version is distinct from local Raft marker 13. Never downgrade written volumes; restore complete compatible backups into isolated storage. |
 | Instance-bound truncate | broker lifecycle protocol 7, Wire command 61 | legacy TRUNCATE keeps its conflict contract | Upgrade all brokers before binding identities or using durable retries. |
 | Truncate consumer cleanup boundary | broker lifecycle protocol 8, optional snapshot-11 evidence | omitted while any registered broker advertises an older capability | Upgrade every registered broker, including offline members, before relying on snapshot-persistent cleanup ordering. See [truncate registration recovery](../truncate-registration-recovery.md). |
 | Replica-gap recovery control state | broker lifecycle protocol 6 | An older active broker blocks a new quarantine transition and cannot register while a durable recovery marker exists | Complete the rolling upgrade before relying on automatic gap quarantine and proof-based ISR re-admission. |
@@ -31,6 +31,13 @@ barrier. Keep a pending standalone manifest, journal and epoch marker together;
 restart resumes the committed cleanup. Do not remove the manifest or manually
 advance the marker. See the [verification ledger](../core/truncate-contract-recovery.md)
 for tested crash boundaries, costs and remaining acceptance checks.
+
+If a post-truncate snapshot predates persisted consumer cleanup boundaries,
+the current HWM cannot reconstruct the missing historical cut. Retain the
+authoritative Raft history containing the truncate and preceding state, or a
+snapshot that actually contains the cut. Without either, cleanup must remain
+pending. A binary replacement alone is not proof that such an incident will
+recover. See the [current acceptance audit](../core/truncate-acceptance-audit.md).
 
 CDM5 checksums cover every serialized authoritative field, including topic,
 partition, offset, producer and transaction metadata, event identity, and

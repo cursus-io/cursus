@@ -1,0 +1,465 @@
+{
+  "source": "9c43d398eecc387ae0011bb7900b54a74a0b0d8d",
+  "test": "TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot",
+  "wall_seconds_including_setup_teardown": 357.43,
+  "environment": "Docker Linux brokers; Windows Go 1.25.0 harness; warm caches; concurrent host work",
+  "counter_scope": "Absolute per-process counters sampled at phase end, not cross-restart deltas. Sync counters are instrumented boundaries, not complete fsync syscall counts. Logical bytes are not physical device IO. Heap is a point sample, not peak.",
+  "metrics": [
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 2051.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 1.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 3.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 4.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"catchup_rpc\",unit=\"transfer_bytes\"}",
+      "value": 4270.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"lineage\",unit=\"cache_misses\"}",
+      "value": 3.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"lineage\",unit=\"canonical_hash_bytes\"}",
+      "value": 5104.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"lineage\",unit=\"decoded_frames\"}",
+      "value": 28.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"lineage\",unit=\"read_bytes\"}",
+      "value": 58638.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"lineage\",unit=\"sync_calls\"}",
+      "value": 450.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"lineage\",unit=\"write_bytes\"}",
+      "value": 2552.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_page\",unit=\"cache_misses\"}",
+      "value": 3.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_page\",unit=\"decoded_bytes\"}",
+      "value": 543.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_page\",unit=\"decoded_frames\"}",
+      "value": 3.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_page\",unit=\"read_bytes\"}",
+      "value": 555.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_page\",unit=\"sync_calls\"}",
+      "value": 3.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 12.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 4096.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 473756760.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 1,
+      "metric": "process_cpu_seconds_total",
+      "value": 9.05
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 2436.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 1.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 4.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 5.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 12.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 4096.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 455666408.0
+    },
+    {
+      "phase": "after failover cleanup",
+      "node": 2,
+      "metric": "process_cpu_seconds_total",
+      "value": 6.52
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 70.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 13916.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 512726832.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 1,
+      "metric": "process_cpu_seconds_total",
+      "value": 1.26
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 70.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 13916.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 509024992.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 2,
+      "metric": "process_cpu_seconds_total",
+      "value": 0.96
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 0.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 70.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 13916.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 508591600.0
+    },
+    {
+      "phase": "truncate snapshot restart",
+      "node": 3,
+      "metric": "process_cpu_seconds_total",
+      "value": 0.84
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 82.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 19334.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 758628648.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 1,
+      "metric": "process_cpu_seconds_total",
+      "value": 1.8
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 82.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 19334.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 756793256.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 2,
+      "metric": "process_cpu_seconds_total",
+      "value": 1.45
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_bytes_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_invalidations_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_reads_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "consumer_cleanup_replay_records_total",
+      "value": 0.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"decoded_frames\"}",
+      "value": 82.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "cursus_recovery_work_total{stage=\"retained_scan\",unit=\"read_bytes\"}",
+      "value": 19334.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "go_memstats_heap_alloc_bytes",
+      "value": 755840232.0
+    },
+    {
+      "phase": "delete snapshot restart",
+      "node": 3,
+      "metric": "process_cpu_seconds_total",
+      "value": 1.36
+    }
+  ]
+}

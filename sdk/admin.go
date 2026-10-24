@@ -235,9 +235,13 @@ func (c *AdminClient) TruncateTopicContext(ctx context.Context, topic string, op
 		return TruncateTopicResult{}, err
 	}
 	result, err := parseTruncateTopicResponse(response)
-	if err == nil && options.ExpectedInstance != "" && (result.InstanceID != options.ExpectedInstance ||
-		options.ExpectedRevision == ^uint64(0) || result.Revision != options.ExpectedRevision+1) {
-		return TruncateTopicResult{}, fmt.Errorf("truncate receipt does not match the requested instance/revision")
+	// The offsets describe the historical reset, including on receipt replay;
+	// fresh writes do not change them. Validate the complete success envelope
+	// before reporting an instance-bound destructive operation as acknowledged.
+	if err == nil && options.ExpectedInstance != "" && (result.Topic != topic || !result.Truncated ||
+		result.InstanceID != options.ExpectedInstance || options.ExpectedRevision == ^uint64(0) ||
+		result.Revision != options.ExpectedRevision+1 || result.LifecycleEpoch < 2 || result.LEO != 0 || result.HWM != 0) {
+		return TruncateTopicResult{}, fmt.Errorf("truncate receipt does not match the requested topic/instance/revision or reset result")
 	}
 	return result, err
 }

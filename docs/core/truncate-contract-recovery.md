@@ -1,5 +1,13 @@
 # Truncate contract and recovery verification
 
+> Historical execution ledger. For the current acceptance matrix, merged PRs,
+> source revision, compatibility limits and remaining work, read the
+> [2026-10-24 audit](truncate-acceptance-audit.md). In particular, #280 is merged,
+> #296 supports reserved oversized-record progress, #298 verifies committed
+> re-registration recovery, and #302 adds opt-in certified history compaction.
+> The observations below describe their original verification points, not
+> today's implementation backlog.
+
 ## Baseline and scope
 
 The audit starts at main `6b92842311150c5a8e5a991c3fc8beed5fa19d82` and the
@@ -245,7 +253,7 @@ evidence, changed committed cuts, later registration, generation/identity
 replacement and bounded retry progress. Those unit results are not labeled as
 three-broker fault-injection coverage.
 
-## Remaining acceptance follow-ups
+## Acceptance follow-ups at the original verification point
 
 - Keep #272 open for its complete three-broker invalid-evidence matrix and a
   later registration committed while a follower is validating an older deletion
@@ -264,5 +272,6 @@ three-broker fault-injection coverage.
   callers requiring a longer retry horizon need a separately designed operation
   history rather than refreshing the expected revision.
 
-These follow-ups prevent treating #164 as fully complete merely because the
-publication fence and opt-in retry contract are implemented.
+These were the follow-ups at the original verification point. Use the
+[current acceptance decision](truncate-acceptance-audit.md#remaining-issue-level-acceptance)
+before deciding whether #164 is complete; do not repeat superseded gaps.

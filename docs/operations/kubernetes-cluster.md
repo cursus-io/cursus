@@ -169,6 +169,28 @@ these contract values to bypass an incompatible image. `image.allowMutableTag`
 must be a YAML boolean; mutable tags are reserved for source-built validation.
 Neither the init container nor the broker needs a mounted Kubernetes API token.
 
+## Reconcile topic definitions without implicit destruction
+
+A topic omitted from a desired list must not trigger DELETE, either TRUNCATE
+command, or DELETE followed by CREATE. Treat reset as a separately approved,
+explicit administrative action. Producer and consumer clients must not perform
+it as part of reconciliation.
+
+Before submitting a reset, persist the broker's topic `instance_id` and
+definition `revision` with the action. Use Go admin `ExpectedInstance` and retry
+only that saved pair. Do not refresh it after a timeout. The receipt is retained
+only until another definition revision; a conflict or missing proof needs
+reconciliation of the outcome, not a new reset. Legacy revision-only TRUNCATE
+cannot fence same-name recreation.
+
+Record committed intent separately from completion on the responding broker
+and every replica. Check per-broker topic/replica materialization, readiness
+and ISR before resuming dependent traffic. Old snapshots missing a historical
+truncate cleanup cut cannot be repaired from current HWM. Preserve the evidence
+and follow the [upgrade/recovery runbook](upgrade-and-recovery.md); never clear
+shared offsets, edit PVC contents or weaken the admission fence to unblock it.
+See the [acceptance audit](../core/truncate-acceptance-audit.md) for current limits.
+
 ## Rotate internal credentials without losing quorum
 
 The token Secret may contain `token` (the active outbound credential) and `next-token` (an additional inbound credential). `cluster.internalAuthGeneration` is a non-secret label surfaced on Pods and by `CLUSTER_STATUS`. Rotate in three complete one-Pod-at-a-time passes, waiting for all three Pods to be Ready and checking `CLUSTER_STATUS` after every Pod:

@@ -150,7 +150,7 @@ Topic names are a portable on-disk identifier: 1-249 ASCII bytes containing only
 
 A missing topic is built from broker defaults and the supplied fields. For an existing topic, `CREATE` is a presence-aware patch: omitted fields retain their authoritative value, while explicit `0`, `false`, and empty `read_acl=`/`write_acl=` values are applied. Partition count can only increase. `replication_factor`, `idempotent`, and `event_sourcing` may be restated with the current value but cannot be changed. A no-op keeps the current `revision`; every effective definition change increments it.
 
-A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores the optional `min_in_sync_replicas` override; omission uses the broker `min_insync_replicas` fallback. Manifest format 3 carries lifecycle epochs after truncate. Distributed state writes Raft snapshot version 10 and requires every partition to carry `committed_hwm_version=1`, an explicit numeric `committed_hwm` (including zero), leader epoch, ISR, and lifecycle epoch.
+A successful standalone `CREATE` means the revisioned topic definition has been atomically replaced and synced in `{log_dir}/__topic_metadata.json` before the new policy or partition count is exposed to publishers. Broker restart restores the optional `min_in_sync_replicas` override; omission uses the broker `min_insync_replicas` fallback. Manifest format 4 carries topic identities, truncate receipts and lifecycle epochs (version 3 remains a legacy input). Distributed state writes Raft snapshot version 11, or 12 when cooperative ownership is present, and requires every partition to carry `committed_hwm_version=1`, an explicit numeric `committed_hwm` (including zero), leader epoch, ISR, and lifecycle epoch.
 
 **ALTER_TOPIC_CONFIG**
 ```
@@ -206,6 +206,10 @@ the old revision returns `topic_revision_conflict`. A timeout is an unknown
 outcome; it is never permission to read a new revision and truncate again.
 The original same-revision retry requirement is provided by the instance-bound
 command below, not retroactively by legacy callers or old stored transitions.
+Legacy requests carry no instance identity and cannot distinguish same-name
+recreation when the revision is reused. Use the instance-bound command for that
+fence; retaining the definition during a truncate does not supply this missing
+request identity.
 
 **TRUNCATE_INSTANCE** (Wire command ID 61)
 
@@ -244,9 +248,16 @@ the new command only when `TruncateTopicOptions.ExpectedInstance` is provided,
 and may retry an ambiguous response with the exact same pair. Existing callers
 remain source-compatible and retain the conservative legacy behavior.
 
-Topic manifests now write version 4 and read version 3 without fabricating
-identities. Raft snapshots/format markers write version 11 and accept versions
-9/10 through the supported one-way recovery path. Perform a coordinated upgrade
+Topic manifests write version 4 and read version 3 without fabricating
+identities. Current Raft FSM snapshots write version 11 (12 when cooperative
+ownership state is present); the local Raft recovery marker is 13. Snapshot
+versions and directory markers are separate compatibility boundaries. The
+instance receipt was introduced at capability 7, and snapshot-persistent
+consumer cleanup cuts at capability 8; the current broker protocol is 10.
+An older post-truncate snapshot without a historical cleanup cut cannot recover
+that cut from today's HWM. Retained authoritative Raft history or a snapshot
+containing the cut is required; otherwise cleanup stays pending.
+Perform a coordinated upgrade
 of every broker and validate copied backups first; mixed-version rolling upgrades
 and downgrade after new-format writes are unsupported. Never clear live storage
 to resolve pending cleanup. See [upgrade and recovery](operations/upgrade-and-recovery.md)
@@ -639,7 +650,7 @@ missing, an entry is malformed, or the same partition appears more than once.
 
 Cursus exposes a broker-managed transaction coordinator for consume-process-produce workflows. In distributed mode, each `transactional_id` maps to a stable logical coordinator shard. `transaction_coordinator_shards` selects the count when a cluster is first created and defaults to 50. Raft metadata persists the immutable count plus each shard's owner and coordinator epoch; a broker with a different configured count is rejected before joining. Clients can discover the current owner with `FIND_COORDINATOR transactional_id=<id>` and must retry on `ERROR: NOT_COORDINATOR host=<host> port=<port>`.
 
-Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Snapshot version 10 requires explicit committed-HWM provenance for every partition. On restore, local data above the authoritative committed HWM is truncated before service, while an HWM above local LEO or missing provenance fails startup rather than guessing.
+Standalone brokers append coordinator snapshots to `<log_dir>/__transaction_state.journal` and fsync each accepted transition. One encoded journal snapshot is limited to 32 MiB. Recovery truncates a torn or checksum-corrupt final journal record, rejects non-tail corruption, restores the latest state for each transactional id, and retries durable `committing` work before the client listener becomes ready. Distributed brokers replicate the same snapshots through the Raft FSM as `TXN_SYNC`. Supported snapshot versions require explicit committed-HWM provenance for every partition; current writers use 11 or conditional cooperative version 12. On restore, local data above the authoritative committed HWM is truncated before service, while an HWM above local LEO or missing provenance fails startup rather than guessing.
 
 `INIT_PRODUCER_ID` selects the exactly-once processing path by default. The broker returns the authoritative `(producerId, epoch)` session and bumps `epoch` on re-initialization to fence older producers. Open transactions receive a deadline from `transaction_timeout_ms` (default 60000); the broker durably prepares and writes abort markers after timeout. After `transactional_id_expiration_ms`, completed transactions discard operation payloads but retain a compact epoch tombstone. Previously persisted legacy transactions remain readable and recoverable.
 
@@ -1052,7 +1063,7 @@ Set `isIdempotent=true` on PUBLISH or in binary batch header.
 - Broker tracks the last seen `(epoch, seqNum)` per `(producerId)` per partition
 - Disk-backed partitions persist producer sequence checkpoints, rebuild producer state from partition logs on broker restart, and use that state to make transactional commit recovery idempotent
 - Distributed FSM snapshots also include producer sequence state for replicated message commands
-- Distributed recovery writes FSM snapshot version 10 and accepts version 9 only for its supported one-way transition. Every partition includes explicit committed-HWM provenance; older persistent state requires a full clean bootstrap.
+- Distributed recovery writes FSM snapshot version 11 or conditional cooperative version 12. Legacy versions 9/10 are accepted only through the supported one-way recovery path. Every partition includes explicit committed-HWM provenance. The local Raft marker is separately versioned at 13; see the upgrade runbook before restoring older persistent state.
 - Producer state expires from memory after `producer_state_ttl_ms` of inactivity (default 30 minutes); durable checkpoints retain the last persisted sequence until the partition data is removed
 
 ---
