@@ -21,6 +21,11 @@ Mixed-version rolling upgrades across a format boundary are unsupported. A
 normal restart of the same compatible release is supported; a format-changing
 upgrade is a coordinated whole-cluster operation.
 
+For older consumer snapshots with unknown recovery authority, use the
+[legacy compatibility recovery contract](../consumer-legacy-compatibility-recovery.md).
+Recovery requires complete committed source coverage and preserves unknown
+authority. Routing capability alone does not establish recovery readiness.
+
 For an instance-bound truncate, save the CREATE response's `instance_id` and
 `revision` with the requested operation before sending it. Retry only that pair
 after a timeout or lost connection. `replayed=true` acknowledges the retained

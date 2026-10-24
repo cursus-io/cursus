@@ -330,7 +330,7 @@ func (ch *CommandHandler) ensureGroupRecovery(partition uint64, epoch int) error
 	if recovered {
 		return nil
 	}
-	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() || ch.legacyConsumerRecoveryRequired() {
 		// The monitor performs owned recovery outside ordinary admission. A
 		// request cannot drain the admission lease it is currently holding.
 		return ErrConsumerRecoveryPending
@@ -444,7 +444,7 @@ func (ch *CommandHandler) refreshLocalGroupRecoveryContext(ctx context.Context) 
 	if err := ch.consumerReadinessError(); err != nil {
 		return err
 	}
-	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() {
+	if ch.Cluster.RaftManager.GetFSM().ConsumerMetadataRoutingEnabled() || ch.legacyConsumerRecoveryRequired() {
 		epochs, err := ch.localGroupRecoveryEpochs()
 		if err != nil {
 			return err

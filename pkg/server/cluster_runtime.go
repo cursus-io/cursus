@@ -53,6 +53,7 @@ func localRegistrationCurrent(sd clusterController.ServiceDiscovery, state *fsm.
 	return actual != nil && actual.Status == "active" && actual.IncarnationID == wanted.IncarnationID &&
 		actual.Addr == wanted.Addr && actual.ClientAddr == wanted.ClientAddr &&
 		actual.RecoveryProtocol == wanted.RecoveryProtocol && actual.LifecycleProtocol == wanted.LifecycleProtocol &&
+		actual.ConsumerRoutingReady == wanted.ConsumerRoutingReady &&
 		state.TransactionCoordinatorShardCount() == shards
 }
 

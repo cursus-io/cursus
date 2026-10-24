@@ -7,6 +7,8 @@ import (
 
 type ConsumerRoutingActivation struct {
 	Voters []string `json:"voters"`
+	// Omitted only in historical commands, whose replay semantics are retained.
+	Processes []BootstrapProcessIdentity `json:"processes,omitempty"`
 }
 
 func (f *BrokerFSM) ConsumerMetadataRoutingEnabled() bool {
@@ -47,6 +49,19 @@ func (f *BrokerFSM) applyConsumerRoutingActivation(data string) interface{} {
 	}
 	if err := validateConsumerRoutingBrokers(f.brokers); err != nil {
 		return err
+	}
+	if command.Processes != nil {
+		if len(command.Processes) != len(f.brokers) {
+			return fmt.Errorf("consumer routing activation process set changed")
+		}
+		seen := make(map[string]bool, len(command.Processes))
+		for _, process := range command.Processes {
+			broker := f.brokers[process.BrokerID]
+			if seen[process.BrokerID] || broker == nil || broker.Status != "active" || !broker.ConsumerRoutingReady || broker.IncarnationID != process.IncarnationID || broker.IncarnationEpoch != process.IncarnationEpoch {
+				return fmt.Errorf("consumer routing activation recovery evidence changed")
+			}
+			seen[process.BrokerID] = true
+		}
 	}
 	seen := make(map[string]struct{}, len(command.Voters))
 	for _, id := range command.Voters {

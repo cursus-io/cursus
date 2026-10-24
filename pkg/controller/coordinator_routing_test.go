@@ -685,6 +685,9 @@ func TestDistributedOffsetCommandsMatchStrictRaftSchema(t *testing.T) {
 		RaftManager: raftManager,
 		Router:      router,
 	})
+	// The standalone fixture has already loaded its state; model completed
+	// startup ownership instead of asking request admission to perform recovery.
+	require.NoError(t, handler.CaptureGroupRecoveryOwnership())
 	writes := 0
 	groupCoordinator.SetOffsetRecordWriter(func(coordinator.ConsumerMetadataRecord) error {
 		writes++

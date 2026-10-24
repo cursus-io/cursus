@@ -51,6 +51,7 @@ type ConsumerMetadataScope struct {
 // PreparedConsumerMetadataReplay is single-use, detached, and bound to the
 // exclusive recovery lease and authority generation that prepared it.
 type PreparedConsumerMetadataReplay struct {
+	legacyCoverage  ConsumerMetadataFullCoverageReader
 	preserveClocks  map[string]bool
 	repairs         map[int]uint64
 	repairValidator ConsumerLogRepairValidator
@@ -65,6 +66,7 @@ type PreparedConsumerMetadataReplay struct {
 type consumerMetadataReplayStamp struct {
 	lease, generation, revision, required uint64
 	legacyStartup                         bool
+	legacyFenced                          bool
 }
 
 type metadataReadRange struct{ first, end uint64 }
@@ -120,6 +122,10 @@ func (c *Coordinator) captureConsumerMetadataReplayStamp() (consumerMetadataRepl
 }
 
 func (c *Coordinator) captureConsumerMetadataReplayStampForStartup(legacy bool) (consumerMetadataReplayStamp, error) {
+	return c.captureConsumerMetadataReplayStampForRecovery(legacy, false)
+}
+
+func (c *Coordinator) captureConsumerMetadataReplayStampForRecovery(legacy, fenced bool) (consumerMetadataReplayStamp, error) {
 	if c == nil || c.standalone {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataRecoveryStandalone
 	}
@@ -136,7 +142,7 @@ func (c *Coordinator) captureConsumerMetadataReplayStampForStartup(legacy bool) 
 	if !g.owned {
 		return consumerMetadataReplayStamp{}, fmt.Errorf("consumer metadata replay requires an active exclusive lease")
 	}
-	if legacy && ((!g.startupPending && g.requiredGeneration == g.completedGeneration) || g.restoreInstalling || g.restoreError != nil) {
+	if legacy && ((!fenced && !g.startupPending && g.requiredGeneration == g.completedGeneration) || g.restoreInstalling || g.restoreError != nil) {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataBootstrapUnknown
 	}
 	if legacy && c.raftCompatibilityKnown && c.metadataSourcesKnown && c.raftCompatibility != nil {
@@ -145,11 +151,11 @@ func (c *Coordinator) captureConsumerMetadataReplayStampForStartup(legacy bool) 
 	if !legacy && (!c.raftCompatibilityKnown || !c.metadataSourcesKnown || c.raftCompatibility == nil) {
 		return consumerMetadataReplayStamp{}, ErrConsumerMetadataBootstrapUnknown
 	}
-	return consumerMetadataReplayStamp{lease: g.lease, generation: c.stateImportGeneration, revision: c.authorityRevision, required: g.requiredGeneration, legacyStartup: legacy}, nil
+	return consumerMetadataReplayStamp{lease: g.lease, generation: c.stateImportGeneration, revision: c.authorityRevision, required: g.requiredGeneration, legacyStartup: legacy, legacyFenced: fenced}, nil
 }
 
 func (c *Coordinator) validateConsumerMetadataReplayStamp(stamp consumerMetadataReplayStamp) error {
-	current, err := c.captureConsumerMetadataReplayStampForStartup(stamp.legacyStartup)
+	current, err := c.captureConsumerMetadataReplayStampForRecovery(stamp.legacyStartup, stamp.legacyFenced)
 	if err != nil {
 		return err
 	}
@@ -410,8 +416,9 @@ func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetada
 	}
 	scratch.offsetTopic = c.offsetTopic
 	scratch.offsetTopicPartitionCount = count
-	// Unknown-authority snapshots retain the historical merge policy.
-	// Known authority always uses replacement replay from the Raft baseline.
+	// Certified legacy recovery uses strict replay with the existing mixed
+	// snapshot as a validated seed. It does not promote that seed to a known
+	// Raft baseline. Known authority uses its independent compatibility state.
 	var replayReader OffsetLogReader = bounded
 	var indexed *indexedMetadataReader
 	if !stamp.legacyStartup && scope == nil {
@@ -432,7 +439,7 @@ func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetada
 			}
 		}
 	}
-	status, err := scratch.recoverConsumerMetadataWithOptions(replayReader, !stamp.legacyStartup)
+	status, err := scratch.recoverConsumerMetadataWithValidation(replayReader, !stamp.legacyStartup || stamp.legacyFenced, false, stamp.legacyFenced)
 	if errors.Is(err, errConsumerReplayIndexFallback) || err != nil && indexed != nil && indexed.cached != nil {
 		full, fullErr := c.prepareConsumerMetadataReplayIndexed(reader, scope, stamp, false)
 		if full != nil && indexed != nil {
@@ -530,6 +537,14 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 	var publication ConsumerLogRepairPublication
 	if p == nil {
 		return fmt.Errorf("prepared replay is nil")
+	}
+	if p.stamp.legacyFenced {
+		if p.legacyCoverage == nil {
+			return ErrConsumerMetadataBootstrapUnknown
+		}
+		if err := p.legacyCoverage.ValidateFullCommittedCoverage(); err != nil {
+			return err
+		}
 	}
 	if !scoped && len(p.repairs) != 0 {
 		if err := c.validateConsumerMetadataReplayStamp(p.stamp); err != nil {

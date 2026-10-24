@@ -17,15 +17,40 @@ import (
 
 var ErrConsumerRecoveryPending = errors.New("consumer metadata local recovery pending")
 
+func (ch *CommandHandler) legacyConsumerRecoveryRequired() bool {
+	return ch.Coordinator != nil && errors.Is(ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
+}
+
+// ConsumerRoutingRecoveryReady advertises readiness for NEW strict routing
+// activation, not authority for destructive recovery. Legacy recovery can serve
+// requests without satisfying this stronger, deliberately conservative gate.
+func (ch *CommandHandler) ConsumerRoutingRecoveryReady() bool {
+	if ch == nil || ch.Coordinator == nil || ch.Coordinator.ConsumerRecoveryRequirement().Pending() ||
+		ch.Coordinator.ConsumerOperationsReadinessError() != nil || ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(0) != nil {
+		return false
+	}
+	epochs, err := ch.localGroupRecoveryEpochs()
+	if err != nil {
+		return false
+	}
+	for partition, epoch := range epochs {
+		if !ch.consumerOwnershipRecovered(partition, epoch) {
+			return false
+		}
+	}
+	return true
+}
+
 type consumerRecoveryReader struct {
-	measureReplay      bool
-	indexTopicInstance string
-	repairGenerations  map[int]disk.ContentGeneration
-	ctx                context.Context
-	views              []*topic.PartitionReadView
-	ends               []uint64
-	staged             StagedConsumerMetadataRecovery
-	metadata           []fsm.PartitionMetadata
+	legacyCoverageValidated bool
+	measureReplay           bool
+	indexTopicInstance      string
+	repairGenerations       map[int]disk.ContentGeneration
+	ctx                     context.Context
+	views                   []*topic.PartitionReadView
+	ends                    []uint64
+	staged                  StagedConsumerMetadataRecovery
+	metadata                []fsm.PartitionMetadata
 }
 
 func (r *consumerRecoveryReader) ExistingPartitionCount(string) (int, error) {
@@ -83,8 +108,8 @@ func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context
 		return fmt.Errorf("%w: %v", ErrConsumerRecoveryPending, err)
 	}
 	// Compatibility replay is selected by unknown authority, never by a failed
-	// coverage check. The coordinator also requires a pending startup/restore
-	// generation, so known authority cannot fall back to a partial local overlay.
+	// coverage check. It requires full physical coverage under the final fence;
+	// known authority must always use its independent historical baseline.
 	legacy := errors.Is(ch.Coordinator.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
 	plan, err := ch.prepareConsumerRecoveryPlan(ctx, metadata, -1, legacy)
 	if err != nil {
@@ -116,14 +141,14 @@ func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context
 			var prepared *coordinator.PreparedConsumerMetadataReplay
 			var err error
 			if plan.legacy {
-				prepared, err = ch.Coordinator.PrepareLegacyConsumerMetadataReplay(reader)
+				prepared, err = ch.Coordinator.PrepareFencedLegacyConsumerMetadataReplay(reader)
 			} else {
 				prepared, err = ch.Coordinator.PrepareFullConsumerMetadataReplay(reader)
 			}
 			if err != nil {
 				return err
 			}
-			if !requirement.Pending() && plan.finite {
+			if !requirement.Pending() {
 				unchanged := make(map[int]bool)
 				ch.groupRecoveryMu.Lock()
 				for partition, after := range plan.owned {
@@ -151,7 +176,7 @@ func (ch *CommandHandler) recoverDistributedConsumerMetadata(ctx context.Context
 			}
 			ch.groupRecoveryMu.Lock()
 			ch.groupRecoveryEpoch = epochs
-			if plan.finite {
+			if state.ConsumerMetadataRoutingEnabled() {
 				ch.groupRecoveryOwnership = plan.owned
 			} else {
 				ch.groupRecoveryOwnership = nil
