@@ -614,6 +614,11 @@ builds. Four groups retain 1,000 revisions each; two replicas stay alive while
 the target repeatedly exits after at least 1,024, 2,048 and 1,024 source records.
 Each attempt asserts its observed threshold and absence of a newly published
 index. A final unarmed restart must recover exact offsets and full ISR.
+The interrupted attempts use advisory file-cache eviction. The final restart
+retains pages read by the last interrupted process; it is not a cold-page-cache
+measurement. Each wrapper report carries a new process token, and restart
+removes its predecessor's exit report so a killed wrapper cannot expose stale
+accounting as a successful new sample.
 
 Each interrupted process records its logical recovery counters, Linux `/proc`
 I/O, CPU, peak RSS and current Go heap before writing the diagnostic result.

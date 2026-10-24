@@ -43,7 +43,8 @@ func TestConsumerHistoryReplayCrashResources(t *testing.T) {
 	defer ctx.Cleanup()
 	actions := ctx.WhenCluster().StartCluster()
 	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic="+topic+" partitions=1 replication_factor=3")
-	emit(map[string]any{"phase": "setup", "source_head": strings.TrimSpace(string(head)), "wall_seconds": time.Since(setup).Seconds(), "groups": 4, "revisions_per_group": revisions})
+	emit(map[string]any{"phase": "setup", "source_head": strings.TrimSpace(string(head)), "wall_seconds": time.Since(setup).Seconds(), "groups": 4, "revisions_per_group": revisions,
+		"interrupted_attempt_page_cache": "advisory_eviction", "final_recovery_page_cache": "warm_after_partial_replay", "trace": "strace -f --seccomp-bpf -e trace=fsync,fdatasync"})
 	seed := time.Now()
 	var workers sync.WaitGroup
 	for group := 0; group < 4; group++ {
@@ -70,6 +71,14 @@ func TestConsumerHistoryReplayCrashResources(t *testing.T) {
 	before := historyMeasureResourcesFor(t, []int{2, 3})
 	beforeMetrics := historyMeasureMetricsFor(t, []int{2, 3})
 	began := time.Now()
+	processTokens := make(map[string]bool)
+	checkProcess := func(accounting map[string]any) {
+		token, ok := accounting["process_token"].(string)
+		require.True(t, ok)
+		require.NotEmpty(t, token)
+		require.False(t, processTokens[token], "a new process cannot reuse the previous exit report")
+		processTokens[token] = true
+	}
 	for attempt, threshold := range []int{1024, 2048, 1024} {
 		historyMeasureOffline(t, target, "absent", "cold")
 		historyReplayArm(t, target, threshold)
@@ -89,7 +98,10 @@ func TestConsumerHistoryReplayCrashResources(t *testing.T) {
 		// Assert absence before the next offline cache preparation can remove it.
 		image := strings.TrimSpace(string(historyMeasureDocker(t, "inspect", "--format", "{{.Image}}", name)))
 		historyMeasureDocker(t, "run", "--rm", "--network", "none", "--pull", "never", "--volumes-from", name, "--entrypoint", "python3", image, "-c", "from pathlib import Path; assert not Path('/app/cluster-logs/.consumer-replay-index.json').exists(), 'incomplete replay published an index'")
-		emit(map[string]any{"phase": "interrupted_replay", "attempt": attempt + 1, "wall_seconds": wall, "fault": fault, "exit_accounting": historyReplayStoppedJSON(t, target, "/tmp/history-exit.json")})
+		exit := historyReplayStoppedJSON(t, target, "/tmp/history-exit.json")
+		require.Equal(t, float64(77), exit["child_returncode"])
+		checkProcess(exit)
+		emit(map[string]any{"phase": "interrupted_replay", "attempt": attempt + 1, "wall_seconds": wall, "fault": fault, "exit_accounting": exit})
 	}
 	historyReplayArm(t, target, 0)
 	finalStart := time.Now()
@@ -104,7 +116,9 @@ func TestConsumerHistoryReplayCrashResources(t *testing.T) {
 	emit(map[string]any{"phase": "final_verified_recovery", "wall_seconds": time.Since(finalStart).Seconds(), "all_attempts_wall_seconds": time.Since(began).Seconds(), "resources": historyMeasureResources(t), "metrics": historyMeasureMetrics(t), "survivors_before": before, "survivor_metrics_before": beforeMetrics})
 	shutdown := time.Now()
 	historyMeasureDocker(t, "stop", name)
-	emit(map[string]any{"phase": "final_shutdown_accounting", "wall_seconds": time.Since(shutdown).Seconds(), "exit_accounting_includes_shutdown": historyReplayStoppedJSON(t, target, "/tmp/history-exit.json")})
+	exit := historyReplayStoppedJSON(t, target, "/tmp/history-exit.json")
+	checkProcess(exit)
+	emit(map[string]any{"phase": "final_shutdown_accounting", "wall_seconds": time.Since(shutdown).Seconds(), "exit_accounting_includes_shutdown": exit})
 }
 
 func historyReplayArm(t *testing.T, node, threshold int) {

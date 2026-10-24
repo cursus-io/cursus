@@ -105,6 +105,10 @@ def sample():
 
 
 def run():
+    # A forced wrapper kill must leave accounting unavailable, never expose a
+    # previous process's successful report as this process's resource usage.
+    Path('/tmp/history-exit.json').unlink(missing_ok=True)
+    process_token = os.urandom(16).hex()
     args = sys.argv[2:]
     if args and args[0] in ('./broker', 'broker'):
         args.pop(0)
@@ -142,6 +146,7 @@ def run():
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     wrapper = resource.getrusage(resource.RUSAGE_SELF)
     final = {
+        'process_token': process_token,
         'child_returncode': child.returncode,
         'child_cpu_seconds': children.ru_utime + children.ru_stime,
         'wrapper_cpu_seconds_before_report': wrapper.ru_utime + wrapper.ru_stime,
