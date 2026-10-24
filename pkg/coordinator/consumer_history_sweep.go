@@ -27,6 +27,15 @@ func (s *historySubsequenceProof) observe(p, target int, r ConsumerMetadataRecor
 	if r.Group == "" {
 		return
 	}
+	// Version-7 intents are routed by transactional ID, independently from the
+	// group's ordinary snapshots. They never supply materialized replay state.
+	// Their separate retirement proof retains the final provenance/producer
+	// witness and orders each intent before its control removal. Counting them
+	// as a second ordinary source would force every real cross-owner transaction
+	// back to a complete-history scan for each segment.
+	if r.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot && r.Version == ConsumerMetadataRecordVersionTransactionHistory {
+		return
+	}
 	if s.sources[r.Group] == nil {
 		s.sources[r.Group] = make(map[int]bool)
 	}

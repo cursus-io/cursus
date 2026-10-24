@@ -21,8 +21,9 @@ func (r *historySweepReader) ConsumerMetadataIndexIdentity(p int) (string, error
 }
 
 func TestConsumerHistorySweepEveryIntermediateReplay(t *testing.T) {
-	for _, transactions := range []bool{false, true} {
-		t.Run(fmt.Sprint(transactions), func(t *testing.T) {
+	for _, mode := range []string{"ordinary", "transaction", "cross_partition_transaction"} {
+		t.Run(mode, func(t *testing.T) {
+			transactions := mode != "ordinary"
 			c, base := newIndexFixture(t, 1000)
 			var source ConsumerMetadataIndexReader = base
 			if transactions {
@@ -32,6 +33,13 @@ func TestConsumerHistorySweepEveryIntermediateReplay(t *testing.T) {
 			}
 			end := uint64(len(base.messages[0]))
 			base.end = map[int]uint64{0: end}
+			if mode == "cross_partition_transaction" {
+				// Real transaction routing differs from ordinary group routing.
+				// Intents contribute provenance but never materialized offsets.
+				base.messages[1] = append([]types.Message(nil), base.messages[0][:2]...)
+				base.messages[0] = base.messages[0][2:]
+				base.end[1] = 2
+			}
 			reader := &historySweepReader{source, base.identity}
 			source = reader
 			full, err := c.PrepareFullConsumerMetadataReplay(source)
@@ -66,6 +74,9 @@ func TestConsumerHistorySweepEveryIntermediateReplay(t *testing.T) {
 			want := 2
 			if transactions {
 				want = 4
+			}
+			if mode == "cross_partition_transaction" {
+				want = 2
 			}
 			require.Len(t, base.messages[0], want)
 		})
