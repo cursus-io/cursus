@@ -10,13 +10,17 @@ and [operational contract](consumer-history-compaction.md).
 ## Source and validation boundaries
 
 - Foundation head: `78b0bf566b4cd23d2d9317c417fc377654374205`.
-- Compaction and ordinary measurement source:
+- Compaction and the incomplete local measurement source:
   `7c85be902f8e07c532e918be7d2afc5309ac35f4`, based on official main
   `d5b8d773ad215362c80ee46a2a8764c37ead9728`.
 - Replay-crash instrumentation and freshness checks:
   `88b3e7d57a292efc22328574e3b5312cb3e897d7`.
+- Completed hosted Linux scaling source:
+  `533afcb82011cc232b88724892426218e0693a5b`, tested merge
+  `bdbe7fcfc6b75f385a1a1a368ee106df9dbe963f`. All 34 reported checks passed,
+  including the complete scaling job and another replay-crash run.
 - [Package race CI](https://github.com/cursus-io/cursus/actions/runs/40092762350/job/120868661688)
-  tested merge `fd66ae9352e55ca4e6a4aec6f33ea54607bada90` for that head.
+  tested merge `fd66ae9352e55ca4e6a4aec6f33ea54607bada90` for `88b3e7d`.
   The tests listed below passed in that run unless a different source is
   explicitly stated. All 33 reported checks passed, including bootstrap,
   snapshot restore, deployment, Helm and the dedicated crash experiment.
@@ -86,11 +90,24 @@ accounting. Its final restart is warm after partial replay.
 
 ## Acceptance limits
 
-Whole-broker 100 / 1,000 / 10,000 baseline/fix results remain a separate required
-measurement; passing unit/race tests or a valid index alone cannot substitute
-for that evidence. The final report must include retained physical history,
-cache-miss recovery, setup and maintenance, all index modes, failover, request
-latency and resource costs before claiming the measured workload is complete.
+The [whole-broker report](consumer-history-whole-broker-results.md) completes
+the 100 / 1,000 / 10,000 baseline/fix matrix on hosted Linux. Every replica met
+the fixed retained-log bound; absent, valid, corrupt and unsupported-version
+indexes, interrupted startup, ownership movement and exact offsets all passed.
+Setup, seeding, maintenance, request latency and resource costs are retained
+in its raw JSONL and CSV. At 10,000, per-replica metadata decreased from
+17,593,264 to 139,824 bytes and cache-absent replay work across three brokers
+decreased from 240,072 to 1,902 decoded records. These are repeated work
+counters, not unique-record counts.
+
+That row's whole startup changed from 15.217 to 12.941 s and failover from
+6.396 to 4.997 s. These are single observations with advisory file-cache
+eviction and unfrozen Raft/background progress, not an isolated causal speedup
+or hardware-cold guarantee. Maintenance including recreation took 33.677 s,
+used 42.890 broker CPU seconds and returned one `NOT_COORDINATOR` error in
+1,341 foreground fetches. Sampled startup heap increased from 290,204,368 to
+307,984,000 bytes despite lower replay work. No availability or memory cost
+is hidden by the retained-history reduction.
 
 The supported bound is for fixed logical identities and supported formats,
 not unlimited creation of distinct deleted group names or producer/transaction

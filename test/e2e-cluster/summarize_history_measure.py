@@ -39,7 +39,14 @@ for row in rows:
     for key in ['cpu_seconds', 'container_cpu_seconds', 'container_read_bytes', 'container_write_bytes', 'process_read_bytes', 'process_write_bytes', 'process_rchar', 'process_wchar', 'successful_sync_calls', 'allocated_bytes_total', 'allocations_total', 'network_received_bytes', 'network_transmitted_bytes']:
         item[key] = total(counters, key) if counters else ''
     for key in ['retained_metadata_bytes', 'retained_metadata_segments', 'sampled_peak_heap_bytes', 'peak_rss_bytes', 'container_peak_memory_bytes', 'sampled_peak_temporary_bytes', 'sampled_peak_store_bytes']:
-        item['max_node_' + key] = max((v[key] for v in resources.values() if key in v), default='')
+        if key == 'sampled_peak_heap_bytes':
+            # The explicit end-of-phase sample can exceed the periodic peak.
+            # Older wrappers emitted zero before observing any heap sample.
+            observed = [v[k] for v in resources.values()
+                        for k in ('sampled_peak_heap_bytes', 'heap_bytes') if v.get(k, 0) > 0]
+        else:
+            observed = [v[key] for v in resources.values() if key in v]
+        item['max_node_' + key] = max(observed, default='')
     for stage, units in {'consumer_frames': ['read_bytes', 'decoded_frames'], 'consumer_replay': ['decoded_bytes', 'decoded_frames', 'pages'], 'consumer_index': ['read_bytes', 'write_bytes', 'cache_hits', 'cache_misses'], 'retained_scan': ['read_bytes', 'decoded_frames'], 'metadata_rpc': ['transfer_bytes'], 'replica_rpc': ['transfer_bytes']}.items():
         for unit in units:
             item[stage + '_' + unit] = total(metrics, work(stage, unit)) if metrics else ''

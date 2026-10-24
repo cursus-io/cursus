@@ -439,6 +439,7 @@ jobs:
       - name: Verify fault accounting and repeated source reads
         run: |
           python3 -m py_compile test/e2e-cluster/history_measure.py test/e2e-cluster/summarize_history_measure.py
+          python3 -m unittest discover -s test/e2e-cluster -p 'test_history_measurement_summary.py'
           go test -tags=e2e_faults -race -count=1 ./pkg/metrics ./pkg/controller \
             -run 'TestRecoveryWorkSnapshotForFault|TestConsumerReplayCountsRepeatedPartialReads'
       - name: Account for every interrupted replay process

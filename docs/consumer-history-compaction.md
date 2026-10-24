@@ -4,6 +4,9 @@ The [acceptance evidence](consumer-history-acceptance-evidence.md) maps the
 current tests to recovery and durability requirements and labels historical
 measurements by source commit. The experiments below retain earlier failures
 and partial results; they are not all measurements of the current head.
+The completed [whole-broker scaling report](consumer-history-whole-broker-results.md)
+contains the hosted Linux 100 / 1,000 / 10,000 baseline/fix matrix, physical
+retained-log bounds, cache-miss recovery and all measured costs.
 
 ## Remaining-work design and regression contract
 
@@ -673,6 +676,10 @@ in wall time, and Linux guest accounting is distinct from host-device I/O.
 CSV beside the ordinary ladder's raw JSONL. It keeps overlapping frame, replay,
 index and transfer counters separate, and leaves unavailable fields blank.
 It does not reinterpret interrupted rows as cumulative process totals.
+Its reported heap maximum includes both the periodic maximum and the explicit
+end-of-phase observation, which can be newer and larger. A legacy zero emitted
+before any heap observation remains unavailable when no positive heap sample
+exists. Synthetic summary-regression fixtures are not performance measurements.
 
 Retained bytes are metadata `.log` bytes; total store bytes also include Raft,
 indexes and checkpoints and may include sparse logical file sizes. Unique group
