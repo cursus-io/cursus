@@ -287,6 +287,15 @@ truncated, err := admin.TruncateTopic(definition.Topic, sdk.TruncateTopicOptions
 
 Omitting `ExpectedInstance` preserves legacy `TRUNCATE`: a successful old-revision retry conflicts and an ambiguous transport failure is not automatically retried. `CleanupPending` distinguishes committed intent from unfinished local materialization; its absence does not certify every replica. Check broker readiness and per-broker materialization before resuming traffic. Desired-list omission never authorizes delete or truncate; only an explicit destructive action may call these APIs. See the [truncate recovery contract](core/truncate-contract-recovery.md) and [upgrade runbook](operations/upgrade-and-recovery.md).
 
+Legacy requests cannot distinguish a recreated topic with a reused revision.
+For instance-bound calls, the retry limit is `MaxRetries + 1` total attempts,
+also bounded by context and request deadlines. Exhaustion returns an error;
+it never infers success. The SDK validates the response's topic, instance,
+next revision, successful reset flag, post-reset epoch and zero historical
+LEO/HWM. Invalid receipts return an error without falling back to legacy or
+refreshing the revision. See the [current acceptance audit](core/truncate-acceptance-audit.md)
+for tested scope and remaining issue-level conditions.
+
 ## Go Transactional Producer
 
 The Go SDK exposes both the existing low-level transaction commands and a

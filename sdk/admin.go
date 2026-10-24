@@ -220,6 +220,10 @@ func (c *AdminClient) TruncateTopic(topic string, options TruncateTopicOptions) 
 	return c.TruncateTopicContext(context.Background(), topic, options)
 }
 
+// TruncateTopicContext requests a revision-guarded reset within ctx's lifetime.
+// ExpectedInstance enables bounded retries of the saved pair and validates the
+// historical reset receipt. CleanupPending reports unfinished local cleanup;
+// a successful return does not certify materialization on every replica.
 func (c *AdminClient) TruncateTopicContext(ctx context.Context, topic string, options TruncateTopicOptions) (TruncateTopicResult, error) {
 	if ctx == nil {
 		return TruncateTopicResult{}, fmt.Errorf("admin context is nil")
@@ -235,9 +239,13 @@ func (c *AdminClient) TruncateTopicContext(ctx context.Context, topic string, op
 		return TruncateTopicResult{}, err
 	}
 	result, err := parseTruncateTopicResponse(response)
-	if err == nil && options.ExpectedInstance != "" && (result.InstanceID != options.ExpectedInstance ||
-		options.ExpectedRevision == ^uint64(0) || result.Revision != options.ExpectedRevision+1) {
-		return TruncateTopicResult{}, fmt.Errorf("truncate receipt does not match the requested instance/revision")
+	// The offsets describe the historical reset, including on receipt replay;
+	// fresh writes do not change them. Validate the complete success envelope
+	// before reporting an instance-bound destructive operation as acknowledged.
+	if err == nil && options.ExpectedInstance != "" && (result.Topic != topic || !result.Truncated ||
+		result.InstanceID != options.ExpectedInstance || options.ExpectedRevision == ^uint64(0) ||
+		result.Revision != options.ExpectedRevision+1 || result.LifecycleEpoch < 2 || result.LEO != 0 || result.HWM != 0) {
+		return TruncateTopicResult{}, fmt.Errorf("truncate receipt does not match the requested topic/instance/revision or reset result")
 	}
 	return result, err
 }
