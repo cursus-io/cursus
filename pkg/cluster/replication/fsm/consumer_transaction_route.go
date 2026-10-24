@@ -9,6 +9,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 // ConsumerTransactionMetadataRoute preserves the transaction coordinator's
@@ -74,7 +75,8 @@ func (f *BrokerFSM) validateConsumerTransactionMessageLocked(route *types.Consum
 		return fenced
 	}
 	if msg.TransactionMarker != "" {
-		if f.consumerTransactionHistoryActivated && tx.Mode == transaction.ModeProcessingV1 && msg.ProducerID == fmt.Sprintf("txn-history:%s:%s", tx.ID, msg.TransactionMarker) && msg.SeqNum == uint64(tx.CoordinatorEpoch) {
+		sequence, sequenceOK := util.SafeInt64ToUint64(tx.CoordinatorEpoch)
+		if sequenceOK && sequence > 0 && f.consumerTransactionHistoryActivated && tx.Mode == transaction.ModeProcessingV1 && msg.ProducerID == fmt.Sprintf("txn-history:%s:%s", tx.ID, msg.TransactionMarker) && msg.SeqNum == sequence {
 			// Validate every other field using the existing processing marker contract.
 			msg.ProducerID = fmt.Sprintf("txn-marker:%s:%d:%s", tx.ID, tx.CoordinatorEpoch, msg.TransactionMarker)
 			msg.SeqNum = 1

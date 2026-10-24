@@ -1281,8 +1281,12 @@ func (ch *CommandHandler) appendTransactionMarkers(tx *transaction.Transaction, 
 			ControlBatchValue:            controlValue,
 		}
 		if partition.Topic == config.ConsumerOffsetsTopicName && tx.Mode == transaction.ModeProcessingV1 && ch.consumerTransactionHistoryEnabled() {
+			sequence, ok := util.SafeInt64ToUint64(coordinatorEpoch)
+			if !ok || sequence == 0 {
+				return fmt.Errorf("invalid transaction history coordinator epoch")
+			}
 			msg.ProducerID = fmt.Sprintf("txn-history:%s:%s", tx.ID, marker)
-			msg.SeqNum = uint64(coordinatorEpoch) // positive fenced coordinator epoch
+			msg.SeqNum = sequence
 		}
 		if err := ch.publishTransactionMarker(partition.Topic, partition.Partition, msg); err != nil {
 			return err
@@ -1539,8 +1543,9 @@ func (ch *CommandHandler) validateTransactionMarkerPublish(tx *transaction.Trans
 	if msg.TransactionMarker != types.TransactionMarkerCommit && msg.TransactionMarker != types.TransactionMarkerAbort {
 		return fmt.Sprintf("ERROR: invalid_transaction_marker marker=%s", msg.TransactionMarker)
 	}
-	historyMarker := topicName == config.ConsumerOffsetsTopicName && tx.Mode == transaction.ModeProcessingV1 && ch.consumerTransactionHistoryEnabled() &&
-		msg.ProducerID == fmt.Sprintf("txn-history:%s:%s", tx.ID, msg.TransactionMarker) && msg.SeqNum == uint64(expectedCoordinatorEpoch)
+	sequence, sequenceOK := util.SafeInt64ToUint64(expectedCoordinatorEpoch)
+	historyMarker := sequenceOK && sequence > 0 && topicName == config.ConsumerOffsetsTopicName && tx.Mode == transaction.ModeProcessingV1 && ch.consumerTransactionHistoryEnabled() &&
+		msg.ProducerID == fmt.Sprintf("txn-history:%s:%s", tx.ID, msg.TransactionMarker) && msg.SeqNum == sequence
 	if !historyMarker && (msg.ProducerID != transactionMarkerProducerID(tx, msg.TransactionMarker) || msg.SeqNum != 1) {
 		return fmt.Sprintf("ERROR: invalid_transaction_marker_producer transactional_id=%s", tx.ID)
 	}
