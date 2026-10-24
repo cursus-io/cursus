@@ -20,7 +20,9 @@ will alter one follower's returned page after the real read: omit a tombstone,
 corrupt its payload, conflict its epoch, expose a record outside the committed
 page, replay an obsolete epoch, or add a transactional envelope. The durable
 log remains intact. An observation marker proves the selected record reached
-the hook; pending status and rejected writes must prove no final publication.
+the hook; pending status and rejected local reads must prove no early local
+completion publication. A routed write may reach a healthy owner, so it is not
+used as proof of the selected follower's local completion.
 This is a local read-response fault model, not on-disk sector corruption or a
 claim that the source actually committed an invalid record. Removing the hook
 and restarting that follower must recover from the unchanged authoritative log.
