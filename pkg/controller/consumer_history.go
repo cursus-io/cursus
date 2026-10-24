@@ -148,7 +148,11 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 		return result, err
 	}
 	phaseStart = time.Now()
+	var previousPublication time.Duration
 	for _, segment := range segments {
+		if err = waitConsumerHistoryPublication(ctx, previousPublication); err != nil {
+			break
+		}
 		first, end := segment.Range()
 		if sweep != nil {
 			certificate, err = sweep.Segment(first, end)
@@ -157,7 +161,9 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 			}
 		}
 		var part disk.CompactionResult
+		publicationStart := time.Now()
 		part, err = ch.publishConsumerHistorySegment(ctx, plan, target, segment, certificate, sweep)
+		previousPublication = time.Since(publicationStart)
 		// A later segment can defer after earlier durable publications. Account
 		// those successes even when the overall sweep returns an error. Failed
 		// rewrites return no removed records and cannot certify saved bytes.
@@ -178,6 +184,27 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 	}
 	metrics.ConsumerHistoryPhaseSeconds.WithLabelValues("publish").Observe(time.Since(phaseStart).Seconds())
 	return result, err
+}
+
+// An ordered sweep must not immediately reacquire exclusive admission for each
+// segment. Give requests and ownership recovery at least as much time as the
+// preceding publication used, with a floor above the ordinary retry interval.
+// The certificate is still validated after the pause; no lock or lease is held.
+func waitConsumerHistoryPublication(ctx context.Context, previous time.Duration) error {
+	if previous == 0 {
+		return ctx.Err()
+	}
+	if previous < 25*time.Millisecond {
+		previous = 25 * time.Millisecond
+	}
+	timer := time.NewTimer(previous)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (ch *CommandHandler) publishConsumerHistorySegment(ctx context.Context, plan *consumerRecoveryPlan, target int, selected disk.ConsumerHistorySegment, certificate *coordinator.ConsumerHistoryCompactionPlan, sweep *coordinator.ConsumerHistorySweep) (result disk.CompactionResult, err error) {
@@ -318,14 +345,14 @@ func (ch *CommandHandler) startConsumerHistoryMonitor(ctx context.Context) error
 		if interval < time.Second {
 			interval = time.Second
 		}
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 		cursor := consumerHistoryCursor{}
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				start := time.Now()
 				result, err := ch.compactConsumerHistory(ctx, &cursor)
 				if err != nil {
@@ -333,6 +360,9 @@ func (ch *CommandHandler) startConsumerHistoryMonitor(ctx context.Context) error
 				} else if result.RecordsRemoved > 0 {
 					util.Info("Consumer history compaction removed=%d bytes_before=%d bytes_after=%d elapsed=%s", result.RecordsRemoved, result.BytesBefore, result.BytesAfter, time.Since(start))
 				}
+				// A long pass must not consume an already queued ticker event and
+				// immediately start another exclusive publication pass.
+				timer.Reset(interval)
 			}
 		}
 	}()

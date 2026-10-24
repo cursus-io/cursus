@@ -500,6 +500,14 @@ preflight and coordinator routing, routing preserves the same retryable
 `consumer_metadata_recovering` response. The tests count these retries in request
 completion latency; they do not rejoin members or retry epoch/ownership failures.
 
+Ordered sweeps leave an admission-free interval between segment publications:
+at least 25 ms and at least the elapsed preceding publication time. The next
+publication revalidates the certificate after that interval. Background passes
+wait the configured interval after completion, rather than immediately consuming
+an overdue ticker event. This limits consecutive maintenance exclusion, including
+slow fsyncs, without weakening committed-cut or generation checks. It does not
+promise a maximum syscall latency or eliminate cross-broker contention.
+
 Cleanup on a nonreplica stages the missing committed raw prefixes through the
 same bounded, certified transfer cache as recovery, before taking coordinator
 lifecycle/global locks. Local read callbacks fence FSM transitions and validate
@@ -517,6 +525,11 @@ attempts. It excludes in-memory projection reads and maintenance certification,
 which has separate counters. Raw reads count returned uncommitted tails as work,
 never as certified state. `stage="consumer_index"` counts actual cache file
 read/write bytes even when parsing or publication fails. These cumulative counters
+also distinguish completed preparations that hit or miss the index; whole-broker
+experiments assert the requested path actually occurred on each broker. The
+maintenance experiment probes ordinary offset reads without changing the seeded
+history and reports completion latency (including SDK retries), successes and
+returned errors separately. These cumulative counters
 must accompany the last-recovery gauges; a later hit does not erase earlier work.
 Underlying detached/file counters can overlap these logical layers and must not
 be summed as physical I/O. Process counters reset on restart; interrupted runs

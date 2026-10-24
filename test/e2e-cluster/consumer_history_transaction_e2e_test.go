@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -24,6 +25,16 @@ func TestConsumerHistoryTransactionsAcrossCoordinatorMove(t *testing.T) {
 	t.Setenv("TRANSACTION_TIMEOUT_MS", "60000")
 	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-history.yml", "docker-compose.history-measure.yml").WithClusterSize(3).WithTopic("history-transactions").WithPartitions(1).WithAcks("all")
 	defer ctx.Cleanup()
+	defer func() {
+		if t.Failed() && os.Getenv("CURSUS_E2E_DUMP_STACKS") == "1" {
+			for node := 1; node <= 3; node++ {
+				out, err := exec.Command("docker", "exec", cleanupContainerName(node), "python3", "-c", "import history_measure as h, os, signal; p=h.broker_pid(); os.kill(int(p.name), signal.SIGQUIT) if p else None").CombinedOutput()
+				t.Logf("failed-fixture stack dump node=%d: %s err=%v", node, out, err)
+				logs, logErr := exec.Command("docker", "logs", cleanupContainerName(node)).CombinedOutput()
+				t.Logf("complete failed-fixture logs node=%d err=%v:\n%s", node, logErr, logs)
+			}
+		}
+	}()
 	actions := ctx.WhenCluster().StartCluster()
 	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-transactions partitions=1 replication_factor=3")
 	const group, id = "history-transaction-group", "history-transaction-id"

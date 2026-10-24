@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
 )
@@ -88,6 +90,9 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 						began := time.Now()
 						attempts += consumerHistoryCommand(t, client, fmt.Sprintf("COMMIT_OFFSET topic=history-measure partition=0 group=%s offset=%d generation=%d member=%s", name, revision, generation, member))
 						times = append(times, time.Since(began))
+						if group == 0 && revision%1000 == 0 {
+							t.Logf("seed history=%d group=%s acknowledged=%d", history, name, revision)
+						}
 						if revision%5 == 0 {
 							consumerHistoryCommand(t, client, fmt.Sprintf("HEARTBEAT topic=history-measure group=%s generation=%d member=%s", name, generation, member))
 						}
@@ -127,6 +132,7 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 					began := time.Now()
 					compose("up", "-d", "--no-build", "--force-recreate")
 					require.NoError(t, actions.checkAllNodesHealth())
+					stopProbe := historyMeasureReadProbe(t, ctx.GetBrokerAddrs(), uint64(history))
 					require.NoError(t, eventually(t, "history sweep on every replica", 5*time.Minute, func() (bool, string, error) {
 						for node := 1; node <= 3; node++ {
 							count, err := consumerHistoryRemoved(node)
@@ -151,7 +157,8 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 						return true, "compacted", nil
 					}))
 					exact(ctx.GetBrokerAddrs())
-					emit(map[string]any{"history": history, "variant": variant, "phase": "maintenance_including_recreate", "wall_seconds": time.Since(began).Seconds(), "before": before, "after": historyMeasureResources(t), "metrics": historyMeasureMetrics(t)})
+					probe := stopProbe()
+					emit(map[string]any{"history": history, "variant": variant, "phase": "maintenance_including_recreate", "wall_seconds": time.Since(began).Seconds(), "fetch_probe_after_ready": probe, "before": before, "after": historyMeasureResources(t), "metrics": historyMeasureMetrics(t)})
 				}
 				for _, mode := range []string{"absent", "valid", "corrupt", "old"} {
 					compose("stop")
@@ -167,7 +174,16 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 					require.NoError(t, actions.checkAllNodesHealth())
 					waitForStableFullISRAndZeroUnderReplicated(t, ctx, "whole history restart")
 					exact(ctx.GetBrokerAddrs())
-					emit(map[string]any{"history": history, "variant": variant, "phase": "whole_cluster_start", "index": mode, "page_cache": cache, "wall_seconds": time.Since(began).Seconds(), "resources": historyMeasureResources(t), "metrics": historyMeasureMetrics(t)})
+					wall := time.Since(began).Seconds()
+					observed := historyMeasureMetrics(t)
+					for node, values := range observed {
+						unit := "cache_misses"
+						if mode == "valid" {
+							unit = "cache_hits"
+						}
+						require.Positive(t, values[fmt.Sprintf(`cursus_recovery_work_total{stage="consumer_index",unit="%s"}`, unit)], "node=%d mode=%s must actually exercise the requested cache path", node, mode)
+					}
+					emit(map[string]any{"history": history, "variant": variant, "phase": "whole_cluster_start", "index": mode, "page_cache": cache, "wall_seconds": wall, "resources": historyMeasureResources(t), "metrics": observed})
 				}
 				// Interrupt startup, then restart again. There is no readiness wait before
 				// kill, but this experiment alone cannot prove the exact replay phase.
@@ -217,6 +233,64 @@ func historyMeasureDocker(t *testing.T, args ...string) []byte {
 	require.NoError(t, err, string(data))
 	return data
 }
+
+// Observe ordinary offset reads during maintenance without changing the seeded
+// revisions. Every completed call (including SDK retries) contributes latency;
+// returned errors are counted separately and never disguised as successful reads.
+func historyMeasureReadProbe(t *testing.T, addrs []string, expected uint64) func() map[string]any {
+	t.Helper()
+	stop, done := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	result := map[string]any{}
+	var wrongOffset error
+	go func() {
+		defer close(done)
+		client := e2e.NewBrokerClient(addrs)
+		defer client.Close()
+		var durations []time.Duration
+		failures := map[string]int{}
+		success := 0
+		for {
+			select {
+			case <-stop:
+				slices.Sort(durations)
+				result["calls"], result["successes"], result["returned_errors"] = len(durations), success, failures
+				if len(durations) > 0 {
+					result["p50_ms"] = float64(durations[len(durations)/2]) / float64(time.Millisecond)
+					result["p95_ms"] = float64(durations[len(durations)*95/100]) / float64(time.Millisecond)
+					result["max_ms"] = float64(durations[len(durations)-1]) / float64(time.Millisecond)
+				}
+				return
+			default:
+			}
+			start := time.Now()
+			value, err := client.FetchCommittedOffset("history-measure", 0, "history-measure-0")
+			durations = append(durations, time.Since(start))
+			if err != nil {
+				code := "transport_or_client"
+				var broker *wire.BrokerError
+				if errors.As(err, &broker) {
+					code = broker.Code
+				}
+				failures[code]++
+			} else if value != expected {
+				wrongOffset = fmt.Errorf("maintenance fetch got=%d want=%d", value, expected)
+			} else {
+				success++
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	finish := func() map[string]any {
+		once.Do(func() { close(stop) })
+		<-done
+		require.NoError(t, wrongOffset)
+		return result
+	}
+	t.Cleanup(func() { finish() })
+	return finish
+}
+
 func historyMeasureOffline(t *testing.T, node int, mode, cache string) {
 	t.Helper()
 	name := cleanupContainerName(node)

@@ -23,6 +23,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestConsumerHistoryPublicationYieldsAndCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// A slow fsync must create an equally long admission-free interval. Testing
+	// with a long duration also proves shutdown does not wait for that budget.
+	done := make(chan error, 1)
+	go func() { done <- waitConsumerHistoryPublication(ctx, time.Hour) }()
+	select {
+	case err := <-done:
+		t.Fatalf("publication budget did not yield: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("publication budget ignored cancellation")
+	}
+	require.ErrorIs(t, waitConsumerHistoryPublication(ctx, 0), context.Canceled)
+	require.NoError(t, waitConsumerHistoryPublication(context.Background(), 0))
+}
+
 func TestConsumerHistoryControllerPublishesAndRestores(t *testing.T) {
 	for _, mode := range []string{"local", "nonreplica", "transactions"} {
 		t.Run(mode, func(t *testing.T) { testConsumerHistoryController(t, mode) })
