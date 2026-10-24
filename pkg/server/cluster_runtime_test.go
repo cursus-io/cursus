@@ -115,6 +115,7 @@ func TestRegistrationWorkerRepublishesChangesAfterInflightSuccess(t *testing.T) 
 	}
 	sd.mu.Lock()
 	sd.wanted.RecoveryProtocol = 2
+	sd.wanted.ConsumerRoutingReady = true
 	sd.wanted.ClientAddr = "client:3"
 	sd.mu.Unlock()
 	releaseOnce.Do(func() { close(sd.release) })
@@ -122,6 +123,7 @@ func TestRegistrationWorkerRepublishesChangesAfterInflightSuccess(t *testing.T) 
 	stop()
 	actual := state.GetBroker("local")
 	require.Equal(t, 2, actual.RecoveryProtocol)
+	require.True(t, actual.ConsumerRoutingReady)
 	require.Equal(t, "client:3", actual.ClientAddr)
 	require.Equal(t, "current", actual.IncarnationID)
 	require.Zero(t, actual.TransactionCoordinatorShards, "registration-only shard count is stored separately in the FSM")

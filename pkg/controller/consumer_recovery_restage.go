@@ -30,9 +30,7 @@ func (p *consumerRecoveryPlan) restageLocalEnds(metadata []fsm.PartitionMetadata
 	for i := range metadata {
 		if p.local[i] != nil {
 			p.metadata[i] = metadata[i]
-			if !p.legacy {
-				p.ends[i] = metadata[i].CommittedHWM
-			}
+			p.ends[i] = metadata[i].CommittedHWM
 		}
 	}
 	return nil

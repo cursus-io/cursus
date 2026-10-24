@@ -83,7 +83,12 @@ func NewServiceDiscovery(rm RaftManager, brokerID, addr, clientAddr string) Serv
 func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 	sd.bootstrapMu.RLock()
 	version := sd.recoveryProtocol
+	source := sd.bootstrapSource
 	sd.bootstrapMu.RUnlock()
+	ready := false
+	if provider, ok := source.(interface{ ConsumerRoutingRecoveryReady() bool }); ok && version == fsm.BootstrapRecoveryProtocolVersion {
+		ready = provider.ConsumerRoutingRecoveryReady()
+	}
 	broker := &fsm.BrokerInfo{
 		ID:                           sd.brokerID,
 		Addr:                         sd.addr,
@@ -94,6 +99,7 @@ func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 		TransactionCoordinatorShards: sd.transactionCoordinatorShardCount(),
 		LifecycleProtocol:            fsm.BrokerProtocolVersionCurrent,
 		RecoveryProtocol:             version,
+		ConsumerRoutingReady:         ready,
 	}
 	return json.Marshal(broker)
 }

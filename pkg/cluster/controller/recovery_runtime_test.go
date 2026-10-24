@@ -12,9 +12,12 @@ import (
 
 type activationSource struct {
 	bindingSource
-	incarnation string
-	ready       bool
+	incarnation   string
+	ready         bool
+	consumerReady bool
 }
+
+func (s *activationSource) ConsumerRoutingRecoveryReady() bool { return s.consumerReady }
 
 func (s *activationSource) RecoveryRuntimeReady(incarnation string) error {
 	if !s.ready || s.incarnation != incarnation {
@@ -42,6 +45,24 @@ func TestRecoveryActivationRequiresInstalledBundle(t *testing.T) {
 	require.NoError(t, sd.ActivateRecoveryRuntime())
 	require.Equal(t, 2, version())
 	require.NoError(t, sd.ActivateRecoveryRuntime())
+}
+
+func TestRegistrationPublishesAndRevokesConsumerRoutingReadiness(t *testing.T) {
+	sd := NewServiceDiscoveryImpl(nil, "source", "source:7000", "source:9000")
+	source := &activationSource{incarnation: sd.incarnationID, ready: true, consumerReady: true}
+	require.NoError(t, sd.BindBootstrapTransferSource(source))
+	read := func() fsm.BrokerInfo {
+		data, err := sd.LocalRegistrationPayload()
+		require.NoError(t, err)
+		var info fsm.BrokerInfo
+		require.NoError(t, json.Unmarshal(data, &info))
+		return info
+	}
+	require.False(t, read().ConsumerRoutingReady, "runtime must be installed first")
+	require.NoError(t, sd.ActivateRecoveryRuntime())
+	require.True(t, read().ConsumerRoutingReady)
+	source.consumerReady = false
+	require.False(t, read().ConsumerRoutingReady, "restore or lost authority revokes the report")
 }
 
 func TestRecoverySourceRejectsRestoredProcessRegistration(t *testing.T) {

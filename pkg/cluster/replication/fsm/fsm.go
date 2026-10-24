@@ -57,6 +57,9 @@ type BrokerInfo struct {
 	LastSeen          time.Time `json:"last_seen"`
 	LifecycleProtocol int       `json:"lifecycle_protocol,omitempty"`
 	RecoveryProtocol  int       `json:"recovery_protocol,omitempty"`
+	// Process-owned readiness for new strict routing activation. Missing legacy
+	// registrations are false. This is not a consumer checkpoint or authority.
+	ConsumerRoutingReady bool `json:"consumer_routing_ready,omitempty"`
 	// IncarnationID identifies one broker process lifetime. IncarnationEpoch is
 	// assigned durably when that lifetime is first registered, so an older
 	// process cannot keep a newer registration alive with heartbeats.

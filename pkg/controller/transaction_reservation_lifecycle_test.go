@@ -167,6 +167,8 @@ func TestReservationRPCWaitsForReplicatedActivationAndFinalDecision(t *testing.T
 	f.SetTransactionManager(ch.TxnManager)
 	installRoutingOffsetsTopology(t, f, "node-1")
 	ch.Config.EnabledDistribution = true
+	// This fixture loads the coordinator in standalone mode before wiring RPCs.
+	require.NoError(t, ch.CaptureGroupRecoveryOwnership())
 	cd.SetOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
 		return appendStandaloneReservationMetadata(tm, record)
 	})
@@ -279,6 +281,7 @@ func TestTerminalReservationCleanupTransfersOwnershipWithoutChangingDecisionEpoc
 			rm.isLeader, rm.state = true, f
 			installRoutingOffsetsTopology(t, f, "node-2")
 			ch.Config.EnabledDistribution = true
+			require.NoError(t, ch.CaptureGroupRecoveryOwnership())
 			cd.SetOffsetRecordWriter(func(record coordinator.ConsumerMetadataRecord) error {
 				return appendStandaloneReservationMetadata(tm, record)
 			})

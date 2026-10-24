@@ -180,7 +180,7 @@ func assertConsumerReadUnderFSMFence(t *testing.T, state *fsm.BrokerFSM) {
 	}), fsm.ErrConsumerMetadataFencePending)
 }
 
-func TestUnknownOriginalStartupUsesLocalCompatibilityWithoutRemoteCoverage(t *testing.T) {
+func TestUnknownOriginalStartupRejectsMissingCommittedCoverage(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	cfg.LogDir = t.TempDir()
@@ -200,8 +200,8 @@ func TestUnknownOriginalStartupUsesLocalCompatibilityWithoutRemoteCoverage(t *te
 	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:"+config.ConsumerOffsetsTopicName+"-0:"), data...)}))
 	h := newCoordinatorRoutingHandler("unassigned", state, c)
 	h.TopicManager = tm
-	require.NoError(t, h.RecoverDistributedConsumerMetadata(context.Background()))
-	require.NoError(t, c.RecoveryReadinessError())
+	require.ErrorIs(t, h.RecoverDistributedConsumerMetadata(context.Background()), ErrConsumerRecoveryPending)
+	require.Error(t, c.RecoveryReadinessError())
 	require.ErrorIs(t, c.ValidateConsumerMetadataBootstrapEligibility(0), coordinator.ErrConsumerMetadataBootstrapUnknown)
 }
 
