@@ -164,12 +164,23 @@ with jitter, starting at least at 100 ms and capped at about one second (or the
 configured minimum if larger). Healthy polling retains its configured cadence.
 Partition fetch connections retain their cursors until reconnect.
 
-An ambiguous lifecycle append closes ownership admission until strict metadata
-recovery resolves it. Successful full strict replay atomically clears lifecycle
-fences; failed or scoped replay cannot clear them. Standalone mode requires
-restart for that recovery; it
-does not reuse a possibly persisted ownership revision. Transient coordinator
-routing and metadata append outages remain retryable without weakening grant fences.
+An ambiguous lifecycle append closes ownership admission rather than reusing a
+possibly persisted ownership revision. In distributed mode, successful full strict
+metadata replay atomically clears lifecycle fences; failed or scoped replay cannot
+clear them. Transient routing and append errors remain retryable, but retrying a
+request does not itself remove an ambiguous lifecycle fence.
+
+In standalone mode, a failed cooperative lifecycle append requires a broker
+process restart. The running process has no automatic unfence path: joins report
+`group lifecycle update in progress`, and cooperative reads/membership report
+`coordinator_not_available`; reconnecting the SDK will not restore availability.
+After correcting the underlying storage/write failure, restart the broker using
+its existing data directory and wait for startup consumer-metadata replay to
+succeed before resuming consumers. `NewCoordinatorWithRecovery` reconstructs the
+group from the local committed metadata log, so it can resolve whether the
+ambiguous write persisted. If that replay fails, recovery is not complete. This
+is an explicit standalone availability cost of retaining the ownership fence;
+no in-place automatic recovery is implemented for this case.
 
 ## Reproducing validation
 
