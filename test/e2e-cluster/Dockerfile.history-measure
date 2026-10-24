@@ -1,0 +1,15 @@
+FROM golang:1.26.6 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /broker ./cmd/broker
+
+FROM alpine:3.20
+RUN apk add --no-cache python3 strace curl
+WORKDIR /app
+COPY --from=build /broker /app/broker
+COPY test/e2e-cluster/history_measure.py /app/history_measure.py
+RUN addgroup -g 1000 cursus && adduser -D -u 1000 -G cursus cursus && mkdir /app/cluster-logs && chown cursus:cursus /app/cluster-logs
+USER cursus
+ENTRYPOINT ["python3", "/app/history_measure.py", "run"]

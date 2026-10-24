@@ -1,0 +1,21 @@
+services:
+  broker-1: &measure-broker
+    cpus: 2
+    build:
+      dockerfile: test/e2e-cluster/Dockerfile.history-measure
+    cap_add: [SYS_PTRACE]
+    environment: &measure-environment
+      CONSUMER_HISTORY_COMPACTION_ENABLED: "${CURSUS_HISTORY_MEASURE_COMPACTION:-false}"
+      LOG_INDEX_SIZE_BYTES: "1048576"
+      LINGER_MS: "1"
+      HISTORY_TRACE_SYNC: "${CURSUS_HISTORY_TRACE_SYNC:-true}"
+      CONSUMER_SESSION_TIMEOUT: "120000"
+      DEFAULT_REPLICATION_FACTOR: "${CURSUS_HISTORY_REPLICATION_FACTOR:-3}"
+  broker-2:
+    <<: *measure-broker
+    environment:
+      <<: *measure-environment
+  broker-3:
+    <<: *measure-broker
+    environment:
+      <<: *measure-environment

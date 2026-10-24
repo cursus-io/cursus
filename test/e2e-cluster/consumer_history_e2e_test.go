@@ -23,7 +23,13 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 		t.Skip("set RUN_E2E_CONSUMER_HISTORY=1 with CURSUS_CLEANUP_PORT_OFFSET")
 	}
 	require.NotZero(t, cleanupPortOffset(), "an isolated port/project offset is mandatory")
-	ctx := givenCleanupCluster(t, composeFile, "docker-compose.consumer-history.yml").WithClusterSize(3).WithTopic("history-orders").WithPartitions(1).WithAcks("all")
+	files := []string{composeFile, "docker-compose.consumer-history.yml"}
+	if os.Getenv("CURSUS_HISTORY_REPLICATION_FACTOR") == "2" {
+		t.Setenv("CURSUS_HISTORY_MEASURE_COMPACTION", "true")
+		t.Setenv("CURSUS_HISTORY_TRACE_SYNC", "false")
+		files = append(files, "docker-compose.history-measure.yml")
+	}
+	ctx := givenCleanupCluster(t, files...).WithClusterSize(3).WithTopic("history-orders").WithPartitions(1).WithAcks("all")
 	defer ctx.Cleanup()
 	actions := ctx.WhenCluster().StartCluster()
 	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-orders partitions=1 replication_factor=3")

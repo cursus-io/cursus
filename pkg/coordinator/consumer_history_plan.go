@@ -22,6 +22,8 @@ type ConsumerHistoryCompactionPlan struct {
 	end                           uint64
 	bounds                        []consumerReplayIndexPartition
 	removed                       []types.Message
+	transactions                  map[string]consumerHistoryTransactionFence
+	subsequenceSafe               bool
 	detached                      bool
 	readRecords, readPayloadBytes int64
 }
@@ -109,6 +111,9 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 	// producer record for legacy sequence-zero writers.
 	producerHigh := make(map[string]types.Message)
 	producerLast := make(map[string]uint64)
+	transactions := make(map[historyTransactionKey]*historyTransaction)
+	intentSources := make(map[string]uint64)
+	subsequence := historySubsequenceProof{valid: true, last: make(map[replayIndexKey]ConsumerMetadataRecord), sources: make(map[string]map[int]bool)}
 	fullReader := &historyPlanReader{ConsumerMetadataCommittedReader: source}
 	fullReader.read = func(topic string, p int, next uint64, max int) ([]types.Message, error) {
 		messages, err := bounded.ReadTopicPartition(topic, p, next, max)
@@ -122,6 +127,10 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 				return nil, err
 			}
 			if protected {
+				if p == partition && m.TransactionMarker == types.TransactionMarkerNone {
+					r, _, _ := decodeConsumerMetadataRecord(m.Payload)
+					intentSources[r.Group] = m.Offset
+				}
 				continue
 			}
 			record, versioned, err := decodeConsumerMetadataRecord(m.Payload)
@@ -133,13 +142,6 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 			}
 			if p == partition && m.Offset >= first && m.Offset < end {
 				candidates = append(candidates, m)
-			}
-			if p == partition && m.ProducerID != "" {
-				producerLast[m.ProducerID] = m.Offset
-				previous, exists := producerHigh[m.ProducerID]
-				if m.SeqNum > 0 && (!exists || m.Epoch > previous.Epoch || m.Epoch == previous.Epoch && (m.SeqNum > previous.SeqNum || m.SeqNum == previous.SeqNum && m.Offset > previous.Offset)) {
-					producerHigh[m.ProducerID] = m
-				}
 			}
 		}
 		return messages, selectors[p].observe(p, messages, false)
@@ -178,11 +180,39 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 			}
 			for _, m := range messages {
 				next = m.Offset + 1
+				if m.TransactionMarker == types.TransactionMarkerNone {
+					r, versioned, decodeErr := decodeConsumerMetadataRecord(m.Payload)
+					if decodeErr != nil || !versioned {
+						subsequence.valid = false
+					} else {
+						subsequence.observe(p, partition, r)
+					}
+				}
+				if p == partition && m.ProducerID != "" {
+					producerLast[m.ProducerID] = m.Offset
+					previous, exists := producerHigh[m.ProducerID]
+					if m.SeqNum > 0 && (!exists || m.Epoch > previous.Epoch || m.Epoch == previous.Epoch && (m.SeqNum > previous.SeqNum || m.SeqNum == previous.SeqNum && m.Offset > previous.Offset)) {
+						producerHigh[m.ProducerID] = m
+					}
+				}
 				protected, err := protectedConsumerHistoryTransaction(m)
 				if err != nil {
 					return nil, err
 				}
 				if protected {
+					if p == partition && indexTransaction(m) {
+						key := historyTransactionOf(m)
+						tx := transactions[key]
+						if tx == nil {
+							tx = &historyTransaction{}
+							transactions[key] = tx
+						}
+						if m.TransactionMarker != types.TransactionMarkerNone {
+							tx.markers = append(tx.markers, m)
+						} else {
+							tx.intents = append(tx.intents, m)
+						}
+					}
 					continue
 				}
 				if err := json.NewEncoder(digest).Encode(m); err != nil {
@@ -198,6 +228,11 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 	keep := make(map[uint64]bool)
 	for _, entry := range selectors[partition].selected {
 		keep[entry.Message.Offset] = true
+		r, _, _ := decodeConsumerMetadataRecord(entry.Message.Payload)
+		delete(intentSources, r.Group)
+	}
+	for _, offset := range intentSources {
+		keep[offset] = true
 	}
 	for _, offset := range producerLast {
 		keep[offset] = true
@@ -211,6 +246,11 @@ func (c *Coordinator) PrepareConsumerHistoryCompaction(source ConsumerMetadataIn
 			remove[m.Offset] = true
 			plan.removed = append(plan.removed, m)
 		}
+	}
+	plan.selectRetiredTransactions(transactions, keep)
+	plan.subsequenceSafe = subsequence.safe(partition)
+	for _, m := range plan.removed {
+		remove[m.Offset] = true
 	}
 	filtered := &historyPlanReader{ConsumerMetadataCommittedReader: source}
 	// Strict replay resumes after the last RETURNED record, which can precede

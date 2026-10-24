@@ -384,6 +384,17 @@ func (l *DetachedMetadataLease) visible(m types.Message, resolver TransactionDec
 // Continue from the last returned offset + 1. Filtered intervals are scanned to
 // the fixed end, and short byte-limited pages may require decoding them again.
 func (l *DetachedMetadataLease) ReadCommittedMetadata(ctx context.Context, offset uint64, maxRecords int, resolver TransactionDecisionResolver) ([]types.Message, error) {
+	return l.readMetadata(ctx, offset, maxRecords, resolver, false)
+}
+
+// ReadRawMetadata exposes the immutable, already-synced adopted prefix for
+// history certification. Invisible intents and controls must not be omitted.
+// It shares the same scratch budget and actual-work accounting as replay.
+func (l *DetachedMetadataLease) ReadRawMetadata(ctx context.Context, offset uint64, maxRecords int) ([]types.Message, error) {
+	return l.readMetadata(ctx, offset, maxRecords, nil, true)
+}
+
+func (l *DetachedMetadataLease) readMetadata(ctx context.Context, offset uint64, maxRecords int, resolver TransactionDecisionResolver, rawRead bool) ([]types.Message, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("detached read requires context")
 	}
@@ -418,7 +429,7 @@ func (l *DetachedMetadataLease) ReadCommittedMetadata(ctx context.Context, offse
 		}
 		for _, raw := range page.Messages {
 			msg := detachedMetadataMessage(raw)
-			visible := l.visible(msg, resolver)
+			visible := rawRead || l.visible(msg, resolver)
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}

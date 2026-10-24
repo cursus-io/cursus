@@ -2,8 +2,8 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
@@ -22,9 +22,9 @@ type consumerHistoryCursor struct {
 	valid     bool
 }
 
-// compactConsumerHistory performs at most one atomic segment replacement. The
-// full certification reads ordinary local views outside consumer admission and
-// FSM exclusion; only final validation/publication takes those gates.
+// compactConsumerHistory certifies one partition's closed prefix, then publishes
+// separately fenced atomic segments. Unsafe subsequences use one segment. Full
+// scans and remote transfers never hold consumer admission or the FSM fence.
 func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *consumerHistoryCursor) (result disk.CompactionResult, err error) {
 	defer func() {
 		outcome := "completed"
@@ -34,10 +34,6 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 			outcome = "skipped"
 		}
 		metrics.ConsumerHistoryRuns.WithLabelValues(outcome).Inc()
-		metrics.ConsumerHistoryRemovedRecords.Add(float64(result.RecordsRemoved))
-		if err == nil && result.BytesBefore > result.BytesAfter {
-			metrics.ConsumerHistoryRemovedBytes.Add(float64(result.BytesBefore - result.BytesAfter))
-		}
 	}()
 	if !ch.isDistributed() || ch.Coordinator == nil || ch.TopicManager == nil || !ch.Config.ConsumerHistoryCompactionEnabled {
 		result.SkippedReason = "disabled"
@@ -56,7 +52,10 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 	phaseStart := time.Now()
 	metadata, err := state.ConsumerMetadataRecoverySnapshot()
 	if err == nil {
-		plan, err = ch.localConsumerHistoryPlan(metadata)
+		plan, err = ch.prepareConsumerRecoveryPlan(ctx, metadata, -1, false)
+	}
+	if plan != nil {
+		defer plan.close()
 	}
 	if err == nil {
 		work, err = ch.Coordinator.TryCaptureConsumerHistoryWork()
@@ -67,6 +66,8 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 	}
 	var certificate *coordinator.ConsumerHistoryCompactionPlan
 	var selected disk.ConsumerHistorySegment
+	var segments []disk.ConsumerHistorySegment
+	var sweep *coordinator.ConsumerHistorySweep
 	target := -1
 	phaseStart = time.Now()
 	err = ch.withConsumerRecoveryPlan(ctx, plan, -1, nil, func(reader *consumerRecoveryReader) error {
@@ -76,6 +77,9 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 		}
 		var candidates []candidate
 		for p, v := range reader.views {
+			if v == nil {
+				continue
+			}
 			if allowed, _ := ch.distributedCompactionAllowed(config.ConsumerOffsetsTopicName, p); !allowed {
 				continue
 			}
@@ -100,14 +104,32 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 		}
 		target, selected = chosen.partition, chosen.segment
 		first, end := selected.Range()
+		for _, candidate := range candidates {
+			start, stop := candidate.segment.Range()
+			if candidate.partition == target && start >= first {
+				segments = append(segments, candidate.segment)
+				end = stop
+			}
+		}
 		*cursor = consumerHistoryCursor{target, first, true}
 		var e error
-		counted := &consumerHistoryCountingReader{ConsumerMetadataIndexReader: reader}
+		counted := &consumerHistoryCountingReader{ConsumerMetadataIndexReader: consumerHistorySource{reader}}
 		defer func() {
 			metrics.ConsumerHistoryReadRecords.Add(float64(counted.records))
 			metrics.ConsumerHistoryReadPayloadBytes.Add(float64(counted.bytes))
 		}()
 		certificate, e = work.Prepare(counted, target, first, end)
+		if e == nil && len(segments) > 1 {
+			var safe bool
+			sweep, safe = certificate.Sweep()
+			if !safe {
+				// Replay equivalence of a whole prefix does not imply safe
+				// intermediate publications. Fall back to the original proof.
+				segments = segments[:1]
+				_, end = selected.Range()
+				certificate, e = work.Prepare(counted, target, first, end)
+			}
+		}
 		return e
 	})
 	metrics.ConsumerHistoryPhaseSeconds.WithLabelValues("certify").Observe(time.Since(phaseStart).Seconds())
@@ -118,49 +140,120 @@ func (ch *CommandHandler) compactConsumerHistory(ctx context.Context, cursor *co
 		result.SkippedReason = "no_eligible_segments"
 		return result, nil
 	}
-	if len(certificate.RemovedRecords()) == 0 && !selected.Empty() {
+	if sweep == nil && len(certificate.RemovedRecords()) == 0 && !selected.Empty() {
 		result.SkippedReason = "no_superseded_records"
 		return result, nil
 	}
+	if err = ch.refreshConsumerHistorySources(ctx, plan); err != nil {
+		return result, err
+	}
 	phaseStart = time.Now()
-	err = ch.withConsumerHistoryFence(ctx, func(metadata []fsm.PartitionMetadata) error {
-		if !state.ConsumerHistoryEnabled() || !state.ConsumerMetadataRoutingEnabled() {
-			return fmt.Errorf("consumer history activation changed")
-		}
-		current, e := ch.localConsumerHistoryPlan(metadata)
-		if e != nil {
-			return e
-		}
-		if len(metadata) != len(plan.metadata) {
-			return fmt.Errorf("consumer history topology changed")
-		}
-		for p, m := range metadata {
-			old := plan.metadata[p]
-			if m.CommittedHWM < old.CommittedHWM || current.local[p] != plan.local[p] {
-				return fmt.Errorf("consumer history source replaced")
-			}
-			m.CommittedHWM = old.CommittedHWM
-			if !reflect.DeepEqual(m, old) {
-				return fmt.Errorf("consumer history authority changed")
+	for _, segment := range segments {
+		first, end := segment.Range()
+		if sweep != nil {
+			certificate, err = sweep.Segment(first, end)
+			if err != nil {
+				break
 			}
 		}
-		if allowed, reason := ch.distributedCompactionAllowed(config.ConsumerOffsetsTopicName, target); !allowed {
-			return fmt.Errorf("consumer history replica gate: %s", reason)
+		var part disk.CompactionResult
+		part, err = ch.publishConsumerHistorySegment(ctx, plan, target, segment, certificate, sweep)
+		// A later segment can defer after earlier durable publications. Account
+		// those successes even when the overall sweep returns an error. Failed
+		// rewrites return no removed records and cannot certify saved bytes.
+		metrics.ConsumerHistoryRemovedRecords.Add(float64(part.RecordsRemoved))
+		if part.RecordsRemoved > 0 && part.BytesBefore > part.BytesAfter {
+			metrics.ConsumerHistoryRemovedBytes.Add(float64(part.BytesBefore - part.BytesAfter))
 		}
-		return current.local[target].WithConsumerHistoryInstallation(ctx, func(view *topic.PartitionReadView, install func(disk.ConsumerHistorySegment, []types.Message) (disk.CompactionResult, error)) error {
-			return ch.withConsumerRecoveryPlan(ctx, current, target, view, func(reader *consumerRecoveryReader) error {
-				reader.ends[target] = metadata[target].CommittedHWM
-				if e := ch.Coordinator.ValidateConsumerHistoryCompaction(reader, certificate); e != nil {
-					return e
-				}
-				var e error
-				result, e = install(selected, certificate.RemovedRecords())
-				return e
-			})
-		})
-	})
+		result.SegmentsScanned += part.SegmentsScanned
+		result.SegmentsRewritten += part.SegmentsRewritten
+		result.RecordsScanned += part.RecordsScanned
+		result.RecordsRemoved += part.RecordsRemoved
+		result.BytesBefore += part.BytesBefore
+		result.BytesAfter += part.BytesAfter
+		if err != nil {
+			break
+		}
+		*cursor = consumerHistoryCursor{target, first, true}
+	}
 	metrics.ConsumerHistoryPhaseSeconds.WithLabelValues("publish").Observe(time.Since(phaseStart).Seconds())
 	return result, err
+}
+
+func (ch *CommandHandler) publishConsumerHistorySegment(ctx context.Context, plan *consumerRecoveryPlan, target int, selected disk.ConsumerHistorySegment, certificate *coordinator.ConsumerHistoryCompactionPlan, sweep *coordinator.ConsumerHistorySweep) (result disk.CompactionResult, err error) {
+	state := ch.Cluster.RaftManager.GetFSM()
+	err = retryConsumerHistoryFence(ctx, func() (bool, error) {
+		entered := false
+		e := ch.withConsumerHistoryFence(ctx, func(metadata []fsm.PartitionMetadata) error {
+			entered = true
+			if !state.ConsumerHistoryEnabled() || !state.ConsumerMetadataRoutingEnabled() {
+				return fmt.Errorf("consumer history activation changed")
+			}
+			if certificate.HasTransactionRemovals() && !state.ConsumerTransactionHistoryEnabled() {
+				return fmt.Errorf("consumer transaction history activation pending")
+			}
+			if e := ch.validateConsumerRecoveryPlan(plan, metadata); e != nil {
+				return e
+			}
+			if allowed, reason := ch.distributedCompactionAllowed(config.ConsumerOffsetsTopicName, target); !allowed {
+				return fmt.Errorf("consumer history replica gate: %s", reason)
+			}
+			return plan.local[target].WithConsumerHistoryInstallation(ctx, func(view *topic.PartitionReadView, install func(disk.ConsumerHistorySegment, disk.ConsumerHistoryRemovalCertificate) (disk.CompactionResult, error)) error {
+				return ch.withConsumerRecoveryPlan(ctx, plan, target, view, func(reader *consumerRecoveryReader) error {
+					reader.ends[target] = metadata[target].CommittedHWM
+					if e := ch.Coordinator.ValidateConsumerHistoryCompaction(consumerHistorySource{reader}, certificate); e != nil {
+						return e
+					}
+					var e error
+					if len(certificate.RemovedRecords()) != 0 || selected.Empty() {
+						selected, e = view.RefreshConsumerHistorySegment(ctx, selected)
+						if e != nil {
+							return e
+						}
+						result, e = install(selected, certificate)
+						if e != nil {
+							return e
+						}
+					}
+					if sweep != nil {
+						identity, e := (consumerHistorySource{reader}).ConsumerMetadataIndexIdentity(target)
+						if e != nil {
+							return e
+						}
+						return sweep.Published(certificate, identity)
+					}
+					return nil
+				})
+			})
+		})
+		return entered, e
+	})
+	return result, err
+}
+
+// Reuse the scanned certificate only when publication never entered the FSM
+// fence. Each retry releases admission first. Once validation or storage starts,
+// any failure discards the plan; no partial publication is retried blindly.
+func retryConsumerHistoryFence(ctx context.Context, attempt func() (bool, error)) error {
+	var err error
+	for tries := 0; tries < 16; tries++ {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
+		var entered bool
+		entered, err = attempt()
+		if entered || !errors.Is(err, fsm.ErrConsumerMetadataFencePending) || tries == 15 {
+			return err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
 }
 
 type consumerHistoryCountingReader struct {
@@ -211,29 +304,6 @@ func (ch *CommandHandler) consumerHistoryRecoveryReady() error {
 	return nil
 }
 
-func (ch *CommandHandler) localConsumerHistoryPlan(metadata []fsm.PartitionMetadata) (*consumerRecoveryPlan, error) {
-	t := ch.TopicManager.GetTopic(config.ConsumerOffsetsTopicName)
-	if t == nil || t.Definition().Partitions != len(metadata) {
-		return nil, ErrConsumerRecoveryPending
-	}
-	plan := &consumerRecoveryPlan{metadata: cloneConsumerRecoveryMetadata(metadata), local: make([]*topic.Partition, len(metadata)), ends: make([]uint64, len(metadata))}
-	for p, m := range metadata {
-		if !m.CommittedHWMKnown || m.LifecycleEpoch != t.Definition().LifecycleEpoch {
-			return nil, ErrConsumerRecoveryPending
-		}
-		partition, err := t.GetPartition(p)
-		if err != nil {
-			return nil, err
-		}
-		// Missing coverage is a hold, never a reason to compact a partial view.
-		if partition.BootstrapPending() || partition.SnapshotRecoveryPending() || !partition.HWMKnown() || partition.GetHWM() < m.CommittedHWM {
-			return nil, ErrConsumerRecoveryPending
-		}
-		plan.local[p], plan.ends[p] = partition, m.CommittedHWM
-	}
-	return plan, nil
-}
-
 func (ch *CommandHandler) startConsumerHistoryMonitor(ctx context.Context) error {
 	if !ch.Config.ConsumerHistoryCompactionEnabled {
 		return nil
@@ -256,10 +326,8 @@ func (ch *CommandHandler) startConsumerHistoryMonitor(ctx context.Context) error
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				attempt, cancel := context.WithTimeout(ctx, time.Minute)
 				start := time.Now()
-				result, err := ch.compactConsumerHistory(attempt, &cursor)
-				cancel()
+				result, err := ch.compactConsumerHistory(ctx, &cursor)
 				if err != nil {
 					util.Warn("Consumer history compaction deferred: %v", err)
 				} else if result.RecordsRemoved > 0 {
