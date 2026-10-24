@@ -407,7 +407,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		defer shutdownObservation()
 		util.Info("Read-only observation gRPC listener started on 127.0.0.1:%d", cfg.ObservationGRPCPort)
 	}
-	if err := globalCH.RecoverPreparedTransactions(); err != nil {
+	if err := awaitPreparedTransactionRecovery(ctx, cfg.EnabledDistribution, globalCH.RecoverPreparedTransactions); err != nil {
 		return fmt.Errorf("failed to recover prepared transactions: %w", err)
 	}
 	globalCH.StartTransactionTimeoutMonitor(ctx)

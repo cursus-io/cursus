@@ -20,7 +20,9 @@ will alter one follower's returned page after the real read: omit a tombstone,
 corrupt its payload, conflict its epoch, expose a record outside the committed
 page, replay an obsolete epoch, or add a transactional envelope. The durable
 log remains intact. An observation marker proves the selected record reached
-the hook; pending status and rejected writes must prove no final publication.
+the hook; pending status and rejected local reads must prove no early local
+completion publication. A routed write may reach a healthy owner, so it is not
+used as proof of the selected follower's local completion.
 This is a local read-response fault model, not on-disk sector corruption or a
 claim that the source actually committed an invalid record. Removing the hook
 and restarting that follower must recover from the unchanged authoritative log.
@@ -265,8 +267,9 @@ after the reservation checks passed, the returning coordinator exited from
 required=3`, preventing full ISR recovery. This run is a failure, not superseded
 by the passing CI timing. A prior local attempt also timed out negotiating the
 group-owner connection before LEAVE; the diagnostic rerun passed that point.
-The deterministic startup retry correction and its validation remain a required
-follow-up layer. The acceptance reconciliation still requires the
+The dependent [startup retry correction](prepared-startup-recovery.md) now has
+deterministic baseline/fix tests, a passing full server race suite and a passing
+rerun of the same real-broker scenario. The acceptance reconciliation still requires the
 unmerged SDK receipt validation in PR 312 and the independent prefix retry fix
 in PR 314 to be delivered alongside this correction. The original unlimited
 same-revision wording must explicitly retain the legacy compatibility exception
