@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -165,6 +166,7 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 		trackPartition = cmd.Partition
 	}
 	exists, state := f.getProducerSequence(cmd.Topic, trackPartition, firstMsg.ProducerID)
+	epochControl := f.consumerTransactionHistoryActivated && cmd.Topic == config.ConsumerOffsetsTopicName && cmd.SequenceScope == "partition" && len(cmd.Messages) == 1 && types.IsEpochSequencedConsumerControl(firstMsg)
 	f.mu.Unlock()
 
 	if !topicExists {
@@ -198,17 +200,17 @@ func (f *BrokerFSM) validateMessageCommand(cmd *types.MessageCommand) error {
 					}
 					return fmt.Errorf("out-of-order sequence (overlap) in %s scope: lastSeq %d, firstMsg.SeqNum %d", scope, state.Seq, firstMsg.SeqNum)
 				}
-				if state.Seq == ^uint64(0) || firstMsg.SeqNum > state.Seq+1 {
+				if !epochControl && (state.Seq == ^uint64(0) || firstMsg.SeqNum > state.Seq+1) {
 					scope := "global"
 					if cmd.SequenceScope == "partition" {
 						scope = "partition"
 					}
 					return fmt.Errorf("idempotency gap in %s scope for producer %s: expected %d, got %d", scope, firstMsg.ProducerID, state.Seq+1, firstMsg.SeqNum)
 				}
-			} else if firstMsg.SeqNum > 1 {
+			} else if firstMsg.SeqNum > 1 && !epochControl {
 				return fmt.Errorf("idempotency error: first message in new producer epoch for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
 			}
-		} else if firstMsg.SeqNum > 1 {
+		} else if firstMsg.SeqNum > 1 && !epochControl {
 			return fmt.Errorf("idempotency error: first message for producer %s must have seqNum 1, got %d", firstMsg.ProducerID, firstMsg.SeqNum)
 		}
 	}

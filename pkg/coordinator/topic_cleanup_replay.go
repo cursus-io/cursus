@@ -787,10 +787,10 @@ func (scan *topicCleanupScan) observeAt(message types.Message, partition int) er
 
 func validateCleanupTransactionControl(message types.Message) error {
 	invalid := fmt.Errorf("invalid consumer metadata transaction control")
-	if message.TransactionalID == "" || message.Payload != types.TransactionControlMarkerPayload ||
+	if message.TransactionalID == "" || message.Epoch < 0 || message.Payload != types.TransactionControlMarkerPayload ||
 		message.Key != "" || message.EventType != "" || message.SchemaVersion != 0 || message.AggregateVersion != 0 ||
 		message.Metadata != "" || message.EventID != "" || message.PayloadDigest != "" ||
-		message.SeqNum != 1 || message.ControlBatchType != types.ControlBatchTransaction ||
+		message.ControlBatchType != types.ControlBatchTransaction ||
 		message.ControlBatchVersion != types.ControlBatchVersionCursusV2 {
 		return invalid
 	}
@@ -809,6 +809,13 @@ func validateCleanupTransactionControl(message types.Message) error {
 	// use a separately fenced coordinator epoch in the marker producer ID.
 	legacy := fmt.Sprintf("txn-marker:%s:%s", message.TransactionalID, message.TransactionMarker)
 	processing := fmt.Sprintf("txn-marker:%s:%d:%s", message.TransactionalID, message.ControlBatchCoordinatorEpoch, message.TransactionMarker)
+	history := fmt.Sprintf("txn-history:%s:%s", message.TransactionalID, message.TransactionMarker)
+	if message.ProducerID == history && message.ControlBatchCoordinatorEpoch > 0 && message.SeqNum == uint64(message.ControlBatchCoordinatorEpoch) {
+		return nil
+	}
+	if message.SeqNum != 1 {
+		return invalid
+	}
 	if message.ProducerID != processing &&
 		(message.ProducerID != legacy || message.Epoch != message.ControlBatchCoordinatorEpoch) {
 		return invalid

@@ -11,49 +11,51 @@ import (
 )
 
 type BrokerFSMSnapshot struct {
-	cooperativeConsumerActivated     bool
-	topicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary
-	consumerHistoryActivated         bool
-	retentionTimeActivated           bool
-	consumerRecovery                 *coordinator.ConsumerRecoveryEnvelope
-	applied                          uint64
-	logs                             map[uint64]*ReplicationEntry
-	brokers                          map[string]*BrokerInfo
-	retiredBrokerIncarnations        map[string][]string
-	partitionMetadata                map[string]*PartitionMetadata
-	producerState                    map[string]map[int]map[string]ProducerSequence
-	groupState                       map[string]*coordinator.GroupStateSnapshot
-	transactionState                 map[string]*transaction.Snapshot
-	nextProducerEpoch                uint64
-	transactionCoordinatorShards     map[int]TransactionCoordinatorShard
-	transactionCoordinatorShardCount int
-	offsetReservationsActivated      bool
-	consumerMetadataRoutingActivated bool
-	topicState                       map[string]*topic.Definition
+	consumerTransactionHistoryActivated bool
+	cooperativeConsumerActivated        bool
+	topicCleanupBoundaries              map[string]*coordinator.TopicCleanupBoundary
+	consumerHistoryActivated            bool
+	retentionTimeActivated              bool
+	consumerRecovery                    *coordinator.ConsumerRecoveryEnvelope
+	applied                             uint64
+	logs                                map[uint64]*ReplicationEntry
+	brokers                             map[string]*BrokerInfo
+	retiredBrokerIncarnations           map[string][]string
+	partitionMetadata                   map[string]*PartitionMetadata
+	producerState                       map[string]map[int]map[string]ProducerSequence
+	groupState                          map[string]*coordinator.GroupStateSnapshot
+	transactionState                    map[string]*transaction.Snapshot
+	nextProducerEpoch                   uint64
+	transactionCoordinatorShards        map[int]TransactionCoordinatorShard
+	transactionCoordinatorShardCount    int
+	offsetReservationsActivated         bool
+	consumerMetadataRoutingActivated    bool
+	topicState                          map[string]*topic.Definition
 }
 
 func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	state := BrokerFSMState{
-		CooperativeConsumerActivated:     s.cooperativeConsumerActivated,
-		TopicCleanupBoundaries:           s.topicCleanupBoundaries,
-		ConsumerHistoryActivated:         s.consumerHistoryActivated,
-		RetentionTimeActivated:           s.retentionTimeActivated,
-		Version:                          s.writeVersion(),
-		Applied:                          s.applied,
-		Logs:                             s.logs,
-		Brokers:                          s.brokers,
-		RetiredBrokerIncarnations:        s.retiredBrokerIncarnations,
-		PartitionMetadata:                s.partitionMetadata,
-		ProducerState:                    s.producerState,
-		GroupState:                       s.groupState,
-		ConsumerRecovery:                 s.consumerRecovery,
-		TransactionState:                 s.transactionState,
-		NextProducerEpoch:                &s.nextProducerEpoch,
-		TransactionCoordinatorShards:     s.transactionCoordinatorShards,
-		TransactionCoordinatorShardCount: s.transactionCoordinatorShardCount,
-		OffsetReservationsActivated:      s.offsetReservationsActivated,
-		ConsumerMetadataRoutingActivated: s.consumerMetadataRoutingActivated,
-		TopicState:                       s.topicState,
+		ConsumerTransactionHistoryActivated: s.consumerTransactionHistoryActivated,
+		CooperativeConsumerActivated:        s.cooperativeConsumerActivated,
+		TopicCleanupBoundaries:              s.topicCleanupBoundaries,
+		ConsumerHistoryActivated:            s.consumerHistoryActivated,
+		RetentionTimeActivated:              s.retentionTimeActivated,
+		Version:                             s.writeVersion(),
+		Applied:                             s.applied,
+		Logs:                                s.logs,
+		Brokers:                             s.brokers,
+		RetiredBrokerIncarnations:           s.retiredBrokerIncarnations,
+		PartitionMetadata:                   s.partitionMetadata,
+		ProducerState:                       s.producerState,
+		GroupState:                          s.groupState,
+		ConsumerRecovery:                    s.consumerRecovery,
+		TransactionState:                    s.transactionState,
+		NextProducerEpoch:                   &s.nextProducerEpoch,
+		TransactionCoordinatorShards:        s.transactionCoordinatorShards,
+		TransactionCoordinatorShardCount:    s.transactionCoordinatorShardCount,
+		OffsetReservationsActivated:         s.offsetReservationsActivated,
+		ConsumerMetadataRoutingActivated:    s.consumerMetadataRoutingActivated,
+		TopicState:                          s.topicState,
 	}
 
 	util.Debug("Persisting snapshot data")
@@ -69,6 +71,9 @@ func (s *BrokerFSMSnapshot) Persist(sink raft.SnapshotSink) error {
 }
 
 func (s *BrokerFSMSnapshot) writeVersion() int {
+	if s.consumerTransactionHistoryActivated {
+		return SnapshotVersionTransactionHistory
+	}
 	if s.cooperativeConsumerActivated {
 		return SnapshotVersionCooperativeRuntime
 	}

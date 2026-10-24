@@ -51,3 +51,13 @@ func (r *consumerRecoveryReader) SyncConsumerMetadataIndex() error {
 	}
 	return nil
 }
+
+func (r *consumerRecoveryReader) ConsumerMetadataIndexTransactionVisible(p int, m types.Message) (bool, error) {
+	if err := r.ctx.Err(); err != nil {
+		return false, err
+	}
+	if p < 0 || p >= len(r.views) || r.views[p] == nil {
+		return false, fmt.Errorf("local replay index view unavailable")
+	}
+	return r.views[p].ConsumerReplayIndexTransactionVisible(m, r.ends[p])
+}

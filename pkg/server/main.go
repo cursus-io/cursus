@@ -280,6 +280,9 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 						if err := clusterController.ActivateConsumerHistory(rm); err != nil {
 							util.Debug("consumer history activation pending: %v", err)
 						}
+						if err := clusterController.ActivateConsumerTransactionHistory(rm); err != nil {
+							util.Debug("consumer transaction history activation pending: %v", err)
+						}
 					}
 					if cfg.ConsumerCooperativeEnabled {
 						if err := clusterController.ActivateCooperativeConsumer(rm); err != nil {

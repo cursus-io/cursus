@@ -16,7 +16,7 @@ func producerEpochWatermarkForRestore(state *BrokerFSMState) (uint64, error) {
 		return 0, fmt.Errorf("transaction snapshot state is missing")
 	}
 	if state.NextProducerEpoch != nil {
-		if state.Version != SnapshotVersionCurrent && state.Version != SnapshotVersionProducerEpoch && state.Version != SnapshotVersionCooperative && state.Version != SnapshotVersionCooperativeRuntime {
+		if state.Version != SnapshotVersionCurrent && state.Version != SnapshotVersionProducerEpoch && state.Version != SnapshotVersionCooperative && state.Version != SnapshotVersionCooperativeRuntime && state.Version != SnapshotVersionTransactionHistory {
 			return 0, fmt.Errorf("snapshot version %d cannot contain a producer epoch watermark", state.Version)
 		}
 		if err := transaction.ValidateProducerEpochWatermark(*state.NextProducerEpoch); err != nil {

@@ -9,6 +9,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
+	"github.com/cursus-io/cursus/util"
 )
 
 // ConsumerTransactionMetadataRoute preserves the transaction coordinator's
@@ -74,6 +75,12 @@ func (f *BrokerFSM) validateConsumerTransactionMessageLocked(route *types.Consum
 		return fenced
 	}
 	if msg.TransactionMarker != "" {
+		sequence, sequenceOK := util.SafeInt64ToUint64(tx.CoordinatorEpoch)
+		if sequenceOK && sequence > 0 && f.consumerTransactionHistoryActivated && tx.Mode == transaction.ModeProcessingV1 && msg.ProducerID == fmt.Sprintf("txn-history:%s:%s", tx.ID, msg.TransactionMarker) && msg.SeqNum == sequence {
+			// Validate every other field using the existing processing marker contract.
+			msg.ProducerID = fmt.Sprintf("txn-marker:%s:%d:%s", tx.ID, tx.CoordinatorEpoch, msg.TransactionMarker)
+			msg.SeqNum = 1
+		}
 		return validateConsumerTransactionMarker(tx, msg)
 	}
 	if msg.ProducerID != tx.Producer || msg.TransactionState != types.TransactionStateOpen {
@@ -82,6 +89,9 @@ func (f *BrokerFSM) validateConsumerTransactionMessageLocked(route *types.Consum
 	record, versioned, err := coordinator.DecodeConsumerMetadataRecord(msg.Payload)
 	if err != nil || !versioned || record.Type != coordinator.ConsumerMetadataRecordTransactionalOffsetSnapshot ||
 		record.TransactionalID != tx.ID || record.ProducerID != tx.Producer || record.ProducerEpoch != tx.Epoch || record.CoordinatorEpoch != tx.CoordinatorEpoch || record.Revision != tx.Revision {
+		return fenced
+	}
+	if record.Version == coordinator.ConsumerMetadataRecordVersionTransactionHistory && (!f.consumerTransactionHistoryActivated || tx.Mode != transaction.ModeProcessingV1) {
 		return fenced
 	}
 	expected := make(map[int]uint64)

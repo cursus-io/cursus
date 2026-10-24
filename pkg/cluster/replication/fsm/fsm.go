@@ -24,18 +24,19 @@ import (
 )
 
 const (
-	TopicLifecycleProtocolVersion          = 1
-	DistributedCompactionProtocolVersion   = 2
-	OffsetReservationsProtocolVersion      = 3
-	ReplicaReassignmentProtocolVersion     = 4
-	LeaderEpochRecoveryProtocolVersion     = 5
-	ReplicaGapRecoveryProtocolVersion      = 6
-	TruncateReceiptProtocolVersion         = 7
-	TruncateCleanupBoundaryProtocolVersion = 8
-	RetentionTimeProtocolVersion           = 9
-	ConsumerHistoryProtocolVersion         = 10
-	CooperativeConsumerProtocolVersion     = 11
-	BrokerProtocolVersionCurrent           = CooperativeConsumerProtocolVersion
+	TopicLifecycleProtocolVersion             = 1
+	DistributedCompactionProtocolVersion      = 2
+	OffsetReservationsProtocolVersion         = 3
+	ReplicaReassignmentProtocolVersion        = 4
+	LeaderEpochRecoveryProtocolVersion        = 5
+	ReplicaGapRecoveryProtocolVersion         = 6
+	TruncateReceiptProtocolVersion            = 7
+	TruncateCleanupBoundaryProtocolVersion    = 8
+	RetentionTimeProtocolVersion              = 9
+	ConsumerHistoryProtocolVersion            = 10
+	CooperativeConsumerProtocolVersion        = 11
+	ConsumerTransactionHistoryProtocolVersion = 12
+	BrokerProtocolVersionCurrent              = ConsumerTransactionHistoryProtocolVersion
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
@@ -75,39 +76,42 @@ type TransactionCoordinatorShard struct {
 }
 
 type BrokerFSMState struct {
-	CooperativeConsumerActivated     bool                                           `json:"cooperativeConsumerActivated,omitempty"`
-	TopicCleanupBoundaries           map[string]*coordinator.TopicCleanupBoundary   `json:"topicCleanupBoundaries,omitempty"`
-	ConsumerHistoryActivated         bool                                           `json:"consumerHistoryActivated,omitempty"`
-	RetentionTimeActivated           bool                                           `json:"retentionTimeActivated,omitempty"`
-	Version                          int                                            `json:"version"`
-	Applied                          uint64                                         `json:"applied"`
-	Logs                             map[uint64]*ReplicationEntry                   `json:"logs"`
-	Brokers                          map[string]*BrokerInfo                         `json:"brokers"`
-	RetiredBrokerIncarnations        map[string][]string                            `json:"retiredBrokerIncarnations,omitempty"`
-	PartitionMetadata                map[string]*PartitionMetadata                  `json:"partitionMetadata"`
-	ProducerState                    map[string]map[int]map[string]ProducerSequence `json:"producerState"`
-	GroupState                       map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
-	ConsumerRecovery                 *coordinator.ConsumerRecoveryEnvelope          `json:"consumerRecovery,omitempty"`
-	TransactionState                 map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
-	NextProducerEpoch                *uint64                                        `json:"nextProducerEpoch,omitempty"`
-	TransactionCoordinatorShards     map[int]TransactionCoordinatorShard            `json:"transactionCoordinatorShards,omitempty"`
-	TransactionCoordinatorShardCount int                                            `json:"transactionCoordinatorShardCount,omitempty"`
-	OffsetReservationsActivated      bool                                           `json:"offsetReservationsActivated,omitempty"`
-	ConsumerMetadataRoutingActivated bool                                           `json:"consumerMetadataRoutingActivated,omitempty"`
-	TopicState                       map[string]*topic.Definition                   `json:"topicState,omitempty"`
+	ConsumerTransactionHistoryActivated bool                                           `json:"consumerTransactionHistoryActivated,omitempty"`
+	CooperativeConsumerActivated        bool                                           `json:"cooperativeConsumerActivated,omitempty"`
+	TopicCleanupBoundaries              map[string]*coordinator.TopicCleanupBoundary   `json:"topicCleanupBoundaries,omitempty"`
+	ConsumerHistoryActivated            bool                                           `json:"consumerHistoryActivated,omitempty"`
+	RetentionTimeActivated              bool                                           `json:"retentionTimeActivated,omitempty"`
+	Version                             int                                            `json:"version"`
+	Applied                             uint64                                         `json:"applied"`
+	Logs                                map[uint64]*ReplicationEntry                   `json:"logs"`
+	Brokers                             map[string]*BrokerInfo                         `json:"brokers"`
+	RetiredBrokerIncarnations           map[string][]string                            `json:"retiredBrokerIncarnations,omitempty"`
+	PartitionMetadata                   map[string]*PartitionMetadata                  `json:"partitionMetadata"`
+	ProducerState                       map[string]map[int]map[string]ProducerSequence `json:"producerState"`
+	GroupState                          map[string]*coordinator.GroupStateSnapshot     `json:"groupState,omitempty"`
+	ConsumerRecovery                    *coordinator.ConsumerRecoveryEnvelope          `json:"consumerRecovery,omitempty"`
+	TransactionState                    map[string]*transaction.Snapshot               `json:"transactionState,omitempty"`
+	NextProducerEpoch                   *uint64                                        `json:"nextProducerEpoch,omitempty"`
+	TransactionCoordinatorShards        map[int]TransactionCoordinatorShard            `json:"transactionCoordinatorShards,omitempty"`
+	TransactionCoordinatorShardCount    int                                            `json:"transactionCoordinatorShardCount,omitempty"`
+	OffsetReservationsActivated         bool                                           `json:"offsetReservationsActivated,omitempty"`
+	ConsumerMetadataRoutingActivated    bool                                           `json:"consumerMetadataRoutingActivated,omitempty"`
+	TopicState                          map[string]*topic.Definition                   `json:"topicState,omitempty"`
 }
 
 type BrokerFSM struct {
-	cooperativeConsumerActivated bool
-	topicCleanupBoundaries       map[string]*coordinator.TopicCleanupBoundary
-	consumerHistoryFlag          atomic.Bool
-	consumerHistoryActivated     bool
-	retentionTimeFlag            atomic.Bool
-	retentionTimeActivated       bool
-	notifiers                    map[string]chan interface{}
-	mu                           sync.RWMutex
-	transitionMu                 contextlock.RWMutex
-	materializationMu            contextlock.RWMutex
+	consumerTransactionHistoryActivated bool
+	consumerTransactionHistoryFlag      atomic.Bool
+	cooperativeConsumerActivated        bool
+	topicCleanupBoundaries              map[string]*coordinator.TopicCleanupBoundary
+	consumerHistoryFlag                 atomic.Bool
+	consumerHistoryActivated            bool
+	retentionTimeFlag                   atomic.Bool
+	retentionTimeActivated              bool
+	notifiers                           map[string]chan interface{}
+	mu                                  sync.RWMutex
+	transitionMu                        contextlock.RWMutex
+	materializationMu                   contextlock.RWMutex
 
 	logs                      map[uint64]*ReplicationEntry
 	brokers                   map[string]*BrokerInfo
@@ -352,6 +356,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyOffsetSyncCommand(strings.TrimPrefix(data, "OFFSET_SYNC:"))
 	case strings.HasPrefix(data, "BATCH_OFFSET:"):
 		res = f.applyBatchOffsetSyncCommand(strings.TrimPrefix(data, "BATCH_OFFSET:"))
+	case strings.HasPrefix(data, "CONSUMER_TRANSACTION_HISTORY_ACTIVATE:"):
+		res = f.applyConsumerTransactionHistoryActivation(strings.TrimPrefix(data, "CONSUMER_TRANSACTION_HISTORY_ACTIVATE:"))
 	case strings.HasPrefix(data, "CONSUMER_HISTORY_ACTIVATE:"):
 		res = f.applyConsumerHistoryActivation(strings.TrimPrefix(data, "CONSUMER_HISTORY_ACTIVATE:"))
 	case strings.HasPrefix(data, "RETENTION_TIME_ACTIVATE:"):
@@ -396,13 +402,21 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 		util.Error("Failed to decode snapshot: %v", err)
 		return fmt.Errorf("failed to restore snapshot: %w", err)
 	}
-	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch && header.Version != SnapshotVersionCooperative && header.Version != SnapshotVersionCooperativeRuntime {
+	if header.Version != SnapshotVersionCurrent && header.Version != SnapshotVersionProducerEpoch && header.Version != SnapshotVersionLegacyEpoch && header.Version != SnapshotVersionCooperative && header.Version != SnapshotVersionCooperativeRuntime && header.Version != SnapshotVersionTransactionHistory {
 		return fmt.Errorf("%w: snapshot version %d is not supported; remove all Cursus persistent state and clean bootstrap version %d", ErrUnsupportedRecoveryProtocol, header.Version, SnapshotVersionCurrent)
 	}
 	var state BrokerFSMState
 	if err := decodeStrictJSON(snapshotData, &state); err != nil {
 		util.Error("Failed to decode snapshot version %d: %v", header.Version, err)
 		return fmt.Errorf("failed to restore snapshot version %d: %w", header.Version, err)
+	}
+	if state.ConsumerTransactionHistoryActivated {
+		if state.Version != SnapshotVersionTransactionHistory || !state.ConsumerHistoryActivated {
+			return fmt.Errorf("invalid transaction history snapshot activation")
+		}
+		if err := validateConsumerTransactionHistoryBrokers(state.Brokers); err != nil {
+			return err
+		}
 	}
 	if state.ConsumerHistoryActivated {
 		if err := validateConsumerHistoryBrokers(state.Brokers); err != nil {
@@ -519,6 +533,8 @@ func (f *BrokerFSM) Restore(rc io.ReadCloser) (restoreErr error) {
 	f.topicState = restoredTopicState
 	f.topicCleanupBoundaries = copyTopicCleanupBoundaries(state.TopicCleanupBoundaries)
 	f.transactionCoordinatorShardCount = persistedShardCount
+	f.consumerTransactionHistoryActivated = state.ConsumerTransactionHistoryActivated
+	f.consumerTransactionHistoryFlag.Store(state.ConsumerTransactionHistoryActivated)
 	f.consumerHistoryActivated = state.ConsumerHistoryActivated
 	f.consumerHistoryFlag.Store(state.ConsumerHistoryActivated)
 	f.cooperativeConsumerActivated = state.CooperativeConsumerActivated
@@ -971,25 +987,26 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 	util.Debug("Creating FSM snapshot")
 	metrics.ConsumerSnapshotBusyConsecutive.Set(0)
 	return &BrokerFSMSnapshot{
-		topicCleanupBoundaries:           f.snapshotTopicCleanupBoundariesLocked(),
-		applied:                          f.applied,
-		logs:                             logsCopy,
-		brokers:                          brokersCopy,
-		retiredBrokerIncarnations:        retiredBrokerIncarnationsCopy,
-		partitionMetadata:                metadataCopy,
-		producerState:                    producerStateCopy,
-		groupState:                       groupState,
-		consumerRecovery:                 consumerRecovery,
-		transactionState:                 transactionState,
-		nextProducerEpoch:                nextProducerEpoch,
-		transactionCoordinatorShards:     transactionCoordinatorShards,
-		transactionCoordinatorShardCount: f.effectiveTransactionCoordinatorShardCountLocked(),
-		consumerHistoryActivated:         f.consumerHistoryActivated,
-		cooperativeConsumerActivated:     f.cooperativeConsumerActivated,
-		retentionTimeActivated:           f.retentionTimeActivated,
-		offsetReservationsActivated:      f.offsetReservationsActivated,
-		consumerMetadataRoutingActivated: f.consumerMetadataRoutingActivated,
-		topicState:                       topicStateCopy,
+		consumerTransactionHistoryActivated: f.consumerTransactionHistoryActivated,
+		topicCleanupBoundaries:              f.snapshotTopicCleanupBoundariesLocked(),
+		applied:                             f.applied,
+		logs:                                logsCopy,
+		brokers:                             brokersCopy,
+		retiredBrokerIncarnations:           retiredBrokerIncarnationsCopy,
+		partitionMetadata:                   metadataCopy,
+		producerState:                       producerStateCopy,
+		groupState:                          groupState,
+		consumerRecovery:                    consumerRecovery,
+		transactionState:                    transactionState,
+		nextProducerEpoch:                   nextProducerEpoch,
+		transactionCoordinatorShards:        transactionCoordinatorShards,
+		transactionCoordinatorShardCount:    f.effectiveTransactionCoordinatorShardCountLocked(),
+		consumerHistoryActivated:            f.consumerHistoryActivated,
+		cooperativeConsumerActivated:        f.cooperativeConsumerActivated,
+		retentionTimeActivated:              f.retentionTimeActivated,
+		offsetReservationsActivated:         f.offsetReservationsActivated,
+		consumerMetadataRoutingActivated:    f.consumerMetadataRoutingActivated,
+		topicState:                          topicStateCopy,
 	}, nil
 }
 

@@ -422,6 +422,10 @@ func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetada
 				indexed.cached = nil
 				indexed.selected = make(map[replayIndexKey]consumerReplayIndexRecord)
 				indexed.epochs = make(map[string]uint64)
+				indexed.cachedRecords = nil
+				indexed.visibleTransactions = nil
+				indexed.index.Transactions = nil
+				indexed.ordinarySources = make(map[string]map[int]struct{})
 				indexed.eligible = false
 				replayReader = indexed
 			}
@@ -431,6 +435,7 @@ func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetada
 	if errors.Is(err, errConsumerReplayIndexFallback) || err != nil && indexed != nil && indexed.cached != nil {
 		full, fullErr := c.prepareConsumerMetadataReplayIndexed(reader, scope, stamp, false)
 		if full != nil && indexed != nil {
+			full.status.IndexTransactionChecks += indexed.transactionChecks
 			full.status.IndexSourceRecords += indexed.readRecords
 			full.status.IndexSourcePayloadBytes += indexed.readBytes
 			full.status.IndexReadBytes += indexed.cacheBytes
@@ -460,6 +465,7 @@ func (c *Coordinator) prepareConsumerMetadataReplayIndexed(reader ConsumerMetada
 			}
 			prepared.status.IndexHit = true
 		}
+		prepared.status.IndexTransactionChecks = indexed.transactionChecks
 		prepared.status.IndexReadBytes = indexed.cacheBytes
 		prepared.status.IndexSourceRecords = indexed.readRecords
 		prepared.status.IndexSourcePayloadBytes = indexed.readBytes

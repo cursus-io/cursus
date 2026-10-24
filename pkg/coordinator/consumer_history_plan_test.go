@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -74,6 +75,102 @@ func TestConsumerHistoryPlanFixedState(t *testing.T) {
 			require.Equal(t, 2, p.status.ReplayedRecords)
 		})
 	}
+}
+
+func TestConsumerHistoryPlanReadsEachRecordOncePerPass(t *testing.T) {
+	for _, history := range []int{100, 1000, 10000} {
+		t.Run(fmt.Sprint(history), func(t *testing.T) {
+			c, r := newIndexFixture(t, history)
+			plan, err := c.PrepareConsumerHistoryCompaction(r, 0, 0, uint64(history+1))
+			require.NoError(t, err)
+			records, _ := plan.ReadWork()
+			t.Logf("history=%d source_records=%d committed_records=%d raw_records=%d", history, records, r.reads, r.rawReads)
+			require.Equal(t, int64(3*(history+1)), records, "one full, one raw and one filtered pass")
+			require.Equal(t, 2*(history+1), r.reads)
+			require.Equal(t, history+1, r.rawReads)
+			applyHistoryPlanToFixture(r, plan)
+			recovered, err := c.PrepareFullConsumerMetadataReplay(r)
+			require.NoError(t, err)
+			require.Equal(t, uint64(history), recovered.scratch.groups["g"].Offsets["events"][0])
+		})
+	}
+}
+
+func TestConsumerHistoryFilteredPagesPreserveSparseWitnesses(t *testing.T) {
+	for _, pageSize := range []int{1, 3, 17, 1024} {
+		t.Run(fmt.Sprint(pageSize), func(t *testing.T) {
+			c, r := newIndexFixture(t, 2200)
+			// Several retained producer witnesses split runs of removed records.
+			// Gaps also model a previous certified rewrite. Keep the original
+			// committed end, not the number of surviving physical frames.
+			r.end = map[int]uint64{0: 2201}
+			var messages []types.Message
+			for _, m := range r.messages[0] {
+				if m.Offset > 0 && m.Offset < 2190 && m.Offset%7 == 0 {
+					continue
+				}
+				if m.Offset%300 == 1 {
+					m.ProducerID, m.SeqNum = fmt.Sprint(m.Offset), 1
+				}
+				messages = append(messages, m)
+			}
+			r.messages[0] = messages
+			r.read = func(p int, next uint64, limit int) ([]types.Message, error) {
+				var out []types.Message
+				for _, m := range r.messages[p] {
+					if m.Offset >= next && len(out) < min(limit, pageSize) {
+						out = append(out, m)
+					}
+				}
+				return out, nil
+			}
+			plan, err := c.PrepareConsumerHistoryCompaction(r, 0, 0, 2190)
+			require.NoError(t, err)
+			records, _ := plan.ReadWork()
+			require.Equal(t, int64(3*len(messages)), records)
+			applyHistoryPlanToFixture(r, plan)
+			for _, m := range messages {
+				if m.ProducerID != "" || m.Offset >= 2190 {
+					require.Contains(t, r.messages[0], m)
+				}
+			}
+			recovered, err := c.PrepareFullConsumerMetadataReplay(r)
+			require.NoError(t, err)
+			require.Equal(t, uint64(2200), recovered.scratch.groups["g"].Offsets["events"][0])
+		})
+	}
+}
+
+func TestConsumerHistoryFilteredCursorDoesNotSurviveFailedAttempt(t *testing.T) {
+	c, r := newIndexFixture(t, 2200)
+	pass := 0
+	fail := true
+	r.read = func(p int, next uint64, limit int) ([]types.Message, error) {
+		if p == 0 && next == 0 {
+			pass++
+		}
+		if fail && p == 0 && pass == 3 && next >= 1024 {
+			return nil, context.DeadlineExceeded
+		}
+		var out []types.Message
+		for _, m := range r.messages[p] {
+			if m.Offset >= next && len(out) < limit {
+				out = append(out, m)
+			}
+		}
+		return out, nil
+	}
+	plan, err := c.PrepareConsumerHistoryCompaction(r, 0, 0, 2201)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Nil(t, plan, "an incomplete filtered replay cannot authorize deletion")
+	require.Empty(t, c.groups)
+	fail, pass, r.reads, r.rawReads = false, 0, 0, 0
+	plan, err = c.PrepareConsumerHistoryCompaction(r, 0, 0, 2201)
+	require.NoError(t, err)
+	require.Equal(t, 3, pass, "retry must start all passes from the original committed start")
+	require.Len(t, plan.RemovedRecords(), 2199)
+	records, _ := plan.ReadWork()
+	require.Equal(t, int64(3*2201), records)
 }
 
 func TestConsumerHistoryPlanProducerRecoveryOrder(t *testing.T) {

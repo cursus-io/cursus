@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -46,7 +45,10 @@ type consumerReplayIndex struct {
 	Topic, Baseline string
 	Partitions      []consumerReplayIndexPartition
 	Records         []consumerReplayIndexRecord
-	Sources         map[string]map[int]struct{}
+	// Version 2 retains raw version-7 transaction evidence. Visibility is resolved
+	// again from the current fixed read view; cached decisions are never authority.
+	Transactions []consumerReplayIndexRecord `json:",omitempty"`
+	Sources      map[string]map[int]struct{}
 }
 
 type replayIndexKey struct{ group, kind, topic string }
@@ -62,6 +64,10 @@ type indexedMetadataReader struct {
 	eligible               bool
 	readRecords, readBytes int
 	cacheBytes             int
+	transactionChecks      int
+	cachedRecords          []consumerReplayIndexRecord
+	visibleTransactions    []consumerReplayIndexRecord
+	ordinarySources        map[string]map[int]struct{}
 }
 
 func (c *Coordinator) newIndexedMetadataReader(reader ConsumerMetadataCommittedReader, bounded *boundedMetadataReader, baseline map[string]*GroupStateSnapshot, load bool) *indexedMetadataReader {
@@ -69,7 +75,7 @@ func (c *Coordinator) newIndexedMetadataReader(reader ConsumerMetadataCommittedR
 	if !ok || c.cfg == nil || !c.cfg.ConsumerRecoveryIndexEnabled || c.cfg.LogDir == "" {
 		return nil
 	}
-	r := &indexedMetadataReader{boundedMetadataReader: bounded, source: source, eligible: true, selected: make(map[replayIndexKey]consumerReplayIndexRecord), epochs: make(map[string]uint64)}
+	r := &indexedMetadataReader{boundedMetadataReader: bounded, source: source, eligible: true, selected: make(map[replayIndexKey]consumerReplayIndexRecord), epochs: make(map[string]uint64), ordinarySources: make(map[string]map[int]struct{})}
 	r.path = filepath.Join(c.cfg.LogDir, ".consumer-replay-index.json")
 	data, err := json.Marshal(baseline)
 	if err != nil {
@@ -111,7 +117,7 @@ func (r *indexedMetadataReader) load() {
 		return
 	}
 	var saved consumerReplayIndex
-	if json.Unmarshal(envelope.Payload, &saved) != nil || saved.Version != 1 || saved.Topic != r.index.Topic || saved.Baseline != r.index.Baseline || len(saved.Partitions) != len(r.index.Partitions) {
+	if json.Unmarshal(envelope.Payload, &saved) != nil || (saved.Version != 1 && saved.Version != 2) || saved.Version == 1 && len(saved.Transactions) != 0 || saved.Version == 2 && len(saved.Transactions) == 0 || saved.Topic != r.index.Topic || saved.Baseline != r.index.Baseline || len(saved.Partitions) != len(r.index.Partitions) {
 		return
 	}
 	for p, current := range r.index.Partitions {
@@ -155,6 +161,13 @@ func (r *indexedMetadataReader) load() {
 	for _, entry := range saved.Records {
 		_ = r.observe(entry.Partition, []types.Message{entry.Message}, false)
 	}
+	if !r.loadTransactions(&saved) {
+		r.selected = make(map[replayIndexKey]consumerReplayIndexRecord)
+		r.epochs = make(map[string]uint64)
+		r.ordinarySources = make(map[string]map[int]struct{})
+		return
+	}
+	r.ordinarySources = saved.Sources
 	r.cached = &saved
 }
 
@@ -163,7 +176,8 @@ func indexTransaction(m types.Message) bool {
 }
 
 // certifyRaw avoids certifying an omission caused by the current transaction
-// decision view. Version 1 declines transaction-bearing ranges entirely.
+// decision view. Version 2 retains every version-7 raw intent/control and resolves
+// visibility again on reuse. Legacy transaction formats still require full replay.
 func (r *indexedMetadataReader) certifyRaw() bool {
 	for p, b := range r.index.Partitions {
 		next := b.First
@@ -185,7 +199,11 @@ func (r *indexedMetadataReader) certifyRaw() bool {
 				r.readRecords++
 				r.readBytes += len(m.Payload) + len(m.Key)
 				if indexTransaction(m) {
-					return false
+					if !indexHistoryTransaction(m) {
+						return false
+					}
+					r.index.Version = 2
+					r.index.Transactions = append(r.index.Transactions, consumerReplayIndexRecord{p, m})
 				}
 				next = m.Offset + 1
 			}
@@ -208,6 +226,12 @@ func replayIndexRecordKey(record ConsumerMetadataRecord) replayIndexKey {
 
 func (r *indexedMetadataReader) observe(p int, messages []types.Message, suffix bool) error {
 	for _, m := range messages {
+		if indexHistoryTransaction(m) {
+			if m.TransactionMarker == types.TransactionMarkerNone {
+				r.visibleTransactions = append(r.visibleTransactions, consumerReplayIndexRecord{p, m})
+			}
+			continue
+		}
 		record, versioned, err := decodeConsumerMetadataRecord(m.Payload)
 		if err != nil || !versioned || indexTransaction(m) || record.Type == ConsumerMetadataRecordTransactionalOffsetSnapshot {
 			r.eligible = false
@@ -216,6 +240,13 @@ func (r *indexedMetadataReader) observe(p int, messages []types.Message, suffix 
 			}
 			continue
 		}
+		if r.ordinarySources == nil {
+			r.ordinarySources = make(map[string]map[int]struct{})
+		}
+		if r.ordinarySources[record.Group] == nil {
+			r.ordinarySources[record.Group] = make(map[int]struct{})
+		}
+		r.ordinarySources[record.Group][p] = struct{}{}
 		key := replayIndexRecordKey(record)
 		if suffix && r.cached != nil && record.Epoch < r.epochs[record.Group] {
 			return errConsumerReplayIndexFallback
@@ -246,7 +277,7 @@ func (r *indexedMetadataReader) observe(p int, messages []types.Message, suffix 
 func (r *indexedMetadataReader) ReadTopicPartition(topic string, p int, next uint64, max int) ([]types.Message, error) {
 	if r.cached != nil && next < r.cached.Partitions[p].End {
 		var out []types.Message
-		for _, entry := range r.cached.Records {
+		for _, entry := range r.cachedRecords {
 			if entry.Partition == p && entry.Message.Offset >= next && len(out) < max {
 				out = append(out, entry.Message)
 			}
@@ -272,16 +303,12 @@ func (r *indexedMetadataReader) projection() *boundedMetadataReader {
 	for _, entry := range r.selected {
 		r.index.Records = append(r.index.Records, entry)
 	}
-	sort.Slice(r.index.Records, func(i, j int) bool {
-		a, b := r.index.Records[i], r.index.Records[j]
-		if a.Partition != b.Partition {
-			return a.Partition < b.Partition
-		}
-		return a.Message.Offset < b.Message.Offset
-	})
+	sortReplayIndexRecords(r.index.Records)
+	projected := append(append([]consumerReplayIndexRecord(nil), r.index.Records...), r.visibleTransactions...)
+	sortReplayIndexRecords(projected)
 	return &boundedMetadataReader{bounds: r.bounds, read: func(_ string, p int, next uint64, max int) ([]types.Message, error) {
 		var out []types.Message
-		for _, entry := range r.index.Records {
+		for _, entry := range projected {
 			if entry.Partition == p && entry.Message.Offset >= next && len(out) < max {
 				out = append(out, entry.Message)
 			}
@@ -318,7 +345,8 @@ func (r *indexedMetadataReader) save(baseline map[string]*GroupStateSnapshot, sc
 	if !reflect.DeepEqual(check.ExportState(), scratch.ExportState()) {
 		return 0, fmt.Errorf("replay projection differs from full replay")
 	}
-	r.index.Sources = scratch.metadataSources
+	r.index.Sources = r.ordinarySources
+	sortReplayIndexRecords(r.index.Transactions)
 	if err := r.source.SyncConsumerMetadataIndex(); err != nil {
 		return 0, err
 	}

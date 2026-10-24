@@ -174,7 +174,11 @@ isolated Linux filesystem; the production reserve is not lowered to run them.
 
 The current certification deliberately replays all partitions twice and scans
 the raw committed records once **per candidate segment**. A filtered page can
-also cause repeated reads of records removed within that page. Scanning does
+end before its consumed source page: the sequential candidate reader retains
+the consumed position separately from the last returned offset, so removed
+trailing records are not read again within that pass. This cursor lives only
+inside one certification; an error or retry starts from the original bounds.
+It is not a durable checkpoint or an authority to skip validation. Scanning does
 not hold a live recovery lease; publication does and includes storage reads and
 fsync. Maintenance processes one segment per configured compaction interval with
 a one-minute attempt deadline. This bounds each attempt but does not prove that
@@ -323,6 +327,73 @@ and compaction without complete local metadata coverage remain separate acceptan
 conditions. Retaining necessary deleted-name fences
 or decisions is authoritative state growth, and is not bounded by live-group
 count alone. Do not close the history-growth issue based only on these results.
+
+## Sequential certification reads (2026-10-24)
+
+The follow-up baseline is official main `9c43d39`, which includes both recovery
+index and ordinary history compaction. Kafka comparison was checked again
+against the **4.1.0 release commit**
+[`13f70256db3c994c590e5d262a7cc50b9e973204`](https://github.com/apache/kafka/tree/13f70256db3c994c590e5d262a7cc50b9e973204).
+Its [LogCleaner](https://github.com/apache/kafka/blob/13f70256db3c994c590e5d262a7cc50b9e973204/storage/src/main/java/org/apache/kafka/storage/internals/log/LogCleaner.java)
+builds an offset map before rewriting segments, excludes the unstable tail,
+and retains producer continuity and transaction markers while needed. Adopt
+sequential progress through a fixed source view; retain Cursus's full state and
+physical-provenance comparison instead of replacing it with key-only cleaning.
+The accepted KIP remains a protocol design, not this implementation's persistent
+snapshot or deletion proof.
+
+Before changing the reader, a four-partition coordinator fixture (one populated
+group) with 100/1,000/10,000 offset revisions read 303/3,003/31,026 source records.
+The last case reread 1,023 filtered records. After separating source consumption
+from returned offsets, the counts are 303/3,003/30,003: one full committed scan,
+one raw scan and one filtered scan. These are decoded logical record counts,
+not physical I/O or startup timings. The fixture uses in-memory source pages;
+initial history construction is outside this comparison.
+
+Regression checks cover short pages of 1/3/17/1,024 records, existing offset
+gaps, retained producer witnesses between removed runs, an unchanged suffix,
+and a deadline failure in the candidate pass followed by a fresh retry. Exact
+offset recovery and the existing tombstone/epoch, reservation, cooperative
+ownership and source-generation rejection checks still apply. No on-disk format,
+activation gate, upgrade/downgrade rule or fallback behavior changes.
+
+This removes redundant page work, **not** the complete-history-per-segment
+algorithm. It does not establish a maintenance throughput bound, enable remote
+coverage, reclaim transaction history or measure cold broker startup/failover.
+In particular, transaction deletion must additionally preserve partition raw
+recovery's producer fences and unresolved boundaries; equality of coordinator
+state alone is insufficient. The distributed internal compaction guard remains
+in place.
+
+The real-disk comparison uses baseline `9c43d39` and source `7e91c69`, Linux
+Go 1.25.0, two CPUs/3 GiB and no container network. Four groups/four partitions
+remain fixed. Each source is measured once on a shared host; another race run
+overlapped the beginning of the baseline. OS caches are warm, initial history
+construction and closing old handlers are excluded, and reopening handlers is
+included in `reopen_full`. The [raw JSONL](benchmarks/consumer-history-scan-linux-2026-10-24.jsonl)
+records all modes and both revisions, including the slower samples.
+
+| Revisions/group | Certification source records baseline → fix | Source key/payload bytes baseline → fix | Retained log bytes before → after (both) |
+| ---: | ---: | ---: | ---: |
+| 100 | 3,066 → 3,066 | 785,982 → 785,982 | 162,752 → 3,632 |
+| 1,000 | 30,066 → 30,066 | 7,779,078 → 7,779,078 | 1,617,160 → 3,640 |
+| 10,000 | 304,158 → 300,066 | 79,308,330 → 78,249,174 | 16,233,168 → 3,648 |
+
+At 10,000 revisions, certification/rewrite wall time was 12,469.89 → 33,695.86 ms,
+CPU 16,464.93 → 19,395.06 ms, sampled peak heap 78,351,872 → 79,792,144 bytes,
+and allocations 2,857,618,464 → 2,853,238,048 bytes. Cache-free warm reopen was
+67.71 → 650.87 ms. These noisy single samples **do not demonstrate a wall-time,
+CPU or cold recovery speedup**; the verified improvement is fewer duplicate
+decoded records/bytes. The certification cost still dominates this workload.
+
+Both 10,000-revision runs removed 39,996 records and recovered eight retained
+records. They read 16,232,632 rewrite frame bytes, wrote 3,388 instrumented file
+bytes and 81,920 kernel-accounted bytes, and used at most 815 temporary bytes
+in the measured per-segment rewrite. Both observed 16 source sync and 24 rewrite
+sync boundaries (partial instrumentation, not all fsync syscalls). Physical
+read bytes and transfer bytes were zero. These local figures exclude network,
+Raft replay, full broker startup and request latency; the existing cluster E2E
+and its CI result remain separate correctness evidence.
 
 ## Verified cache-absent cluster restart
 

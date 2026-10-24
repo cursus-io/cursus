@@ -13,6 +13,7 @@ const (
 	SnapshotVersionCurrent            = 11
 	SnapshotVersionCooperative        = 12
 	SnapshotVersionCooperativeRuntime = 13
+	SnapshotVersionTransactionHistory = 14
 	SnapshotVersionLegacyEpoch        = 9
 	CommittedHWMVersionCurrent        = 1
 )
