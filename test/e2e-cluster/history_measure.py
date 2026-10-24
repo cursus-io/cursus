@@ -118,8 +118,8 @@ def run():
 
 
 def offline(mode, evict):
-    if broker_pid():
-        raise RuntimeError('offline operation requires stopped broker')
+    # The Go launcher verifies the fixture container is stopped. This helper
+    # shares its volume, not its PID namespace, so /proc cannot prove that here.
     index = ROOT / '.consumer-replay-index.json'
     if mode == 'absent':
         index.unlink(missing_ok=True)

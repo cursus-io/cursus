@@ -223,6 +223,8 @@ func historyMeasureOffline(t *testing.T, node int, mode, cache string) {
 	project := fmt.Sprintf("cursus-truncate-%d-e2e", cleanupPortOffset())
 	label := strings.TrimSpace(string(historyMeasureDocker(t, "inspect", "--format", `{{index .Config.Labels "com.docker.compose.project"}}`, name)))
 	require.Equal(t, project, label, "offline changes are restricted to this fixture")
+	running := strings.TrimSpace(string(historyMeasureDocker(t, "inspect", "--format", "{{.State.Running}}", name)))
+	require.Equal(t, "false", running, "offline changes require a stopped broker container")
 	image := strings.TrimSpace(string(historyMeasureDocker(t, "inspect", "--format", "{{.Image}}", name)))
 	historyMeasureDocker(t, "run", "--rm", "--network", "none", "--pull", "never", "--volumes-from", name, "--entrypoint", "python3", image, "/app/history_measure.py", "offline", mode, cache)
 }
