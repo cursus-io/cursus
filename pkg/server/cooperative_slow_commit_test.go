@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/stretchr/testify/require"
 )
@@ -57,18 +58,24 @@ func TestCooperativeWireSlowCommitKeepsStableReadsAndDurableBarrier(t *testing.T
 		t.Fatal("commit acknowledged while durable writer was paused")
 	default:
 	}
-	// Membership still uses the global mutation fence. Pausing durable append
-	// deterministically reproduces a TCP response timeout through that fence;
-	// it does not prove the trigger of a historical, uninstrumented stall.
+	// Hold append longer than the fixture's unchanged two-second session
+	// timeout. Real wire heartbeats must keep the original durable grant alive.
 	heartbeatRaw, heartbeat := dial()
 	command := fmt.Sprintf("HEARTBEAT protocol=cooperative topic=%s group=%s member=%s registration_epoch=%d session=%d", cfg.Topic, cfg.GroupID, membership.Member, membership.RegistrationEpoch, membership.Session)
-	writeWireCommand(t, heartbeat, wire.CommandHeartbeat, 2, command)
-	_, err = heartbeat.ReadFrame()
-	var timeout net.Error
-	require.ErrorAs(t, err, &timeout)
-	require.True(t, timeout.Timeout(), "%v", err)
-	_ = heartbeatRaw.Close()
-	t.Log("injected durable append pause caused heartbeat response timeout through coordinator/group locking; stable read remained available and commit remained unacknowledged")
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		require.NoError(t, heartbeatRaw.SetDeadline(time.Now().Add(time.Second)))
+		require.Equal(t, "OK cooperative="+protocol.EncodeCooperative(membership), wireRequest(t, heartbeat, wire.CommandHeartbeat, []byte(command)))
+		select {
+		case <-done:
+			t.Fatal("commit acknowledged before durable append resumed")
+		default:
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_, stale := dial()
+	staleCommand := fmt.Sprintf("HEARTBEAT protocol=cooperative topic=%s group=%s member=%s registration_epoch=%d session=%d", cfg.Topic, cfg.GroupID, membership.Member, membership.RegistrationEpoch, membership.Session+1)
+	require.Contains(t, wireRequest(t, stale, wire.CommandHeartbeat, []byte(staleCommand)), "cooperative_fenced")
+	t.Log("paused append exceeded session timeout while original-session heartbeats succeeded; stale session rejected and commit unacknowledged")
 	unblock()
 	select {
 	case err := <-done:

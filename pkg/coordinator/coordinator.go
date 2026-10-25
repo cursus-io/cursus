@@ -15,8 +15,10 @@ import (
 // Coordinator manages consumer groups, membership, heartbeats, and partition assignment.
 type Coordinator struct {
 	consumerAdmission consumerAdmission
-	// Lock order: authorityMu -> lifecycleMu -> mu -> group.mu. Provenance is
-	// copied only after group locks are released; writers may hold those locks.
+	// Lock order: authorityMu -> lifecycleMu -> mu.commits -> mu.state -> group.mu.
+	// mu readers need only state; unchanged heartbeats and FSM restore also bypass
+	// commits (see coordinatorStateMutex). Provenance is copied only after group
+	// locks are released; writers may hold those locks.
 	authorityMu              sync.Mutex
 	authorityRevision        uint64 // Guarded by authorityMu; invalidates detached replay results.
 	stateImportGeneration    uint64 // Guarded by mu; fences publications/scans begun before import.
@@ -27,7 +29,7 @@ type Coordinator struct {
 	metadataSourcesKnown     bool
 	offsetRecordWriterRouted bool
 	groups                   map[string]*GroupMetadata // All consumer groups
-	mu                       sync.RWMutex              // Global lock for coordinator state
+	mu                       coordinatorStateMutex     // Global state lock plus durable cooperative commit fence.
 	lifecycleMu              sync.Mutex                // Serializes durable group lifecycle transitions
 	cooperativePending       map[string]*CooperativeAssignment
 	lifecyclePending         map[string]bool // Groups whose durable lifecycle write is in progress

@@ -28,6 +28,11 @@ func (c *Coordinator) ReconcileCooperative(groupName, member string, registratio
 		return CooperativeMembership{}, err
 	}
 	defer release()
+	if !leave && len(acks) == 0 && registration != 0 && session != 0 {
+		if result, handled, err := c.refreshCooperativeHeartbeat(groupName, member, registration, session, partitions); handled {
+			return result, err
+		}
+	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 	c.mu.Lock()
@@ -241,30 +246,66 @@ func (c *Coordinator) CommitCooperativeBatch(groupName string, tokens []protocol
 		return err
 	}
 	defer release()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	group := c.groups[groupName]
-	if group == nil || group.Cooperative == nil {
-		return fmt.Errorf("ERROR: cooperative_fenced")
-	}
-	first := tokens[0]
-	seen := make(map[int]bool, len(tokens))
-	for i, token := range tokens {
-		grant := token.Grant
-		if token.RegistrationEpoch != first.RegistrationEpoch || grant.Partition.Topic != first.Grant.Partition.Topic || grant.Member != first.Grant.Member || grant.Session != first.Grant.Session || grant.Partition.Partition != offsets[i].Partition || seen[offsets[i].Partition] {
-			return fmt.Errorf("ERROR: invalid_cooperative_payload")
-		}
-		seen[offsets[i].Partition] = true
-		if err := c.validateCooperativePendingLocked(groupName, token.RegistrationEpoch, grant); err != nil {
-			return err
-		}
-		if err := group.Cooperative.ValidateGrant(token.RegistrationEpoch, grant); err != nil {
+	// Keep durable membership stable without holding the global map lock over
+	// storage I/O. Independent groups can commit concurrently; unchanged valid
+	// heartbeats need neither this state-mutation fence nor the offset lock.
+	c.mu.commits.RLock()
+	defer c.mu.commits.RUnlock()
+	return c.commitCooperativeBatchFenced(groupName, tokens, offsets)
+}
+
+// commitCooperativeBatchFenced requires shared state-mutation exclusion. Restore
+// deliberately bypasses that fence, so completion also checks map identity and
+// import generation before acknowledging an append to a possibly detached group.
+func (c *Coordinator) commitCooperativeBatchFenced(groupName string, tokens []protocol.CooperativeToken, offsets []OffsetItem) error {
+	for {
+		c.mu.RLock()
+		group := c.groups[groupName]
+		if group == nil || group.Cooperative == nil {
+			c.mu.RUnlock()
 			return fmt.Errorf("ERROR: cooperative_fenced")
 		}
+		first := tokens[0]
+		seen := make(map[int]bool, len(tokens))
+		for i, token := range tokens {
+			grant := token.Grant
+			if token.RegistrationEpoch != first.RegistrationEpoch || grant.Partition.Topic != first.Grant.Partition.Topic || grant.Member != first.Grant.Member || grant.Session != first.Grant.Session || grant.Partition.Partition != offsets[i].Partition || seen[offsets[i].Partition] {
+				c.mu.RUnlock()
+				return fmt.Errorf("ERROR: invalid_cooperative_payload")
+			}
+			seen[offsets[i].Partition] = true
+			if err := c.validateCooperativePendingLocked(groupName, token.RegistrationEpoch, grant); err != nil {
+				c.mu.RUnlock()
+				return err
+			}
+			if err := group.Cooperative.ValidateGrant(token.RegistrationEpoch, grant); err != nil {
+				c.mu.RUnlock()
+				return fmt.Errorf("ERROR: cooperative_fenced")
+			}
+		}
+		if !group.mu.TryLock() {
+			// Never queue behind another append while pinning the map read lock:
+			// that would again prevent a heartbeat from updating its session clock.
+			c.mu.RUnlock()
+			group.mu.Lock()
+			group.mu.Unlock() //nolint:staticcheck // Wait for the current append, then revalidate the installed group under the state lock.
+			continue
+		}
+		generation := c.stateImportGeneration
+		c.mu.RUnlock()
+		err := c.commitAuthorizedOffsetsBulkForGroupLocked(group, groupName, first.Grant.Partition.Topic, offsets)
+		group.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		c.mu.RLock()
+		changed := c.stateImportGeneration != generation || c.groups[groupName] != group
+		c.mu.RUnlock()
+		if changed {
+			return ErrConsumerMetadataRecovering
+		}
+		return c.ConsumerOperationsReadinessError()
 	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-	return c.commitAuthorizedOffsetsBulkForGroupLocked(group, groupName, first.Grant.Partition.Topic, offsets)
 }
 
 // IsCooperativeGroup is a synchronized mode query for legacy admission.

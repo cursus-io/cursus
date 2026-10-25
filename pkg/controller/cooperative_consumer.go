@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -38,6 +37,8 @@ func (ch *CommandHandler) cooperativeTopic(name string) (topic.Definition, error
 	return topic.Definition{}, fmt.Errorf("ERROR: topic_not_found")
 }
 
+// handleCooperativeMembership validates routing and the single-topic subscription
+// before reconciling membership against the authoritative topic definition.
 func (ch *CommandHandler) handleCooperativeMembership(args map[string]string, action string) string {
 	if !ch.cooperativeEnabled() {
 		return "ERROR: cooperative_not_enabled"
@@ -74,29 +75,14 @@ func (ch *CommandHandler) handleCooperativeMembership(args map[string]string, ac
 			return formatCoordinatorError(err)
 		}
 	}
-	snapshot := ch.Coordinator.ExportGroupState(group)
-	if snapshot == nil {
-		return coordinatorUnavailableResponse
-	}
 	// This wire/API version supports one explicit topic per group. Reject a
-	// mismatched subscription before modifying durable membership.
-	if snapshot.TopicName != topicName || len(snapshot.Topics) != 0 || snapshot.TopicPattern != "" {
-		return "ERROR: invalid_cooperative_payload"
+	// mismatched subscription without exporting the in-flight offset snapshot.
+	if err := ch.Coordinator.ValidateCooperativeSubscription(group, topicName); err != nil {
+		return formatCoordinatorError(err)
 	}
-	names := append([]string(nil), snapshot.Topics...)
-	if len(names) == 0 {
-		names = []string{snapshot.TopicName}
-	}
-	sort.Strings(names)
 	var partitions []coordinator.CooperativePartition
-	for _, name := range names {
-		def, err := ch.cooperativeTopic(name)
-		if err != nil {
-			return err.Error()
-		}
-		for p := 0; p < def.Partitions; p++ {
-			partitions = append(partitions, coordinator.CooperativePartition{Topic: name, Partition: p, LifecycleEpoch: def.LifecycleEpoch})
-		}
+	for p := 0; p < definition.Partitions; p++ {
+		partitions = append(partitions, coordinator.CooperativePartition{Topic: topicName, Partition: p, LifecycleEpoch: definition.LifecycleEpoch})
 	}
 	registration, session := uint64(0), uint64(0)
 	if action != "join" {

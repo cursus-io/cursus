@@ -301,6 +301,9 @@ func validateCompatibilityState(state map[string]*GroupStateSnapshot) error {
 	return nil
 }
 
+// ImportStateWithRecovery validates and installs snapshot state and its recovery
+// evidence. A missing envelope leaves authority unknown. It fences detached
+// operations by import generation without waiting for Raft-dependent appends.
 func (c *Coordinator) ImportStateWithRecovery(groups map[string]*GroupStateSnapshot, envelope *ConsumerRecoveryEnvelope) error {
 	if err := ValidateImportState(groups); err != nil {
 		return err
@@ -326,8 +329,10 @@ func (c *Coordinator) ImportStateWithRecovery(groups map[string]*GroupStateSnaps
 	// Restore may hold FSM transition locks while a lifecycle publisher is
 	// waiting for Raft with lifecycleMu held. Do not wait for that publisher;
 	// its existing group identity checks fence completion against this import.
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Cooperative commits similarly recheck map identity/import generation;
+	// waiting for their commit fence here could deadlock the Raft restore.
+	c.mu.state.Lock()
+	defer c.mu.state.Unlock()
 	if err := c.importStateLocked(groups); err != nil {
 		return err
 	}
