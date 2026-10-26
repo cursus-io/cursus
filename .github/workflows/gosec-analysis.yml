@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Run GoSec
-        uses: securego/gosec@v2.29.0
+        uses: securego/gosec@v2.30.0
         with:
           args: '-exclude-dir=api/gen -fmt sarif -out gosec-results.sarif ./...'
 
