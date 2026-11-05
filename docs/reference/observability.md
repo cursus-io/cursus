@@ -86,9 +86,9 @@ when the broker cannot safely serve client work.
 
 ## Metrics Semantics
 
-Runtime gauges are generated from a point-in-time broker snapshot on every
-scrape. They do not retain labels for deleted topics, departed groups, or old
-partition leaders.
+Runtime gauges come from expiring background snapshots. Each completed sample
+replaces the preceding series, including labels for deleted topics, departed
+groups and old partition leaders.
 
 ### Broker Traffic
 
@@ -174,15 +174,15 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 |---|---|---|
 | `cursus_consumer_group_members{topic,group}` | Gauge / members | Current member count, emitted only by the authoritative coordinator |
 | `cursus_consumer_group_state{topic,group,state}` | Gauge / boolean | One-hot authoritative state: `stable` or `empty` |
-| `cursus_consumer_group_coordinator_up{topic,group}` | Gauge / boolean | `1` only on the broker that successfully resolves itself as current coordinator; every broker emits `0` or `1` |
+| `cursus_consumer_group_coordinator_up{topic,group}` | Gauge / boolean | `1` only on the broker that successfully resolves itself as current coordinator; known groups emit `0` or `1`, while unavailable group observation can omit the series |
 | `cursus_consumer_group_last_activity_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest accepted heartbeat or group lifecycle activity known by the authoritative coordinator; `0` means unknown, including after standalone durable recovery |
 | `cursus_consumer_group_last_rebalance_timestamp_seconds{topic,group}` | Gauge / Unix seconds | Latest completed membership rebalance known by the authoritative coordinator; `0` means unavailable or no rebalance has completed since recovery |
 | `cursus_consumer_group_observation_failures_total{topic,group,reason}` | Counter / failures | Per-broker observation failures; reason is one of `coordinator_lookup`, `group_lookup`, or `topic_lookup`, and a series appears only after its first failure |
-| `cursus_consumer_group_generation{group,topic}` | Gauge / generation | Current group generation |
-| `cursus_consumer_group_assigned_partitions{group,topic}` | Gauge / partitions | Assignments held by active members |
-| `cursus_consumer_group_committed_offset{group,topic,partition}` | Gauge / offsets | Durable next offset |
-| `cursus_consumer_group_lag{group,topic,partition}` | Gauge / messages | `max(HWM - committedNextOffset, 0)` |
-| `cursus_consumer_group_offset_out_of_range{group,topic,partition}` | Gauge / boolean | Commit is below log start or above the high watermark |
+| `cursus_consumer_group_generation{group,topic}` | Gauge / generation | Authoritative coordinator's current group generation |
+| `cursus_consumer_group_assigned_partitions{group,topic}` | Gauge / partitions | Authoritative coordinator's assignments held by active members |
+| `cursus_consumer_group_committed_offset{group,topic,partition}` | Gauge / offsets | Known durable next offset on the authoritative coordinator, with an observed local partition |
+| `cursus_consumer_group_lag{group,topic,partition}` | Gauge / messages | Authoritative `max(HWM - committedNextOffset, 0)`; absent when an input is unknown |
+| `cursus_consumer_group_offset_out_of_range{group,topic,partition}` | Gauge / boolean | Authoritative commit is below local log start or above local HWM; absent when an input is unknown |
 | `cursus_storage_filesystem_free_bytes` | Gauge / bytes | Space currently available on the filesystem containing `log_dir` |
 | `cursus_storage_filesystem_total_bytes` | Gauge / bytes | Total capacity of the filesystem containing `log_dir` |
 | `cursus_storage_filesystem_headroom_ready` | Gauge / boolean | `1` while the configured byte and percentage free-space reserve permits new writes |
@@ -194,7 +194,7 @@ In diagnostics-only mode, `/ready` includes the retained `consumer_metadata` fai
 In standalone mode the local coordinator is authoritative. In distributed
 mode, replicated membership can remain present on a broker that no longer owns
 the group, while heartbeat activity is coordinator-local. Such a broker emits
-`coordinator_up = 0` and omits the authoritative lifecycle gauges. It does not
+`coordinator_up = 0` and omits the authoritative lifecycle and offset gauges. It does not
 present its retained snapshot as healthy.
 
 For a converged three-broker scrape, exactly one target emits authoritative
@@ -250,9 +250,61 @@ See the [consumer lifecycle alert runbook](../operations/consumer-lifecycle-aler
 for the catalog contract, alert rules, and a `1 -> 0 -> 1` canary procedure.
 
 Lag uses the high watermark rather than the local log end so uncommitted replica
-tail data is not reported as consumable work. For an exact-topic group with no
-stored offset, the collector applies the broker's earliest default of `0`.
-Wildcard groups expose partitions for which broker offset state exists.
+tail data is not reported as consumable work. Both exact-topic and wildcard
+groups expose only known stored offsets with available local partition data.
+No stored commit means no offset/lag/out-of-range sample; a stored offset of
+zero remains a valid sample. Fetch/reset defaults do not imply a durable commit.
+
+#### Consumer offset authority and query migration
+
+Names and labels are unchanged, but series from non-coordinators and fabricated
+default-zero commits are removed. During rolling upgrades, filter the old
+brokers' metrics by authority on the **same scrape target before aggregation**.
+For example, record the following expression as `cursus:consumer_group_lag`
+(use the same expression with the out-of-range or committed-offset metric):
+
+```promql
+max by (cluster, group, topic, partition) (
+  cursus_consumer_group_lag
+  and on (cluster, job, instance, group)
+    (cursus_consumer_group_coordinator_up == 1)
+  and on (cluster, job, instance)
+    (up{job="cursus"} == 1)
+  and on (cluster, job, instance)
+    (cursus_observation_valid{component="runtime"} == 1)
+)
+and on (cluster, group)
+  (sum by (cluster, group) (cursus_consumer_group_coordinator_up) == 1)
+```
+
+Adapt `cluster`, `job` and `instance` to labels that uniquely identify your
+cluster and broker scrape target; preserve tenant/namespace labels if required.
+The group is broker-unique. Do not join on `topic` for wildcard or multi-topic
+subscriptions: coordinator labels describe the subscription, whereas offset
+labels describe the concrete topic. An exact authority count rejects overlapping
+owner views. Samples across brokers still have sampling/scraping delay; this is
+not an atomic cluster snapshot.
+
+Alert separately on `sum by (cluster,group) (...coordinator_up) != 1` and on
+absent expected groups. A concrete missing-owner check for a known group is:
+
+```promql
+absent(cursus_consumer_group_coordinator_up{cluster="prod", group="workers"})
+or
+(sum(cursus_consumer_group_coordinator_up{cluster="prod", group="workers"}) != 1)
+```
+
+Also detect missing expected offset partitions with `absent()` or an external
+expected-group/partition inventory. `coordinator_up=1` alone does not prove that
+every partition/commit is observable. Do not use `or vector(0)` for missing lag
+or out-of-range data. Monitor `up`, runtime observation validity and consumer
+metadata recovery separately. A missing group is not evidence that it is healthy.
+
+Apply range functions to the authority-filtered recording rule; a direct
+`max_over_time` over legacy per-broker series retains old false positives for
+the whole window. These are query migration examples, not deployed alert changes.
+See [the design and regression comparison](../consumer-offset-metric-authority.md)
+for handoff/recovery behavior and the limitations of local partition observations.
 
 Wire v2 exposes only `cursus_consumer_group_lag`; the former
 `broker_consumer_lag` alias is not registered.
@@ -375,13 +427,13 @@ cursus_cluster_assignment_deficient_partitions > 0
 cursus_cluster_min_insync_unsatisfied_partitions > 0
 
 # Group commit no longer points into retained data
-cursus_consumer_group_offset_out_of_range == 1
+cursus:consumer_group_offset_out_of_range == 1
 
 # The converged broker set has no single authoritative group coordinator
 sum by (topic, group) (cursus_consumer_group_coordinator_up) != 1
 
 # Sustained consumer backlog
-max_over_time(cursus_consumer_group_lag[10m]) > 10000
+max_over_time(cursus:consumer_group_lag[10m]) > 10000
 
 # Storage writer backlog
 min_over_time(cursus_storage_pending_writes[10m]) > 0

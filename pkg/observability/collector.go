@@ -188,9 +188,9 @@ func NewCollector(topics topicSource, groups groupSource, diskState diskSource, 
 		groupObservationFailures:        prometheus.NewDesc("cursus_consumer_group_observation_failures_total", "Failed consumer group observation attempts by bounded reason.", []string{"topic", "group", "reason"}, nil),
 		groupGeneration:                 prometheus.NewDesc("cursus_consumer_group_generation", "Current consumer group generation.", []string{"group", "topic"}, nil),
 		groupAssignments:                prometheus.NewDesc("cursus_consumer_group_assigned_partitions", "Partitions assigned to active group members.", []string{"group", "topic"}, nil),
-		groupCommittedOffset:            prometheus.NewDesc("cursus_consumer_group_committed_offset", "Committed next offset for a consumer group partition.", []string{"group", "topic", "partition"}, nil),
-		groupLag:                        prometheus.NewDesc("cursus_consumer_group_lag", "Committed-reader lag, max(high watermark - committed next offset, 0).", []string{"group", "topic", "partition"}, nil),
-		groupOffsetOutOfRange:           prometheus.NewDesc("cursus_consumer_group_offset_out_of_range", "Whether a committed offset is outside the retained committed-readable range.", []string{"group", "topic", "partition"}, nil),
+		groupCommittedOffset:            prometheus.NewDesc("cursus_consumer_group_committed_offset", "Known committed next offset on the authoritative group coordinator; omitted when the offset or partition observation is unavailable.", []string{"group", "topic", "partition"}, nil),
+		groupLag:                        prometheus.NewDesc("cursus_consumer_group_lag", "Authoritative coordinator committed-reader lag, max(high watermark - committed next offset, 0); omitted when inputs are unavailable.", []string{"group", "topic", "partition"}, nil),
+		groupOffsetOutOfRange:           prometheus.NewDesc("cursus_consumer_group_offset_out_of_range", "Whether the authoritative coordinator's known committed offset is outside its observed committed-readable range; omitted when inputs are unavailable.", []string{"group", "topic", "partition"}, nil),
 		consumerMetadataIndexHit:        prometheus.NewDesc("cursus_consumer_metadata_index_hit", "Whether the last recovery used a validated current-state replay index.", nil, nil),
 		consumerMetadataIndexWork:       prometheus.NewDesc("cursus_consumer_metadata_index_work", "Actual index and source work during the last recovery; source bytes count keys and payloads, not physical I/O.", []string{"unit"}, nil),
 		consumerMetadataRecovery:        prometheus.NewDesc("cursus_consumer_metadata_recovery_ready", "Whether durable consumer metadata recovery completed without error.", []string{"phase"}, nil),
@@ -310,8 +310,8 @@ func (c *Collector) sample(ctx context.Context) ([]prometheus.Metric, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	c.collectGroupLifecycle(ch, partitionKeysByTopic)
-	c.collectGroups(ch, partitionState, partitionKeysByTopic)
+	authoritative := c.collectGroupLifecycle(ch, partitionKeysByTopic)
+	c.collectGroups(ch, partitionState, authoritative)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -370,9 +370,9 @@ func (c *Collector) collectTransactions(ch func(prometheus.Metric)) {
 func (c *Collector) collectGroups(
 	ch func(prometheus.Metric),
 	partitions map[string]topic.PartitionRuntimeSnapshot,
-	partitionKeysByTopic map[string][]string,
+	authoritative map[observationGroupKey]struct{},
 ) {
-	if c.groups == nil {
+	if c.groups == nil || len(authoritative) == 0 {
 		return
 	}
 	groups := c.groups.ExportState()
@@ -384,7 +384,10 @@ func (c *Collector) collectGroups(
 
 	for _, name := range names {
 		state := groups[name]
-		if state == nil {
+		if state == nil || state.Deleted {
+			continue
+		}
+		if _, ok := authoritative[observationGroupKey{topic: state.TopicName, group: name}]; !ok {
 			continue
 		}
 		assignments := 0
@@ -395,11 +398,7 @@ func (c *Collector) collectGroups(
 		ch(gauge(c.groupAssignments, float64(assignments), name, state.TopicName))
 
 		positions := make(map[string]uint64)
-		if !strings.ContainsAny(state.TopicName, "*?") {
-			for _, key := range partitionKeysByTopic[state.TopicName] {
-				positions[key] = 0
-			}
-		}
+		// Missing commits are unknown, not a durable commit at offset zero.
 		for topicName, offsets := range state.Offsets {
 			for partition, offset := range offsets {
 				positions[partitionKey(topicName, partition)] = offset
@@ -430,9 +429,10 @@ func (c *Collector) collectGroups(
 	}
 }
 
-func (c *Collector) collectGroupLifecycle(ch func(prometheus.Metric), partitionKeysByTopic map[string][]string) {
+func (c *Collector) collectGroupLifecycle(ch func(prometheus.Metric), partitionKeysByTopic map[string][]string) map[observationGroupKey]struct{} {
+	authoritative := make(map[observationGroupKey]struct{})
 	if c.groups == nil {
-		return
+		return authoritative
 	}
 
 	observations := c.consumerGroupObservations()
@@ -455,6 +455,7 @@ func (c *Collector) collectGroupLifecycle(ch func(prometheus.Metric), partitionK
 		if !observation.CoordinatorUp || failureReason != "" {
 			continue
 		}
+		authoritative[observationGroupKey{topic: observation.TopicName, group: observation.GroupName}] = struct{}{}
 
 		ch(gauge(c.groupMembers, float64(observation.MemberCount), observation.TopicName, observation.GroupName))
 		for _, state := range []string{coordinator.ConsumerGroupStateStable, coordinator.ConsumerGroupStateEmpty} {
@@ -464,6 +465,7 @@ func (c *Collector) collectGroupLifecycle(ch func(prometheus.Metric), partitionK
 		ch(gauge(c.groupLastRebalance, timestampSeconds(observation.LastRebalance), observation.TopicName, observation.GroupName))
 	}
 	c.collectObservationFailureCounters(ch, active, failed)
+	return authoritative
 }
 
 func (c *Collector) consumerGroupObservations() []coordinator.ConsumerGroupObservation {
@@ -494,7 +496,10 @@ func (c *Collector) consumerGroupObservations() []coordinator.ConsumerGroupObser
 			State:         groupState,
 			LastActivity:  state.LastActivity,
 			LastRebalance: state.LastRebalance,
-			CoordinatorUp: true,
+			// ExportState alone cannot establish ownership, even if the local
+			// snapshot is populated. The production coordinator supplies the
+			// explicit standalone/distributed observation contract above.
+			ObservationError: coordinator.ObservationFailureCoordinatorLookup,
 		})
 	}
 	return observations

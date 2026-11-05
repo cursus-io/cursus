@@ -23,6 +23,21 @@ func (source fixedGroups) ExportState() map[string]*coordinator.GroupStateSnapsh
 	return source.snapshot
 }
 
+// Mapping fixtures explicitly model an authoritative standalone coordinator.
+func (source fixedGroups) ObserveConsumerGroups() []coordinator.ConsumerGroupObservation {
+	var observations []coordinator.ConsumerGroupObservation
+	for name, state := range source.snapshot {
+		if state == nil || state.Deleted {
+			continue
+		}
+		observations = append(observations, coordinator.ConsumerGroupObservation{
+			GroupName: name, TopicName: state.TopicName, CoordinatorUp: true,
+			MemberCount: len(state.Members), State: coordinator.ConsumerGroupStateStable,
+		})
+	}
+	return observations
+}
+
 type fixedRecoveryGroups struct {
 	fixedGroups
 	recovery coordinator.ConsumerMetadataRecoveryStatus
@@ -114,8 +129,9 @@ func TestCollectorExportsScrapeTimeBrokerState(t *testing.T) {
 	assertGauge(t, families, "cursus_partition_high_watermark", map[string]string{"topic": "orders", "partition": "0"}, 8)
 	assertGauge(t, families, "cursus_consumer_group_committed_offset", map[string]string{"group": "workers", "topic": "orders", "partition": "0"}, 5)
 	assertGauge(t, families, "cursus_consumer_group_lag", map[string]string{"group": "workers", "topic": "orders", "partition": "0"}, 3)
-	assertGauge(t, families, "cursus_consumer_group_lag", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"}, 8)
-	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"}, 1)
+	assertMetricMissing(t, families, "cursus_consumer_group_committed_offset", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"})
+	assertMetricMissing(t, families, "cursus_consumer_group_lag", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"})
+	assertMetricMissing(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "new-workers", "topic": "orders", "partition": "0"})
 	assertGauge(t, families, "cursus_consumer_group_offset_out_of_range", map[string]string{"group": "ahead-workers", "topic": "orders", "partition": "0"}, 1)
 	assertGauge(t, families, "cursus_storage_bytes", nil, 4096)
 	assertGauge(t, families, "cursus_storage_filesystem_free_bytes", nil, 8192)
