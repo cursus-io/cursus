@@ -11,7 +11,6 @@ import (
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/transaction"
-	"github.com/cursus-io/cursus/util"
 )
 
 // startServerWorker returns an idempotent cancel-and-join closure. Callers stop
@@ -64,13 +63,16 @@ func localRegistrationCurrent(sd clusterController.ServiceDiscovery, state *fsm.
 func runLocalRegistration(ctx context.Context, sd clusterController.ServiceDiscovery, cc *clusterController.ClusterController, cfg *config.Config) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var failures registrationFailureLog
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if !localRegistrationCurrent(sd, cc.RaftManager.GetFSM()) {
+		if localRegistrationCurrent(sd, cc.RaftManager.GetFSM()) {
+			failures.recovered(time.Now())
+		} else {
 			if err := registerLocalProcess(ctx, sd, cc, cfg); err != nil && ctx.Err() == nil {
-				util.Debug("local process registration pending: %v", err)
+				failures.failed(time.Now(), err)
 			}
 		}
 		select {
@@ -82,19 +84,27 @@ func runLocalRegistration(ctx context.Context, sd clusterController.ServiceDisco
 }
 
 func registerLocalProcess(ctx context.Context, sd clusterController.ServiceDiscovery, cc *clusterController.ClusterController, cfg *config.Config) error {
-	if err := sd.Register(); err == nil {
+	localErr := sd.Register()
+	if localErr == nil {
 		return nil
+	}
+	leader := cc.RaftManager.GetLeaderAddress()
+	failed := func(err error) error {
+		return &localRegistrationError{local: localErr, final: err, leader: leader}
 	}
 	command, err := forwardedLocalRegistrationCommand(sd, cfg)
 	if err != nil {
-		return err
+		return failed(err)
 	}
-	response, err := cc.ForwardCommandToBrokerContext(ctx, cc.RaftManager.GetLeaderAddress(), command)
+	if leader == "" {
+		return failed(fmt.Errorf("raft leader unavailable"))
+	}
+	response, err := cc.ForwardCommandToBrokerContext(ctx, leader, command)
 	if err != nil {
-		return err
+		return failed(err)
 	}
 	if protocol.IsErrorResponse(response) {
-		return fmt.Errorf("registration rejected: %s", response)
+		return failed(fmt.Errorf("registration rejected: %s", response))
 	}
 	return nil
 }
