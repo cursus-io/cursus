@@ -104,15 +104,17 @@ func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 	return json.Marshal(broker)
 }
 
+// Register submits this process's current registration locally. Callers own
+// forwarding, retry policy and final-failure diagnostics.
 func (sd *serviceDiscovery) Register() error {
 	data, err := sd.LocalRegistrationPayload()
 	if err != nil {
-		util.Error("Failed to marshal broker info: %v", err)
 		return fmt.Errorf("marshal broker info: %w", err)
 	}
 
 	if err := sd.rm.ApplyCommand("REGISTER", data); err != nil {
-		util.Error("Failed to register broker %s: %v", sd.brokerID, err)
+		// The caller may still forward to the leader. Report only the final
+		// outcome there, with retry-aware logging, rather than each local failure.
 		return err
 	}
 
