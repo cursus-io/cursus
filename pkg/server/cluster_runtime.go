@@ -83,6 +83,8 @@ func runLocalRegistration(ctx context.Context, sd clusterController.ServiceDisco
 	}
 }
 
+// registerLocalProcess tries local Raft application and then leader forwarding,
+// returning contextual errors only after both registration paths have failed.
 func registerLocalProcess(ctx context.Context, sd clusterController.ServiceDiscovery, cc *clusterController.ClusterController, cfg *config.Config) error {
 	localErr := sd.Register()
 	if localErr == nil {

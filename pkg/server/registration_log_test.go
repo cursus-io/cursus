@@ -28,19 +28,19 @@ import (
 // lockedRegistrationLogs permits assertions while the registration worker runs.
 type lockedRegistrationLogs struct {
 	sync.Mutex
-	bytes.Buffer
+	buffer bytes.Buffer
 }
 
 func (b *lockedRegistrationLogs) Write(p []byte) (int, error) {
 	b.Lock()
 	defer b.Unlock()
-	return b.Buffer.Write(p)
+	return b.buffer.Write(p)
 }
 
 func (b *lockedRegistrationLogs) text() string {
 	b.Lock()
 	defer b.Unlock()
-	return b.Buffer.String()
+	return b.buffer.String()
 }
 
 func captureRegistrationLogs(t *testing.T) *lockedRegistrationLogs {
@@ -135,7 +135,7 @@ func serveRegistrationWire(t *testing.T, listener net.Listener, state *fsm.Broke
 				return
 			}
 			func() {
-				defer raw.Close()
+				defer func() { _ = raw.Close() }()
 				_ = raw.SetDeadline(time.Now().Add(2 * time.Second))
 				conn, err := wire.ServerHandshake(raw, []wire.Compression{wire.CompressionNone})
 				if err != nil {
@@ -224,13 +224,13 @@ func TestRegistrationExpiredTLSIsPreservedAndVisible(t *testing.T) {
 	pool.AddCert(certificate)
 	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: private}}})
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		conn, err := listener.Accept()
 		if err == nil {
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 			_ = conn.(*tls.Conn).Handshake()
 		}

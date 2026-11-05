@@ -104,6 +104,8 @@ func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 	return json.Marshal(broker)
 }
 
+// Register submits this process's current registration locally. Callers own
+// forwarding, retry policy and final-failure diagnostics.
 func (sd *serviceDiscovery) Register() error {
 	data, err := sd.LocalRegistrationPayload()
 	if err != nil {

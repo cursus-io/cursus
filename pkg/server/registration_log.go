@@ -20,10 +20,12 @@ type localRegistrationError struct {
 	leader       string
 }
 
+// Error includes both stages without discarding the leader's final failure.
 func (e *localRegistrationError) Error() string {
 	return fmt.Sprintf("leader=%q: %v (local registration: %v)", e.leader, e.final, e.local)
 }
 
+// Unwrap exposes the final cause to typed transport and certificate checks.
 func (e *localRegistrationError) Unwrap() error { return e.final }
 
 // registrationFailureLog belongs to one registration worker. Log throttling
@@ -35,6 +37,8 @@ type registrationFailureLog struct {
 	suppressed  uint64
 }
 
+// failed records each failed attempt but emits only first, changed or periodic
+// diagnostics. Suppressed attempts are included in the next emitted summary.
 func (s *registrationFailureLog) failed(now time.Time, err error) {
 	key := registrationFailureKey(err)
 	if s.attempts == 0 {
@@ -49,6 +53,8 @@ func (s *registrationFailureLog) failed(now time.Time, err error) {
 	s.suppressed++
 }
 
+// recovered closes the failure interval after the caller observes the current
+// registration in its FSM, allowing a later outage to log immediately again.
 func (s *registrationFailureLog) recovered(now time.Time) {
 	if s.attempts == 0 {
 		return
