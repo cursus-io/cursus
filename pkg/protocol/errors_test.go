@@ -33,6 +33,19 @@ func TestConsumerMetadataRecoveringClassification(t *testing.T) {
 	}
 }
 
+// TestTransactionFaultBoundaryClassification prevents injected boundary failures
+// from becoming an unregistered wire error or being hidden by automatic retries.
+func TestTransactionFaultBoundaryClassification(t *testing.T) {
+	const code = "transaction_fault_boundary"
+	if !IsKnownErrorCode(code) {
+		t.Fatal("transaction fault boundary error is missing from the registry")
+	}
+	parsed, ok := ParseErrorResponse("ERROR: " + code)
+	if !ok || parsed.Class != ErrorClassInternal || parsed.Retryable {
+		t.Fatalf("unexpected transaction fault classification: %+v", parsed)
+	}
+}
+
 func TestAppendCallbacksRequireControllerFenceClassification(t *testing.T) {
 	const code = "append_callbacks_require_controller_fence"
 	if !IsKnownErrorCode(code) {

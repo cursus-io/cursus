@@ -128,7 +128,9 @@ func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTest
 		data, err := os.ReadFile(config)
 		require.NoError(t, err)
 		config = filepath.Join(t.TempDir(), "config.yaml")
-		require.NoError(t, os.WriteFile(config, []byte(strings.ReplaceAll(string(data), `log_level: "info"`, `log_level: "debug"`)), 0o600))
+		// This nonsecret fixture config is bind-mounted into a UID-1000 broker.
+		// Linux CI may create it with a different owner; keep the broker unprivileged.
+		require.NoError(t, os.WriteFile(config, []byte(strings.ReplaceAll(string(data), `log_level: "info"`, `log_level: "debug"`)), 0o644))
 	}
 	data, err := os.ReadFile(composeFile)
 	require.NoError(t, err)

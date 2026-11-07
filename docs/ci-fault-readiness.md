@@ -89,3 +89,8 @@ A disposable Linux container confirmed that a different UID cannot read the
 original mode-0600 config but can read mode 0644, and that the proposed reserved
 port list is accepted in its own network namespace. No developer-host sysctl or
 existing cluster was modified.
+
+The boundary error is now registered as nonretryable internal failure, with an
+explicit classification regression. The complete protocol package passed Linux
+race tests both normally and with `e2e_faults`. Generated debug config files now
+use mode 0644; only the nonsecret temporary fixture copy changes permissions.
