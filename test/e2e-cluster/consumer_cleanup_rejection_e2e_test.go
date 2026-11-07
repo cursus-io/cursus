@@ -167,10 +167,8 @@ func TestTopicLifecycleRejectsSubscriptionsOnThreeBrokers(t *testing.T) {
 		if mode == "pattern" {
 			registration = "REGISTER_GROUP group=" + group + " pattern=guard-" + mode + "-*"
 		}
-		response, err := client.SendCommand("", registration, 15*time.Second)
-		require.NoError(t, err, response)
-		response, err = client.SendCommand("", "JOIN_GROUP topic="+orders+" group="+group+" member=guard-member", 15*time.Second)
-		require.NoError(t, err, response)
+		consumerHistoryCommand(t, client, registration)
+		consumerHistoryCommand(t, client, "JOIN_GROUP topic="+orders+" group="+group+" member=guard-member")
 		before, err := client.GetConsumerGroupStatus(group)
 		require.NoError(t, err)
 		require.Len(t, before.Members, 1)
@@ -193,8 +191,7 @@ func TestTopicLifecycleRejectsSubscriptionsOnThreeBrokers(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, before.Generation, after.Generation)
 		require.Equal(t, before.Members, after.Members)
-		response, err = client.SendCommand("", fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d", orders, group, before.Members[0].MemberID, before.Generation), 15*time.Second)
-		require.NoError(t, err, response)
+		consumerHistoryCommand(t, client, fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d", orders, group, before.Members[0].MemberID, before.Generation))
 		if mode != "single" {
 			check()
 		}

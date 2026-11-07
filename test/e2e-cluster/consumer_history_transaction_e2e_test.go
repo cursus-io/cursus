@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/stretchr/testify/require"
@@ -130,7 +131,7 @@ func retryHistoryAdmission(t *testing.T, operation func() error) int {
 			return retries
 		}
 		var rejected *wire.BrokerError
-		if !errors.As(err, &rejected) || rejected.Code != "consumer_metadata_recovering" || time.Now().After(deadline) {
+		if !errors.As(err, &rejected) || !isHistoryAdmissionRejection(rejected) || time.Now().After(deadline) {
 			if rejected != nil {
 				t.Logf("history command rejected code=%s fields=%v", rejected.Code, rejected.Fields)
 			}
@@ -138,6 +139,21 @@ func retryHistoryAdmission(t *testing.T, operation func() error) int {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// Lifecycle preflight wraps loading as a conflict. Match its exact reason so
+// real subscription/transaction blockers cannot be mistaken for availability.
+func isHistoryAdmissionRejection(rejected *wire.BrokerError) bool {
+	if rejected.Code == "consumer_metadata_recovering" {
+		return true
+	}
+	if rejected.Code != "topic_delete_blocked" && rejected.Code != "topic_truncate_blocked" {
+		return false
+	}
+	reason := rejected.Fields["reason"]
+	loading := coordinator.ErrConsumerMetadataRecovering.Error()
+	return reason == "topic delete blocked: "+loading ||
+		reason == "topic delete blocked: refresh replicated consumer groups: "+loading
 }
 
 // Transaction-shard election can precede group-owner recovery. Count that wait

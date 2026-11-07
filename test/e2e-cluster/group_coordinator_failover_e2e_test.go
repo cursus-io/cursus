@@ -39,15 +39,10 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 	if err := waitForGroupRegistration(topic, group); err != nil {
 		t.Fatalf("register group after topic creation: %v", err)
 	}
-	client := e2e.NewBrokerClient(clusterBrokerAddrs(3))
+	// Establish the initial member through the existing bounded loading check;
+	// retain strict post-fault fencing and offset assertions below.
+	client, generation, member := joinClusterGroup(t, clusterBrokerAddrs(3), topic, group)
 	defer client.Close()
-	generation, member, err := client.JoinGroup(topic, group)
-	if err != nil {
-		t.Fatalf("join group: %v", err)
-	}
-	if _, err := client.SyncGroup(topic, group, generation, member); err != nil {
-		t.Fatalf("sync group: %v", err)
-	}
 	const preFailureOffset uint64 = 50
 	if err := client.CommitOffset(topic, 0, group, preFailureOffset); err != nil {
 		t.Fatalf("commit offset before coordinator failure: %v", err)
@@ -94,6 +89,7 @@ func TestGroupCoordinatorFailoverUsesDurableMembership(t *testing.T) {
 	if _, err := commitClient.SyncGroup(topic, group, generation, member); err != nil {
 		// Membership fencing is an allowed fail-closed outcome. Rejoin before
 		// committing rather than treating the prior generation as successful.
+		var err error
 		generation, member, err = commitClient.JoinGroup(topic, group)
 		if err != nil {
 			commitClient.Close()
