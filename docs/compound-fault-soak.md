@@ -114,6 +114,15 @@ The active fixture's ownership is now recorded for concurrent host tasks, and
 broker logs plus Docker events are saved throughout the run. Prior attempts'
 elapsed time is not added to this attempt.
 
+That attempt ended at 19:01:38 UTC after 1,090.76 seconds. Nine rounds completed;
+round ten stopped when an unresolved Raft HWM commit left the partition's write
+fence in place even after a new Raft leader was elected. Unlike the prior
+interruption, this was a broker availability failure. The retained tail and
+full process logs were preserved. The same failure appeared during cooperative
+rolling restart. [Partition commit reconciliation](partition-commit-reconciliation.md)
+describes the repair and its focused regressions. A new campaign must validate
+the repair; neither interrupted attempt establishes 24-hour reliability.
+
 The later full validation run exposed two failures outside the compound scenario.
 Consumer-history replay failed before broker startup because host port 40002 was
 already in use. The replay and cooperative jobs now reserve every shifted

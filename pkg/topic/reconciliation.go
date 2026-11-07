@@ -6,6 +6,20 @@ import (
 	"github.com/cursus-io/cursus/pkg/types"
 )
 
+// ReconciliationOnlyError returns the pending outcome only when no independent
+// recovery failure prevents retry. It does not clear the marker or expose data.
+func (p *Partition) ReconciliationOnlyError() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	p.recoveryMu.RLock()
+	defer p.recoveryMu.RUnlock()
+	if p.closed || p.snapshotRecovery || p.recoveryErr != nil || p.txnRecoveryErr != nil || p.producerRecoveryErr != nil ||
+		p.bootstrapErrorLocked() != nil || p.rollbackErrorLocked() != nil {
+		return nil
+	}
+	return p.reconciliationErr
+}
+
 // ValidateReconciliationRecord checks the exact retained bytes and excludes
 // genuine storage recovery failures. Callers must hold replication ownership.
 func (p *Partition) ValidateReconciliationRecord(marker error, message types.Message) error {
@@ -13,7 +27,8 @@ func (p *Partition) ValidateReconciliationRecord(marker error, message types.Mes
 	defer p.mu.RUnlock()
 	p.recoveryMu.RLock()
 	defer p.recoveryMu.RUnlock()
-	if p.closed || p.snapshotRecovery || p.recoveryErr != nil || p.reconciliationErr != marker {
+	if p.closed || p.snapshotRecovery || p.recoveryErr != nil || p.txnRecoveryErr != nil || p.producerRecoveryErr != nil ||
+		p.bootstrapErrorLocked() != nil || p.rollbackErrorLocked() != nil || p.reconciliationErr != marker {
 		return fmt.Errorf("stream reconciliation recovery state changed or unavailable")
 	}
 	messages, err := p.dh.ReadMessages(message.Offset, 1)
@@ -33,7 +48,8 @@ func (p *Partition) CompleteReconciliation(marker error, hwm uint64) error {
 	defer p.mu.RUnlock()
 	p.recoveryMu.Lock()
 	defer p.recoveryMu.Unlock()
-	if marker == nil || p.reconciliationErr != marker || p.recoveryErr != nil || p.snapshotRecovery || p.closed ||
+	if marker == nil || p.reconciliationErr != marker || p.recoveryErr != nil || p.txnRecoveryErr != nil || p.producerRecoveryErr != nil ||
+		p.bootstrapErrorLocked() != nil || p.rollbackErrorLocked() != nil || p.snapshotRecovery || p.closed ||
 		!p.hwmAuthoritative || p.HWM != hwm || p.LEO.Load() != hwm {
 		return fmt.Errorf("stream reconciliation is not committed at the verified boundary")
 	}

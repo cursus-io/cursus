@@ -865,9 +865,13 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Cont
 	if len(metadata.RecoveryReplicas) > 0 {
 		return fail(fmt.Errorf("replica_recovery_pending brokers=%s", strings.Join(metadata.RecoveryReplicas, ",")))
 	}
-	// Only verified stream append outcomes can be resumed; storage failures
-	// and unknown recovery markers still fail the recovery check below.
-	if repaired, err := ch.reconcileStreamAppendLocked(ctx, topicName, partitionID, p, snapshot, requiredISR); err != nil {
+	// Resume only typed append/commit outcomes. Unknown storage and recovery
+	// markers still fail the recovery check below.
+	repaired, err := ch.reconcilePartitionCommitLocked(ctx, topicName, partitionID, p, snapshot, requiredISR)
+	if err == nil && !repaired {
+		repaired, err = ch.reconcileStreamAppendLocked(ctx, topicName, partitionID, p, snapshot, requiredISR)
+	}
+	if err != nil {
 		return fail(fmt.Errorf("partition recovery pending: %w", err))
 	} else if repaired {
 		metadata = fsmRef.GetPartitionMetadata(fmt.Sprintf("%s-%d", topicName, partitionID))
@@ -876,7 +880,7 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Cont
 			return fail(refreshErr)
 		}
 		if metadata == nil || !sameReplicationFence(snapshot, updated) || len(updated.RecoveryReplicas) != 0 {
-			return fail(fmt.Errorf("stream reconciliation fence changed after commit"))
+			return fail(fmt.Errorf("partition reconciliation fence changed after commit"))
 		}
 		snapshot = updated
 	}
