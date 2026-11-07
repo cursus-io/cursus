@@ -28,6 +28,8 @@ func writePayloadHash(payload string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
 }
 
+// checkWriteHistory validates acknowledged-write preservation, idempotent retries,
+// payload identity, contiguous offsets, and per-producer ordering in a retained log.
 func checkWriteHistory(attempts []writeAttempt, records []types.Message) error {
 	if len(attempts) == 0 {
 		return fmt.Errorf("empty write history")

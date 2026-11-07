@@ -52,8 +52,9 @@ Independent checker mutation tests are runnable without Docker. Docker scenarios
 use dedicated containers, ports, network and volumes, with firewall changes only
 inside a test container's network namespace. The broker binary has no test hooks.
 
-Recovery measurements include per-process physical read bytes, decoded frames,
+Recovery measurements include per-process logical read bytes, decoded frames,
 canonical hash bytes and transferred bytes where existing metrics expose them.
+These application counters do not measure physical device I/O.
 Counter resets across a process restart are recorded as separate process intervals.
 Samples before readback separate recovery from the catch-up reads performed by
 the verifier; samples after readback also include that inspection work.

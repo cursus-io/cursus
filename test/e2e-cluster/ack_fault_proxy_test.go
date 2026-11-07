@@ -10,6 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestAckFaultReplyProxy distinguishes a dropped valid ACK from failure or an
+// unrelated response, without allowing any response through to the client.
 func TestAckFaultReplyProxy(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -53,6 +55,7 @@ func TestAckFaultReplyProxy(t *testing.T) {
 	}
 }
 
+// serveAckFaultProxyResponse emits one controlled Wire response for proxy validation.
 func serveAckFaultProxyResponse(listener net.Listener, payload string, mismatch bool) error {
 	conn, err := listener.Accept()
 	if err != nil {

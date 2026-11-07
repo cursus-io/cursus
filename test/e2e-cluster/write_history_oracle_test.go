@@ -7,6 +7,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestWriteHistoryOracle mutates valid histories to prove the oracle rejects each
+// safety violation while allowing unresolved writes to be either present or absent.
 func TestWriteHistoryOracle(t *testing.T) {
 	first := types.Message{ProducerID: "p", SeqNum: 1, Epoch: 2, Payload: "first", Offset: 0}
 	second := types.Message{ProducerID: "p", SeqNum: 2, Epoch: 2, Payload: "second", Offset: 1}

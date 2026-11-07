@@ -28,6 +28,7 @@ type ackFaultJournal struct {
 	attempts []writeAttempt
 }
 
+// newAckFaultJournal opens a broker-independent history file that survives the fault.
 func newAckFaultJournal(t *testing.T) *ackFaultJournal {
 	t.Helper()
 	dir := os.Getenv("CURSUS_ACK_FAULT_RESULTS")
@@ -41,6 +42,7 @@ func newAckFaultJournal(t *testing.T) *ackFaultJournal {
 	return &ackFaultJournal{t: t, file: file}
 }
 
+// record syncs each event before the test proceeds to its next fault or request.
 func (j *ackFaultJournal) record(kind string, value any) {
 	j.t.Helper()
 	event := struct {
@@ -84,6 +86,8 @@ func (j *ackFaultJournal) publish(addr, topic string, message types.Message) (wr
 	return attempt, sent
 }
 
+// ackFaultRoundTrip makes one direct request and reports whether Send completed.
+// A receive error leaves the write outcome unknown; the request is never retried.
 func ackFaultRoundTrip(addr, command string) ([]byte, bool, error) {
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
@@ -104,6 +108,8 @@ func ackFaultRoundTrip(addr, command string) ([]byte, bool, error) {
 	return response, true, err
 }
 
+// newAckFaultCluster creates a dedicated three-broker fixture and waits for full ISR.
+// Only broker 1 bootstraps Raft; fault restarts preserve each broker's existing volume.
 func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	t.Helper()
 	require.Empty(t, os.Getenv("CURSUS_CLEANUP_PORT_OFFSET"), "cleanup fixture overrides cannot be combined")
@@ -145,6 +151,7 @@ func ackFaultContainer(node int) string {
 	return fmt.Sprintf("%s-broker-%d", ackFaultProject, node)
 }
 
+// ackFaultDocker bounds each Docker operation and includes its output on failure.
 func ackFaultDocker(t *testing.T, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -200,6 +207,7 @@ func isolateAckFaultLeader(t *testing.T, leader int, journal *ackFaultJournal) f
 	return heal
 }
 
+// dropAckFaultReply starts a one-shot proxy and reports whether it withheld a valid ACK.
 func dropAckFaultReply(t *testing.T, upstream string) (string, <-chan error) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -213,6 +221,8 @@ func dropAckFaultReply(t *testing.T, upstream string) (string, <-chan error) {
 	return listener.Addr().String(), done
 }
 
+// forwardAndDropPublishReply forwards one publish, validates its correlated ACK,
+// then closes the client connection without exposing that ACK to the client.
 func forwardAndDropPublishReply(listener net.Listener, upstream string) error {
 	client, err := listener.Accept()
 	if err != nil {

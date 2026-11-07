@@ -16,6 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestAcknowledgedWritesSurviveLostReplyAndLeaderKill retries an unknown write
+// after killing its leader and checks that every acknowledged identity survives once.
 func TestAcknowledgedWritesSurviveLostReplyAndLeaderKill(t *testing.T) {
 	if os.Getenv("RUN_E2E_ACK_FAULTS") != "1" {
 		t.Skip("set RUN_E2E_ACK_FAULTS=1 for isolated acknowledged-write faults")
@@ -57,6 +59,8 @@ func TestAcknowledgedWritesSurviveLostReplyAndLeaderKill(t *testing.T) {
 	verifyAckFaultRecovery(t, ctx, journal)
 }
 
+// TestAcknowledgedWritesFenceIsolatedLeader requires majority progress and rejects
+// fresh acknowledgements from the isolated leader before comparing healed replicas.
 func TestAcknowledgedWritesFenceIsolatedLeader(t *testing.T) {
 	if os.Getenv("RUN_E2E_ACK_FAULTS") != "1" {
 		t.Skip("set RUN_E2E_ACK_FAULTS=1 for isolated acknowledged-write faults")
@@ -91,6 +95,7 @@ func ackFaultMessage(producer string, sequence uint64) types.Message {
 		Payload: fmt.Sprintf("%s-message-%04d", producer, sequence)}
 }
 
+// ackFaultOtherNodes returns the surviving peer numbers for a three-broker fixture.
 func ackFaultOtherNodes(excluded int) []int {
 	var nodes []int
 	for node := 1; node <= 3; node++ {
@@ -101,6 +106,7 @@ func ackFaultOtherNodes(excluded int) []int {
 	return nodes
 }
 
+// publishAckFaultEventually retries the same identity while journaling every outcome.
 func publishAckFaultEventually(t *testing.T, journal *ackFaultJournal, topic string, node int, message types.Message) {
 	t.Helper()
 	require.NoError(t, eventually(t, "acknowledgement for "+writeIdentity(message), 2*clusterReadyTimeout, func() (bool, string, error) {
@@ -120,6 +126,7 @@ type ackFaultPartition struct {
 	RecoveryReplicas []string `json:"recovery_replicas"`
 }
 
+// ackFaultState reads one broker's metadata view of the test partition.
 func ackFaultState(node int, topic string) (ackFaultPartition, error) {
 	response, _, err := ackFaultRoundTrip(clusterBrokerAddrs(3)[node-1], "CLUSTER_STATUS")
 	if err != nil {
@@ -139,6 +146,8 @@ func ackFaultState(node int, topic string) (ackFaultPartition, error) {
 	return ackFaultPartition{}, fmt.Errorf("partition %s not found on broker %d", topic, node)
 }
 
+// waitAckFaultState waits for the selected brokers to agree on leadership and HWM,
+// with the required ISR size and no unresolved replica recovery.
 func waitAckFaultState(t *testing.T, topic string, nodes []int, excluded string, expectedISR int) ackFaultPartition {
 	t.Helper()
 	var result ackFaultPartition
@@ -164,6 +173,8 @@ func waitAckFaultState(t *testing.T, topic string, nodes []int, excluded string,
 	return result
 }
 
+// verifyAckFaultRecovery requires sustained full ISR, checks every replica against
+// the write journal, and independently compares the public consumer's offsets and payloads.
 func verifyAckFaultRecovery(t *testing.T, ctx *ClusterTestContext, journal *ackFaultJournal) {
 	t.Helper()
 	waitAckFaultState(t, ctx.GetTopic(), []int{1, 2, 3}, "", 3)
