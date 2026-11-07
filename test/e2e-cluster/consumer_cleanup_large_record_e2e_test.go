@@ -69,13 +69,12 @@ func seedLargeCleanupHistory(t *testing.T, ctx *ClusterTestContext) {
 	const group = "cleanup-large-history"
 	client := e2e.NewBrokerClient(addrs)
 	defer client.Close()
-	response, err := client.SendCommand("", "REGISTER_GROUP topic="+cleanupRetainedMessages+" group="+group, 30*time.Second)
-	require.NoError(t, err)
-	require.True(t, strings.HasPrefix(response, "OK"), response)
+	// Metadata replay can still reject admission after broker readiness succeeds.
+	require.NoError(t, waitForGroupRegistration(cleanupRetainedMessages, group))
 	// The API currently accepts a long token. This deliberately synthetic
 	// state avoids creating thousands of local partitions just to cross 1 MiB.
 	member := "large-" + strings.Repeat("m", (1<<20)+4096)
-	response, err = client.SendCommand("", fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", cleanupRetainedMessages, group, member), 30*time.Second)
+	response, err := client.SendCommand("", fmt.Sprintf("JOIN_GROUP topic=%s group=%s member=%s", cleanupRetainedMessages, group, member), 30*time.Second)
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(response, "OK"), "join response prefix: %.200s", response)
 	status, err := client.GetConsumerGroupStatus(group)
