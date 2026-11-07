@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,7 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 			setup := time.Now()
 			ctx := givenCleanupCluster(t, files...).WithClusterSize(3).WithTopic("history-measure").WithPartitions(1).WithAcks("all")
 			defer ctx.Cleanup()
+			defer historyMeasureCaptureFailure(t, fmt.Sprintf("%s.failure-%d", output, history))
 			actions := ctx.WhenCluster().StartCluster()
 			project, isolated := isolateCleanupCompose(t, "cursus-cleanup-e2e", files)
 			compose := func(args ...string) {
@@ -248,6 +250,43 @@ func TestConsumerHistoryWholeBrokerLadder(t *testing.T) {
 		if t.Failed() {
 			return
 		} // Do not seed larger histories after a failed level.
+	}
+}
+
+// historyMeasureCaptureFailure preserves process state and complete logs before
+// cleanup, including OOM/exit evidence when startup never opens its listener.
+func historyMeasureCaptureFailure(t *testing.T, prefix string) {
+	t.Helper()
+	if !t.Failed() {
+		return
+	}
+	for node := 1; node <= 3; node++ {
+		container := cleanupContainerName(node)
+		for _, probe := range []struct {
+			suffix string
+			args   []string
+		}{
+			{"log", []string{"logs", "--timestamps", container}},
+			{"state.json", []string{"inspect", "--format", "{{json .State}}", container}},
+			{"ports.json", []string{"inspect", "--format", "{{json .NetworkSettings.Ports}}", container}},
+			{"exit.tar", []string{"cp", container + ":/tmp/history-exit.json", "-"}},
+		} {
+			file, err := os.Create(fmt.Sprintf("%s-broker-%d.%s", prefix, node, probe.suffix))
+			if err != nil {
+				t.Logf("history failure evidence: %v", err)
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			cmd := exec.CommandContext(ctx, "docker", probe.args...)
+			cmd.Stdout, cmd.Stderr = file, file
+			if err := cmd.Run(); err != nil {
+				t.Logf("history failure probe %v: %v", probe.args, err)
+			}
+			cancel()
+			if err := file.Close(); err != nil {
+				t.Logf("history failure evidence close: %v", err)
+			}
+		}
 	}
 }
 
