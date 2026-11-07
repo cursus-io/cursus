@@ -64,6 +64,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	t.Setenv("CURSUS_CLEANUP_PORT_OFFSET", "24000")
 	fixture := givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml", "docker-compose.cooperative.yml")
 	defer fixture.Cleanup()
+	defer captureCooperativeRecoveryFailure(t)
 	addrs := fixture.GetBrokerAddrs()
 	// Docker Desktop's IPv6 loopback proxy can stall parallel Wire clients.
 	// Pin this isolated host-published fixture to the advertised IPv4 addresses.

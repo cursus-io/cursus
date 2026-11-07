@@ -111,6 +111,10 @@ The replica was advancing under continuing writes; no terminal heartbeat fence
 was reported. Port reservation alone is not proof of that failure's cause or
 correction. The unchanged cooperative recovery assertions now run three times
 per validation job to retain evidence of recurrence.
+Failures also retain all broker logs, container state and bounded public
+readiness/metrics snapshots before cleanup, with a separate timestamp for each
+repetition. This preserves the advancing commit boundary and per-process recovery
+work instead of relying only on the generic final log tail.
 
 ## Running
 
