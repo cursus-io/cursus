@@ -101,6 +101,19 @@ Waiting, sleep and earlier attempts do not count toward that campaign. Its
 completed duration and final history verification must be recorded separately
 before claiming a 24-hour pass.
 
+That attempt stopped after 4,346.26 total test seconds. The first 39 rounds
+completed full verification: the final verified history contained 1,355 records
+from 1,658 attempts. During round 40, a separate host-side cleanup force-deleted
+all three running containers and their data volumes at 18:28:21 UTC. Docker API
+events and the cleanup command establish this external interruption before the
+test's own failure cleanup; it is not evidence of a broker-originated failure or
+a completed 24-hour campaign. The external journal remains available. A fresh
+attempt started at 18:43:17 UTC using implementation `1cf4d7d` and driver SHA-256
+`7e7f44c1722f4b99ebd7e382f945c0c370265ff340e1b3c262a513f8f1f41338`.
+The active fixture's ownership is now recorded for concurrent host tasks, and
+broker logs plus Docker events are saved throughout the run. Prior attempts'
+elapsed time is not added to this attempt.
+
 The later full validation run exposed two failures outside the compound scenario.
 Consumer-history replay failed before broker startup because host port 40002 was
 already in use. The replay and cooperative jobs now reserve every shifted
@@ -127,6 +140,10 @@ error and successful bounded retry; the final drain checks retain their original
 deadline and ACK requirements and now log offsets, ACK counts and query errors.
 This explains that final-drain failure, not the earlier moving-tail readiness
 timeout. Production routing and consumer behavior are unchanged.
+With the corrected oracle, three consecutive runs passed in 115.99, 57.35 and
+52.53 seconds. All six partitions drained to their committed log ends in every
+run, and none redelivered within an unchanged grant. The third run observed one
+133-byte replay during a member handoff, within the existing one-batch bound.
 
 ## Running
 
