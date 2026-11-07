@@ -37,6 +37,52 @@ on:
       - 'util/**'
 
 jobs:
+  acknowledged-write-faults:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
+      - name: Verify acknowledged writes across response loss and leader isolation
+        env:
+          RUN_E2E_ACK_FAULTS: "1"
+          CURSUS_ACK_FAULT_RESULTS: ${{ github.workspace }}/ack-fault-results
+        run: |
+          set -o pipefail
+          mkdir -p ack-fault-results
+          go test -json -race -count=1 -timeout 25m ./test/e2e-cluster \
+            -run '^Test(WriteHistoryOracle|AckFaultReplyProxy|AcknowledgedWritesSurviveLostReplyAndLeaderKill|AcknowledgedWritesFenceIsolatedLeader)$' \
+            | tee ack-fault-results/tests.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          events = [json.loads(line) for line in Path("ack-fault-results/tests.jsonl").read_text().splitlines()]
+          required = {
+              "TestWriteHistoryOracle",
+              "TestAckFaultReplyProxy",
+              "TestAcknowledgedWritesSurviveLostReplyAndLeaderKill",
+              "TestAcknowledgedWritesFenceIsolatedLeader",
+          }
+          passed = {e.get("Test") for e in events if e.get("Action") == "pass"}
+          skipped = {e.get("Test") for e in events if e.get("Action") == "skip"}
+          if not required <= passed or required & skipped:
+              raise SystemExit(f"Missing/failed required tests: {required - passed}; skipped: {required & skipped}")
+          PY
+      - name: Upload client histories and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: acknowledged-write-faults
+          path: ack-fault-results
+          if-no-files-found: error
+
   standalone-guest-power-loss:
     runs-on: ubuntu-latest
     timeout-minutes: 35

@@ -72,7 +72,7 @@ func readRecoveryHistory(t *testing.T, history string, node, leader, epoch int, 
 	var records []types.Message
 	for request.NextOffset < end {
 		ctx, cancel := context.WithTimeout(readCtx, 5*time.Second)
-		batch, err := transport.FetchReplicaCatchup(ctx, "localhost", 7999+node, request)
+		batch, err := transport.FetchReplicaCatchup(ctx, "localhost", 7999+clusterPortShift()+node, request)
 		cancel()
 		var busy *wire.BrokerError
 		if errors.As(err, &busy) && busy.Code == "recovery_busy" && busy.Retryable {
