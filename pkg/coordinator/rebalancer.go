@@ -635,8 +635,34 @@ func (c *Coordinator) persistAndApplyLifecycle(groupName string, group, candidat
 	if c.groups[groupName] != group {
 		return fmt.Errorf("group %q changed during durable lifecycle update", groupName)
 	}
+	preserveCooperativeHeartbeatClocks(group, candidate)
 	applyGroupLifecycle(group, candidate)
 	return nil
+}
+
+// preserveCooperativeHeartbeatClocks carries only newer volatile liveness into
+// a successfully persisted candidate. Registration/session changes never inherit
+// the old session's clock, and this does not modify the persisted assignment.
+func preserveCooperativeHeartbeatClocks(group, candidate *GroupMetadata) {
+	if group.Cooperative == nil || candidate.Cooperative == nil || group.RegistrationEpoch != candidate.RegistrationEpoch {
+		return
+	}
+	sessions := make(map[string]uint64, len(group.Cooperative.Members))
+	for _, member := range group.Cooperative.Members {
+		sessions[member.ID] = member.Session
+	}
+	for _, member := range candidate.Cooperative.Members {
+		if member.Session == 0 || sessions[member.ID] != member.Session {
+			continue
+		}
+		previous, next := group.Members[member.ID], candidate.Members[member.ID]
+		if previous != nil && next != nil && previous.LastHeartbeat.After(next.LastHeartbeat) {
+			next.LastHeartbeat = previous.LastHeartbeat
+			if next.LastHeartbeat.After(candidate.LastActivity) {
+				candidate.LastActivity = next.LastHeartbeat
+			}
+		}
+	}
 }
 
 func cloneGroupLifecycle(group *GroupMetadata) *GroupMetadata {

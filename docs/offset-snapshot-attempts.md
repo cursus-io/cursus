@@ -40,9 +40,18 @@ does not repair previously conflicting records.
 
 Local cooperative E2E reruns encountered repeated Wire timeouts and member
 fencing before reaching the CI failure's rolling-restart phase. They do not
-establish end-to-end success for this fix; hosted CI remains required.
+establish local end-to-end success for this fix. Hosted validation is recorded
+separately below.
 
 On commit `39ac3f9`, hosted coordinator race/coverage tests and cooperative E2E
 passed. The E2E completed coordinator failover, coordinator restart, and all
 three rolling broker restarts, delivering 464 records with zero duplicate
 deliveries. This hosted result does not erase the local transport/fencing failures.
+
+The final `47967ab`
+[cooperative run](https://github.com/cursus-io/cursus/actions/runs/42376965677/job/128416433157)
+passed in 97.08 seconds, drained every partition and matched committed offsets
+to log end. Parent and graceful-peer consumers delivered 556 records with zero
+duplicates and zero replay payload bytes. Local session/transport diagnosis is
+still separate work; neither this pass nor the revision allocator proves its
+cause has been corrected.

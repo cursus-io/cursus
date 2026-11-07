@@ -184,6 +184,11 @@ func cleanupBrokerCommand(t *testing.T, operation string, nodes ...int) string {
 
 func leaveCleanupGroup(t *testing.T, client *e2e.BrokerClient, generation int, member string) {
 	t.Helper()
+	// Setup heartbeats use a separate connection. The original management
+	// connection can exceed the broker's idle timeout during restart waits.
+	// Refresh transport before this one-shot mutation, preserving membership;
+	// never retry an ambiguous LEAVE as though its first attempt were rejected.
+	client.Close()
 	response, err := client.SendCommand("", fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d", cleanupRecoveryTopic, cleanupRecoveryGroup, member, generation), 15*time.Second)
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(response, "OK"), response)
