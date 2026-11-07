@@ -288,10 +288,19 @@ func (d *DiskHandler) lineagePrefix(ctx context.Context, end uint64) (LineagePre
 			metrics.RecordRecoveryWork(metrics.RecoveryLineage, metrics.RecoveryCacheMisses, 1)
 			i := sort.Search(len(p.index.checkpoints), func(i int) bool { return p.index.checkpoints[i].EndOffset > end })
 			cursor = p.index.checkpoints[i-1]
+			// Endpoint cursors belong to this validated builder generation.
+			// Reuse a closer certified prefix without trusting a persisted cache
+			// or skipping the generation checks around raw reads/publication.
+			for offset, cached := range p.endpoints {
+				if offset > cursor.EndOffset && offset <= end {
+					cursor = cached
+				}
+			}
 			for cursor.EndOffset < end {
 				raw := p.cursor
 				raw.End, raw.Segment, raw.Position = cursor.EndOffset, cursor.Segment, cursor.Position
-				b, err := d.captureLineageBatch(ctx, raw, rawFrameBudget{lineageByteLimit, lineageCheckpointInterval, lineageTransitionLimit})
+				records := min(uint64(lineageCheckpointInterval), end-cursor.EndOffset)
+				b, err := d.captureLineageBatch(ctx, raw, rawFrameBudget{lineageByteLimit, records, lineageTransitionLimit})
 				if err != nil {
 					return LineagePrefix{}, err
 				}
