@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/internal/faultpoint"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
 	"github.com/cursus-io/cursus/pkg/protocol"
@@ -535,6 +536,7 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 	return fmt.Sprintf("OK transactional_id=%s staged_offsets=%d", txnID, len(ops))
 }
 
+// handleEndTxn validates the producer and drives the durable transaction decision and marker sequence.
 func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) string {
 	ctx := firstClientContext(contexts)
 	args := parseKeyValueArgs(cmd[len("END_TXN "):])
@@ -586,13 +588,22 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 				if err := ch.syncTransactionState(txnID); err != nil {
 					return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 				}
+				if err := faultpoint.Pause("transaction-prepare-abort", txnID); err != nil {
+					return fmt.Sprintf("ERROR: transaction_fault_boundary reason=%q", err.Error())
+				}
 				if err := ch.appendTransactionMarkers(prepared, types.TransactionMarkerAbort); err != nil {
 					return fmt.Sprintf("ERROR: transaction_abort_failed state=prepare_abort reason=%q", err.Error())
+				}
+				if err := faultpoint.Pause("transaction-markers-abort", txnID); err != nil {
+					return fmt.Sprintf("ERROR: transaction_fault_boundary reason=%q", err.Error())
 				}
 			}
 		}
 		if err := ch.abortTransactionDecision(txnID, producerID, epoch); err != nil {
 			return fmt.Sprintf("ERROR: transaction_abort_failed reason=%q", err.Error())
+		}
+		if err := faultpoint.Pause("transaction-decision-abort", txnID); err != nil {
+			return fmt.Sprintf("ERROR: transaction_fault_boundary reason=%q", err.Error())
 		}
 		return fmt.Sprintf("OK transactional_id=%s state=aborted", txnID)
 	}
@@ -654,14 +665,23 @@ func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) s
 			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 		}
 	}
+	if err := faultpoint.Pause("transaction-prepare-commit", txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_fault_boundary reason=%q", err.Error())
+	}
 	if err := ch.applyTransaction(tx); err != nil {
 		if syncErr := ch.syncTransactionState(txnID); syncErr != nil {
 			return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q sync_reason=%q", err.Error(), syncErr.Error())
 		}
 		return fmt.Sprintf("ERROR: transaction_commit_failed state=committing reason=%q", err.Error())
 	}
+	if err := faultpoint.Pause("transaction-markers-commit", txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_fault_boundary reason=%q", err.Error())
+	}
 	if err := ch.commitTransactionDecision(txnID); err != nil {
 		return fmt.Sprintf("ERROR: transaction_commit_failed reason=%q", err.Error())
+	}
+	if err := faultpoint.Pause("transaction-decision-commit", txnID); err != nil {
+		return fmt.Sprintf("ERROR: transaction_fault_boundary reason=%q", err.Error())
 	}
 	if err := ch.indexCommittedTransactionStreams(tx); err != nil {
 		return fmt.Sprintf("ERROR: transaction_stream_index_failed reason=%q", err.Error())
@@ -692,12 +712,21 @@ func (ch *CommandHandler) completeTransactionAbort(tx *transaction.Transaction) 
 			if err := ch.syncTransactionState(tx.ID); err != nil {
 				return err
 			}
+			if err := faultpoint.Pause("transaction-prepare-abort", tx.ID); err != nil {
+				return err
+			}
 			if err := ch.appendTransactionMarkers(prepared, types.TransactionMarkerAbort); err != nil {
+				return err
+			}
+			if err := faultpoint.Pause("transaction-markers-abort", tx.ID); err != nil {
 				return err
 			}
 		}
 	}
-	return ch.abortTransactionDecision(tx.ID, tx.Producer, tx.Epoch)
+	if err := ch.abortTransactionDecision(tx.ID, tx.Producer, tx.Epoch); err != nil {
+		return err
+	}
+	return faultpoint.Pause("transaction-decision-abort", tx.ID)
 }
 
 func (ch *CommandHandler) recoverPreparedTransactionsBatch(shards []int, limit int) (bool, error) {

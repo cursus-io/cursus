@@ -345,19 +345,18 @@ func (c *Coordinator) ResolveOffsetReservation(groupName string, registrationEpo
 		}
 		sort.Strings(topics)
 		for _, name := range topics {
-			if group.OffsetRevisions[name] == ^uint64(0) {
-				return fmt.Errorf("offset revision overflow")
+			revision, err := reserveOffsetRevision(group, name)
+			if err != nil {
+				return err
+			}
+			items := mergedOffsetSnapshot(group, name, byTopic[name])
+			if err := c.writeOffsetSnapshot(groupName, name, registrationEpoch, revision, items); err != nil {
+				return err
 			}
 			if group.OffsetRevisions == nil {
 				group.OffsetRevisions = make(map[string]uint64)
 			}
-			// A durable append can succeed even when its response is lost. Never
-			// reuse that revision for a different later snapshot.
-			group.OffsetRevisions[name]++
-			items := mergedOffsetSnapshot(group, name, byTopic[name])
-			if err := c.writeOffsetSnapshot(groupName, name, registrationEpoch, group.OffsetRevisions[name], items); err != nil {
-				return err
-			}
+			group.OffsetRevisions[name] = revision
 			for _, item := range byTopic[name] {
 				group.storeOffset(name, item.Partition, item.Offset)
 			}

@@ -1,10 +1,11 @@
-# Production broker code; NET_ADMIN is granted only by the isolated test fixture.
+# Empty tags build production code. Only explicit boundary scenarios enable hooks.
 FROM golang:1.26.6 AS builder
+ARG E2E_BUILD_TAGS=""
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /app/broker ./cmd/broker
+RUN CGO_ENABLED=0 go build -tags="$E2E_BUILD_TAGS" -o /app/broker ./cmd/broker
 
 FROM alpine:3.20
 RUN apk add --no-cache bash curl iptables \
@@ -13,6 +14,6 @@ RUN apk add --no-cache bash curl iptables \
 WORKDIR /app
 COPY --from=builder --chown=cursus:cursus /app/broker /app/broker
 COPY --chown=cursus:cursus entrypoint.sh /app/entrypoint.sh
-RUN mkdir -p /app/cluster-logs && chown -R cursus:cursus /app && chmod +x /app/entrypoint.sh
+RUN mkdir -p /app/cluster-logs /run/cursus-e2e-faults && chown -R cursus:cursus /app /run/cursus-e2e-faults && chmod +x /app/entrypoint.sh
 USER cursus
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/internal/faultpoint"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -611,12 +612,16 @@ type partitionCommitCommand struct {
 	LifecycleEpoch uint64                       `json:"lifecycle_epoch,omitempty"`
 }
 
+// applyPartitionCommitCommand decodes and applies the committed partition watermark, with a test-only pre-apply boundary.
 func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	var cmd partitionCommitCommand
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {
 		return fmt.Errorf("unmarshal partition commit: %w", err)
 	}
 	key := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+	if err := faultpoint.PauseOffset("partition-commit", cmd.Topic, cmd.Partition, cmd.HWM); err != nil {
+		return err
+	}
 
 	f.mu.Lock()
 	if err := f.validateConsumerMetadataRouteLocked(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {

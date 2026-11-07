@@ -22,6 +22,7 @@ func TestTruncateReregistrationConvergesDelayedFollower(t *testing.T) {
 	}
 }
 
+// runTruncateReregistrationRecovery checks a delayed follower preserves the new registration after replay or snapshot restore of an old truncate.
 func runTruncateReregistrationRecovery(t *testing.T, snapshot bool) {
 	files := []string{composeFile}
 	if snapshot {
@@ -98,16 +99,23 @@ func runTruncateReregistrationRecovery(t *testing.T, snapshot bool) {
 			(strings.Contains(pending, "handler-open") || strings.Contains(pending, "consumer cleanup")), body, nil
 	}))
 	setTruncateTargetOpenFault(t, delayed, false)
-	require.NoError(t, eventually(t, "old truncate reaches recovered group", clusterReadyTimeout, func() (bool, string, error) {
+	require.NoError(t, eventually(t, "old truncate reconciles recovered group", clusterReadyTimeout, func() (bool, string, error) {
 		heartbeatGroup(t, fresh, cleanupRecoveryTopic, cleanupRecoveryGroup, newGeneration, newMember)
-		_, body, err := readReadiness(delayed)
-		return err == nil && strings.Contains(body, "consumer cleanup"), body, nil
+		status, body, err := readReadiness(delayed)
+		// Startup opens the final authoritative generation. If its truncate
+		// already completed, no second cleanup read is needed. Validate the
+		// terminal data and membership below instead of requiring a transient
+		// readiness error that may never occur on this legitimate path.
+		ready := status == 200 && strings.Contains(body, `"status":"ready"`)
+		return err == nil && (strings.Contains(body, "consumer cleanup") || ready), body, nil
 	}))
 	setCleanupReadFault(t, []int{delayed}, false)
 	requireClusterStatusMaterializedWithin(t, addrs, clusterReadyTimeout, func() {
 		heartbeatGroup(t, fresh, cleanupRecoveryTopic, cleanupRecoveryGroup, newGeneration, newMember)
 	})
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "old truncate preserved new registration")
+	requireClusterDefinitionEventually(t, addrs, cleanupRecoveryTopic, map[string]string{"revision": "2", "lifecycle_epoch": "2"})
+	requireReplicaOffsetsEventually(t, addrs, cleanupRecoveryTopic, 1)
 	require.NoError(t, actions.waitForNodeHealth(delayed, clusterHealthCheckAddrs(3)[delayed-1]))
 	heartbeatGroup(t, fresh, cleanupRecoveryTopic, cleanupRecoveryGroup, newGeneration, newMember)
 	require.Equal(t, uint64(1), fetchCommittedOffset(t, fresh, cleanupRecoveryTopic, cleanupRecoveryGroup))

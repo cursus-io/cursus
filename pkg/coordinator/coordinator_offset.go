@@ -69,6 +69,7 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 	return c.commitAuthorizedOffsetForGroupLocked(gm, groupName, topic, partition, offset)
 }
 
+// commitAuthorizedOffsetForGroupLocked persists one authorized offset and publishes it only after acknowledgement; gm.mu must be held.
 func (c *Coordinator) commitAuthorizedOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
 	if err := reservedOffsetError(gm, groupName, topic, partition); err != nil {
 		return err
@@ -92,7 +93,10 @@ func (c *Coordinator) commitAuthorizedOffsetForGroupLocked(gm *GroupMetadata, gr
 			return nil
 		}
 		items := mergedOffsetSnapshot(gm, topic, []OffsetItem{{Partition: partition, Offset: offset}})
-		revision := gm.OffsetRevisions[topic] + 1
+		revision, err := reserveOffsetRevision(gm, topic)
+		if err != nil {
+			return err
+		}
 		if err := c.writeOffsetSnapshot(groupName, topic, gm.RegistrationEpoch, revision, items); err != nil {
 			return err
 		}
@@ -181,6 +185,7 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 	return c.commitAuthorizedOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
 }
 
+// commitAuthorizedOffsetsBulkForGroupLocked persists a merged topic snapshot before publishing acknowledged offsets; gm.mu must be held.
 func (c *Coordinator) commitAuthorizedOffsetsBulkForGroupLocked(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
@@ -207,7 +212,10 @@ func (c *Coordinator) commitAuthorizedOffsetsBulkForGroupLocked(gm *GroupMetadat
 			return nil
 		}
 		items := mergedOffsetSnapshot(gm, topic, offsets)
-		revision := gm.OffsetRevisions[topic] + 1
+		revision, err := reserveOffsetRevision(gm, topic)
+		if err != nil {
+			return err
+		}
 		if err := c.writeOffsetSnapshotWithReadWindow(gm, groupName, topic, revision, items); err != nil {
 			return err
 		}
@@ -258,6 +266,7 @@ func (c *Coordinator) ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, membe
 	return c.validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID, generation, registrationEpoch, offsets)
 }
 
+// validateAndCommitTopicOffsetsBulkForEpoch fences stale members and commits each topic snapshot without reusing uncertain revisions.
 func (c *Coordinator) validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -299,13 +308,20 @@ func (c *Coordinator) validateAndCommitTopicOffsetsBulkForEpoch(groupName, membe
 		}
 		for _, topic := range topics {
 			items := mergedOffsetSnapshot(group, topic, offsets[topic])
-			if err := c.writeOffsetSnapshot(groupName, topic, group.RegistrationEpoch, group.OffsetRevisions[topic]+1, items); err != nil {
+			revision, err := reserveOffsetRevision(group, topic)
+			if err != nil {
+				return err
+			}
+			if err := c.writeOffsetSnapshot(groupName, topic, group.RegistrationEpoch, revision, items); err != nil {
 				return err
 			}
 			for _, item := range offsets[topic] {
 				group.storeOffset(topic, item.Partition, item.Offset)
 			}
-			group.OffsetRevisions[topic]++
+			if group.OffsetRevisions == nil {
+				group.OffsetRevisions = make(map[string]uint64)
+			}
+			group.OffsetRevisions[topic] = revision
 		}
 		return nil
 	}
@@ -346,12 +362,18 @@ func (c *Coordinator) MaterializeCommittedTransactionOffsets(groupName string, r
 		topics = append(topics, topic)
 	}
 	sort.Strings(topics)
+	revisions := make(map[string]uint64, len(topics))
 	for _, topic := range topics {
 		if err := validateOffsetBatchLocked(group, groupName, topic, offsets[topic]); err != nil {
 			return err
 		}
 		items := mergedOffsetSnapshot(group, topic, offsets[topic])
-		if err := c.writeOffsetSnapshot(groupName, topic, registrationEpoch, group.OffsetRevisions[topic]+1, items); err != nil {
+		revision, err := reserveOffsetRevision(group, topic)
+		if err != nil {
+			return err
+		}
+		revisions[topic] = revision
+		if err := c.writeOffsetSnapshot(groupName, topic, registrationEpoch, revision, items); err != nil {
 			return err
 		}
 	}
@@ -359,7 +381,10 @@ func (c *Coordinator) MaterializeCommittedTransactionOffsets(groupName string, r
 		for _, item := range offsets[topic] {
 			group.storeOffset(topic, item.Partition, item.Offset)
 		}
-		group.OffsetRevisions[topic]++
+		if group.OffsetRevisions == nil {
+			group.OffsetRevisions = make(map[string]uint64)
+		}
+		group.OffsetRevisions[topic] = revisions[topic]
 	}
 	return nil
 }

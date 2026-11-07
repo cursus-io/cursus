@@ -88,6 +88,65 @@ jobs:
           path: ack-fault-results
           if-no-files-found: error
 
+  recovery-boundary-faults:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
+      - name: Reserve fault fixture ports across broker restarts
+        run: |
+          # The internal-wire host ports overlap Linux's ephemeral range.
+          existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}42001-42003"
+      - name: Verify storage operations and gated fault hooks
+        run: |
+          go test -race -tags=e2e_faults -count=1 ./internal/faultpoint ./pkg/disk \
+            -run '^Test(PauseRequiresGateAndExplicitRelease|StorageOperationFailurePreservesAcknowledgedPrefix|CompactionRenameFailureRecoversPublishedLog)$'
+      - name: Verify commit, transaction, storage and interrupted recovery boundaries
+        env:
+          RUN_E2E_RECOVERY_BOUNDARIES: "1"
+          CURSUS_ACK_FAULT_RESULTS: ${{ github.workspace }}/recovery-boundary-results
+          GOMAXPROCS: "2"
+        run: |
+          set -o pipefail
+          mkdir -p recovery-boundary-results
+          go test -json -race -p 2 -count=1 -timeout 28m ./test/e2e-cluster \
+            -run '^Test(AcknowledgedWritesSurviveCommitApplicationCrash|TransactionDecisionsSurviveCoordinatorBoundaries|AcknowledgedWritesSurviveStorageErrors|RecoveryBudgetInterruptedMixedLoad)$' \
+            | tee recovery-boundary-results/tests.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          events = [json.loads(line) for line in Path("recovery-boundary-results/tests.jsonl").read_text().splitlines()]
+          required = {
+              "TestAcknowledgedWritesSurviveCommitApplicationCrash",
+              "TestTransactionDecisionsSurviveCoordinatorBoundaries",
+              "TestAcknowledgedWritesSurviveStorageErrors",
+              "TestRecoveryBudgetInterruptedMixedLoad",
+          }
+          required.update(f"TestTransactionDecisionsSurviveCoordinatorBoundaries/{decision}-{boundary}"
+                          for decision in ("commit", "abort") for boundary in ("prepare", "markers", "decision"))
+          required.update(f"TestAcknowledgedWritesSurviveStorageErrors/{point}" for point in ("disk-append", "disk-sync"))
+          passed = {e.get("Test") for e in events if e.get("Action") == "pass"}
+          skipped = {e.get("Test") for e in events if e.get("Action") == "skip"}
+          if not required <= passed or required & skipped:
+              raise SystemExit(f"Missing/failed required tests: {required - passed}; skipped: {required & skipped}")
+          PY
+      - name: Preserve boundary evidence and recovery work
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: recovery-boundary-faults
+          path: recovery-boundary-results
+          if-no-files-found: error
+
   standalone-guest-power-loss:
     runs-on: ubuntu-latest
     timeout-minutes: 35

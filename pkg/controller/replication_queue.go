@@ -327,6 +327,8 @@ func (l *partitionReplicationLane) run() {
 	}
 }
 
+// process replicates under the task's ownership fence and resolves its commit
+// before completion; an uncertain outcome retains the tail for reconciliation.
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
 	failures := uint64(0)
@@ -441,6 +443,19 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 		commitResult := partitionCommitResult{}
 		if err == nil {
 			commitResult, err = l.owner.executor.Commit(task)
+			if err != nil && !commitResult.accepted {
+				commitResult, err = l.resolveUncertainCommit(task, err)
+				if err != nil && !commitResult.accepted {
+					// The command may still apply. Neither a timeout nor a new
+					// fence proves that the old local watermark is authoritative.
+					util.Error("partition commit outcome unresolved; tail preserved topic=%s partition=%d ack_mode=%s commit_hwm=%d error=%v", task.topic, task.partition, task.ackMode, task.commitHWM, err)
+					if task.partitionRef != nil {
+						task.partitionRef.MarkReconciliationPending(err)
+					}
+					completeReplicationTaskPreservingTail(task, err)
+					return
+				}
+			}
 		}
 		if err == nil {
 			current, snapshotErr := l.owner.executor.Snapshot(task.topic, task.partition)
@@ -620,6 +635,41 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 		return current, nil
 	}
 	return current, nil
+}
+
+// Retry only the same metadata commit while retaining append ownership. Retrying
+// the whole replication lane could reuse or reconcile an uncertain tail. An
+// accepted result is handled by the existing authoritative-HWM completion path.
+func (l *partitionReplicationLane) resolveUncertainCommit(task partitionReplicationTask, cause error) (partitionCommitResult, error) {
+	deadline := time.NewTimer(DefaultFSMApplyTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if isReplicationFenceError(cause) {
+			return partitionCommitResult{}, cause
+		}
+		select {
+		case <-l.owner.ctx.Done():
+			return partitionCommitResult{}, errors.Join(errReplicationQueueClosed, cause)
+		case <-deadline.C:
+			return partitionCommitResult{}, fmt.Errorf("partition commit outcome unresolved: %w", cause)
+		case <-tick.C:
+		}
+		current, err := l.owner.executor.Snapshot(task.topic, task.partition)
+		if err != nil {
+			cause = err
+			continue
+		}
+		if !sameReplicationFence(current, task.snapshot) {
+			return partitionCommitResult{}, fmt.Errorf("%w while resolving uncertain commit", clusterController.ErrPartitionLeaderFenced)
+		}
+		result, err := l.owner.executor.Commit(task)
+		if err == nil || result.accepted {
+			return result, err
+		}
+		cause = err
+	}
 }
 
 func sameReplicationFence(left, right clusterController.PartitionReplicationSnapshot) bool {

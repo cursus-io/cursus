@@ -36,7 +36,7 @@ func newAckFaultJournal(t *testing.T) *ackFaultJournal {
 		dir = t.TempDir()
 	}
 	require.NoError(t, os.MkdirAll(dir, 0o750))
-	file, err := os.OpenFile(filepath.Join(dir, t.Name()+".jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "_")+".jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, file.Close()) })
 	return &ackFaultJournal{t: t, file: file}
@@ -112,12 +112,27 @@ func ackFaultRoundTrip(addr, command string) ([]byte, bool, error) {
 // Only broker 1 bootstraps Raft; fault restarts preserve each broker's existing volume.
 func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	t.Helper()
+	return newAckFaultClusterMode(t, topic, false)
+}
+
+// newAckFaultClusterMode starts an isolated three-broker fixture with optional explicitly gated fault hooks.
+func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTestContext {
+	t.Helper()
 	require.Empty(t, os.Getenv("CURSUS_CLEANUP_PORT_OFFSET"), "cleanup fixture overrides cannot be combined")
 	t.Setenv("CURSUS_E2E_PORT_SHIFT", strconv.Itoa(ackFaultPortShift))
 	root, err := filepath.Abs("../..")
 	require.NoError(t, err)
 	config, err := filepath.Abs("../cluster/config.yaml")
 	require.NoError(t, err)
+	if hooks {
+		// Keep rejected recovery generations and continuations in fault evidence.
+		data, err := os.ReadFile(config)
+		require.NoError(t, err)
+		config = filepath.Join(t.TempDir(), "config.yaml")
+		// This nonsecret fixture config is bind-mounted into a UID-1000 broker.
+		// Linux CI may create it with a different owner; keep the broker unprivileged.
+		require.NoError(t, os.WriteFile(config, []byte(strings.ReplaceAll(string(data), `log_level: "info"`, `log_level: "debug"`)), 0o644))
+	}
 	data, err := os.ReadFile(composeFile)
 	require.NoError(t, err)
 	text := strings.ReplaceAll(string(data), "context: ../..", "context: "+filepath.ToSlash(root))
@@ -127,6 +142,10 @@ func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	text = strings.Replace(text, "- BOOTSTRAP_CLUSTER=false", "- BOOTSTRAP_CLUSTER=true", 1)
 	text = strings.ReplaceAll(text, "../cluster/config.yaml", filepath.ToSlash(config))
 	text = strings.ReplaceAll(text, "dockerfile: Dockerfile", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults")
+	if hooks {
+		text = strings.ReplaceAll(text, "dockerfile: test/e2e-cluster/Dockerfile.ack-faults", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults\n      args:\n        E2E_BUILD_TAGS: e2e_faults")
+		text = strings.ReplaceAll(text, "- CONFIG_PATH=/app/config.yaml", "- CONFIG_PATH=/app/config.yaml\n      - CURSUS_E2E_FAULTS=1")
+	}
 	text = strings.ReplaceAll(text, "name: cluster_network", "name: "+ackFaultProject)
 	for node := 1; node <= 3; node++ {
 		text = strings.ReplaceAll(text, fmt.Sprintf("container_name: broker-%d", node),
@@ -142,6 +161,39 @@ func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	require.NoError(t, os.WriteFile(compose, []byte(text), 0o600))
 	ctx := givenClusterRestart(t, ackFaultProject, compose).WithTopic(topic).WithPartitions(1).WithIdempotent(true).WithAcks("all")
 	t.Cleanup(ctx.Cleanup)
+	logDir := os.Getenv("CURSUS_ACK_FAULT_RESULTS")
+	if logDir == "" {
+		logDir = t.TempDir()
+	}
+	require.NoError(t, os.MkdirAll(logDir, 0o750))
+	t.Cleanup(func() {
+		// Preserve complete process lifetimes before topic/container cleanup.
+		// The generic failure tail can omit the recovery error under debug load.
+		for node := 1; node <= 3; node++ {
+			if t.Failed() {
+				// The scenario is already failed. Capture Go stacks before the
+				// dedicated containers are destroyed, including blocked replay.
+				dumpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = exec.CommandContext(dumpCtx, "docker", "kill", "--signal=QUIT", ackFaultContainer(node)).Run()
+				_ = exec.CommandContext(dumpCtx, "docker", "wait", ackFaultContainer(node)).Run()
+				cancel()
+			}
+			path := filepath.Join(logDir, fmt.Sprintf("%s-broker-%d.log", strings.ReplaceAll(t.Name(), "/", "_"), node))
+			file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Logf("broker log artifact: %v", err)
+				continue
+			}
+			logCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			cmd := exec.CommandContext(logCtx, "docker", "logs", ackFaultContainer(node))
+			cmd.Stdout, cmd.Stderr = file, file
+			if err := cmd.Run(); err != nil {
+				t.Logf("broker log capture: %v", err)
+			}
+			cancel()
+			_ = file.Close()
+		}
+	})
 	ctx.WhenCluster().CreateTopic().WaitForTopicMetadata()
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "ack fault fixture")
 	return ctx

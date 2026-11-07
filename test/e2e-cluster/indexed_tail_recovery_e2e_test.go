@@ -61,13 +61,19 @@ func publishRecoveryHistory(t *testing.T, addr, history string, afterBatch func(
 
 func readRecoveryHistory(t *testing.T, history string, node, leader, epoch int, end uint64) []types.Message {
 	t.Helper()
+	return readRecoveryHistoryFrom(t, history, node, node%3+1, leader, epoch, end, 30*time.Second)
+}
+
+// readRecoveryHistoryFrom reads retained history from the selected receiver under the supplied leader fence and deadline.
+func readRecoveryHistoryFrom(t *testing.T, history string, node, receiver, leader, epoch int, end uint64, timeout time.Duration) []types.Message {
+	t.Helper()
 	request := fsm.ReplicaCatchupRequest{
-		Topic: history, BrokerID: fmt.Sprintf("broker-%d-9000", node%3+1),
+		Topic: history, BrokerID: fmt.Sprintf("broker-%d-9000", receiver),
 		Leader: fmt.Sprintf("broker-%d-9000", leader), LeaderEpoch: epoch, LifecycleEpoch: 1,
 		SourceBroker: fmt.Sprintf("broker-%d-9000", node), CommittedHWM: end, MaxRecords: fsm.MaxReplicaCatchupRecords,
 	}
 	transport := clusterClient.NewSecureTCPClusterClient("cursus-test-internal-token", nil)
-	readCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+	readCtx, stop := context.WithTimeout(context.Background(), timeout)
 	defer stop()
 	var records []types.Message
 	for request.NextOffset < end {

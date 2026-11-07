@@ -34,6 +34,7 @@ func TestApplyOffsetUpdateFromFSMInitializesAndFencesReplayState(t *testing.T) {
 	require.ErrorContains(t, c.ApplyOffsetUpdateFromFSM("blank", "payments", []OffsetItem{{Partition: 1, Offset: 6}}), "offset regression")
 }
 
+// TestMaterializeCommittedTransactionOffsetsIsAtomic keeps transaction offsets invisible until all topic snapshots succeed.
 func TestMaterializeCommittedTransactionOffsetsIsAtomic(t *testing.T) {
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
 	t.Cleanup(c.Stop)
@@ -72,7 +73,7 @@ func TestMaterializeCommittedTransactionOffsetsIsAtomic(t *testing.T) {
 	require.Equal(t, "payments", records[1].Topic)
 	require.Equal(t, uint64(5), mustOffset(t, c, "workers", "orders", 0))
 	require.Equal(t, uint64(8), mustOffset(t, c, "workers", "payments", 0))
-	require.Equal(t, uint64(1), c.GetGroup("workers").OffsetRevisions["orders"])
+	require.Equal(t, uint64(2), c.GetGroup("workers").OffsetRevisions["orders"], "the failed append attempt consumed revision 1 without exposing its offset")
 }
 
 func TestConsumerMetadataCandidateSelectionRejectsConflicts(t *testing.T) {

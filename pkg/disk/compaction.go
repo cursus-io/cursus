@@ -13,7 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
+	"github.com/cursus-io/cursus/internal/faultpoint"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
@@ -486,7 +488,11 @@ func (d *DiskHandler) rewriteClosedSegment(segment uint64, allowOffsetGaps bool,
 	if err := stage("log_published"); err != nil {
 		return 0, before, after, err
 	}
-	if err := replaceCompactedFile(indexTemp, indexPath); err != nil {
+	replaceErr := faultpoint.Fail("disk-rename", fmt.Sprintf("%s-%d-index", d.topicName, d.partitionID), syscall.EIO)
+	if replaceErr == nil {
+		replaceErr = replaceCompactedFile(indexTemp, indexPath)
+	}
+	if err := replaceErr; err != nil {
 		_ = os.Chmod(logPath, originalMode)
 		_ = syncDirectory(directory)
 		return 0, before, after, err

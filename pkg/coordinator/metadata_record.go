@@ -1096,6 +1096,7 @@ func (c *Coordinator) recoverConsumerMetadataWithValidation(reader OffsetLogRead
 			}
 			continue
 		}
+		preserveOffsetWriteRevisions(existing, recovered)
 		existing.mu.RLock()
 		// A durable commit may complete after this scan has passed the group's
 		// offsets partition. Preserve only strictly newer acknowledged revisions

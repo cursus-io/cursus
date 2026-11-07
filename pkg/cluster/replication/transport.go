@@ -57,23 +57,28 @@ func (l *raftTLSStreamLayer) Dial(address raft.ServerAddress, timeout time.Durat
 	return tls.DialWithDialer(dialer, "tcp", string(address), l.clientConfig.Clone())
 }
 
-func newRaftNetworkTransport(cfg *config.Config, bindAddress, advertised string) (*raft.NetworkTransport, error) {
+// newRaftNetworkTransport constructs the configured TCP or TLS transport with voter-identity validation.
+func newRaftNetworkTransport(cfg *config.Config, bindAddress, advertised string) (*identityRaftTransport, error) {
 	const timeout = 10 * time.Second
 	if !cfg.InternalUseTLS {
 		resolved, err := net.ResolveTCPAddr("tcp", advertised)
 		if err != nil {
 			return nil, fmt.Errorf("resolve advertised Raft address %q: %w", advertised, err)
 		}
-		return raft.NewTCPTransport(bindAddress, resolved, 3, timeout, os.Stderr)
+		transport, err := raft.NewTCPTransport(bindAddress, resolved, 3, timeout, os.Stderr)
+		if err != nil {
+			return nil, err
+		}
+		return &identityRaftTransport{transport}, nil
 	}
 
 	layer, err := newRaftTLSStreamLayer(bindAddress, stableRaftAddress(advertised), cfg.InternalServerTLSConfig(), cfg.InternalClientTLSConfig())
 	if err != nil {
 		return nil, err
 	}
-	return raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+	return &identityRaftTransport{raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 		Stream:  layer,
 		MaxPool: 3,
 		Timeout: timeout,
-	}), nil
+	})}, nil
 }
