@@ -72,7 +72,7 @@ func TestMaterializeCommittedTransactionOffsetsIsAtomic(t *testing.T) {
 	require.Equal(t, "payments", records[1].Topic)
 	require.Equal(t, uint64(5), mustOffset(t, c, "workers", "orders", 0))
 	require.Equal(t, uint64(8), mustOffset(t, c, "workers", "payments", 0))
-	require.Equal(t, uint64(1), c.GetGroup("workers").OffsetRevisions["orders"])
+	require.Equal(t, uint64(2), c.GetGroup("workers").OffsetRevisions["orders"], "the failed append attempt consumed revision 1 without exposing its offset")
 }
 
 func TestConsumerMetadataCandidateSelectionRejectsConflicts(t *testing.T) {

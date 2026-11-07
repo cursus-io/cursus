@@ -629,6 +629,9 @@ func (c *Coordinator) applyConsumerMetadataReplay(p *PreparedConsumerMetadataRep
 		previous.mu.RUnlock()
 	}
 	publish := func() {
+		for name, next := range p.scratch.groups {
+			preserveOffsetWriteRevisions(c.groups[name], next)
+		}
 		if scoped {
 			for name := range p.scope.names {
 				delete(c.groups, name)

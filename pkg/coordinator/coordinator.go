@@ -122,6 +122,8 @@ func (c *Coordinator) SetTransactionalOffsetResolver(resolver TransactionalOffse
 
 // GroupMetadata holds metadata for a single consumer group.
 type GroupMetadata struct {
+	offsetRevisionMu     sync.Mutex
+	offsetWriteRevisions map[string]uint64 // topic -> highest attempted snapshot revision
 	offsetReadWindow     offsetReadWindow
 	mu                   sync.RWMutex               // Per-group lock for offset operations
 	TopicName            string                     // Topic this group consumes
@@ -1101,6 +1103,7 @@ func (c *Coordinator) importStateValidated(state map[string]*GroupStateSnapshot)
 func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) error {
 	c.stateImportGeneration++
 
+	previousGroups := c.groups
 	c.groups = make(map[string]*GroupMetadata, len(state))
 	c.groupEpochs = make(map[string]uint64, len(state))
 	c.lifecyclePending = make(map[string]bool)
@@ -1149,6 +1152,7 @@ func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) er
 			group.OffsetRevisions[topic] = revision
 		}
 
+		preserveOffsetWriteRevisions(previousGroups[name], group)
 		c.groups[name] = group
 	}
 	return nil
