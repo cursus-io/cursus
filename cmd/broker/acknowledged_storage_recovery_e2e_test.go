@@ -24,10 +24,13 @@ import (
 
 const storageRecoveryRecords = 32
 
+// storageRecoveryPayload gives each producer sequence a reproducible payload.
 func storageRecoveryPayload(sequence int) string {
 	return fmt.Sprintf("ack-recovery-%04d-%s", sequence, strings.Repeat("x", 256))
 }
 
+// publishStorageRecoveryRecord verifies the durable ACK and exact offset for an
+// idempotent identity, including retries after recovery.
 func publishStorageRecoveryRecord(t *testing.T, port, sequence int) types.AckResponse {
 	t.Helper()
 	response := brokerCommand(t, port, fmt.Sprintf("PUBLISH topic=events partition=0 producerId=power-producer epoch=1 seqNum=%d isIdempotent=true acks=all message=%s", sequence, storageRecoveryPayload(sequence)))
@@ -38,6 +41,8 @@ func publishStorageRecoveryRecord(t *testing.T, port, sequence int) types.AckRes
 	return ack
 }
 
+// seedStorageRecoveryRecords writes the acknowledged prefix and group state,
+// ending at the offset-commit ACK without an additional flush before power loss.
 func seedStorageRecoveryRecords(t *testing.T, port int) {
 	t.Helper()
 	require.Contains(t, brokerCommand(t, port, "CREATE topic=events partitions=1 idempotent=true min_in_sync_replicas=1"), "OK")
@@ -54,6 +59,8 @@ func seedStorageRecoveryRecords(t *testing.T, port int) {
 	require.Equal(t, "OK", brokerCommand(t, port, fmt.Sprintf("COMMIT_OFFSET topic=events partition=0 group=workers offset=13 generation=%s member=%s", joined[1], joined[2])))
 }
 
+// verifyStorageRecoveryRecords checks recovered offsets, deduplicated retries,
+// full public readback and the next successful append.
 func verifyStorageRecoveryRecords(t *testing.T, port int) {
 	t.Helper()
 	for group, offset := range map[string]int{"workers": 13, "empty-workers": 0} {
@@ -87,6 +94,8 @@ func verifyStorageRecoveryRecords(t *testing.T, port int) {
 	t.Logf("verified records=%d payload_bytes=%d committed_offset=13 new_end=33", storageRecoveryRecords, storageRecoveryRecords*len(storageRecoveryPayload(1)))
 }
 
+// TestStandaloneBrokerAcknowledgedPrefixPowerRecovery checks acknowledged state
+// after a child-process crash or the external guest power-cut boundary.
 func TestStandaloneBrokerAcknowledgedPrefixPowerRecovery(t *testing.T) {
 	if phase := os.Getenv("CURSUS_POWER_PHASE"); phase != "" && phase != "acknowledged_prefix" {
 		t.Skip("another guest power boundary selected")
@@ -124,6 +133,8 @@ type recoveryFileDigest struct {
 	SHA256 string
 }
 
+// recoveryDirectoryDigests inventories file contents and byte counts without
+// modifying the backup, so validation and restoration can prove immutability.
 func recoveryDirectoryDigests(t *testing.T, root string) map[string]recoveryFileDigest {
 	t.Helper()
 	result := make(map[string]recoveryFileDigest)
@@ -157,6 +168,8 @@ func recoveryDirectoryDigests(t *testing.T, root string) map[string]recoveryFile
 	return result
 }
 
+// TestStandaloneBrokerBackupCorruptionRestore checks corruption rejection,
+// derived-index reconstruction and complete recovery from an unchanged backup.
 func TestStandaloneBrokerBackupCorruptionRestore(t *testing.T) {
 	t.Setenv("CURSUS_E2E_FAULTS", "1")
 	root, backup := t.TempDir(), t.TempDir()

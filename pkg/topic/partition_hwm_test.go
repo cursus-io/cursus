@@ -51,6 +51,8 @@ func TestTransactionDecisionRejectsMarkerFromPreviousCoordinatorEpoch(t *testing
 	}, resolver))
 }
 
+// TestPartition_RestoresPersistedHWMCheckpoint verifies that distributed recovery
+// retains the committed checkpoint instead of exposing the uncommitted tail.
 func TestPartition_RestoresPersistedHWMCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()

@@ -169,6 +169,8 @@ func runAcknowledgedClusterBackupRestore(t *testing.T, source, candidate string)
 	journal.record("backup_restore_verified", map[string]any{"elapsed_ms": time.Since(began).Milliseconds(), "cloned_bytes": copiedBytes, "clone_hash_bytes": copiedBytes, "backup_recheck_bytes": copiedBytes, "committed_offset": 13, "acknowledged_records": 33})
 }
 
+// backupFileInventory hashes every regular file and counts bytes read, providing
+// comparable inventories for the stopped source, backup and restored clone.
 func backupFileInventory(t *testing.T, root string) (map[string]string, int64) {
 	t.Helper()
 	result := make(map[string]string)
@@ -204,6 +206,8 @@ func backupFileInventory(t *testing.T, root string) (map[string]string, int64) {
 	return result, total
 }
 
+// parseBackupHashes validates the container-side digest inventory and rejects
+// malformed rows or duplicate paths before comparing copied data.
 func parseBackupHashes(t *testing.T, output string) map[string]string {
 	t.Helper()
 	result := make(map[string]string)

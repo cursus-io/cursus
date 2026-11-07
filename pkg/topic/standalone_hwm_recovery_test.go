@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestPartitionRecoveryStaleHWMCheckpoint distinguishes standalone durable-tail
+// recovery from distributed commit authority and keeps open transactions hidden.
 func TestPartitionRecoveryStaleHWMCheckpoint(t *testing.T) {
 	for _, distributed := range []bool{false, true} {
 		mode := "standalone"
