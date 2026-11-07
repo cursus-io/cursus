@@ -101,6 +101,17 @@ Waiting, sleep and earlier attempts do not count toward that campaign. Its
 completed duration and final history verification must be recorded separately
 before claiming a 24-hour pass.
 
+The later full validation run exposed two failures outside the compound scenario.
+Consumer-history replay failed before broker startup because host port 40002 was
+already in use. The replay and cooperative jobs now reserve every shifted
+listener against Linux ephemeral client allocation, as the scaling and ACK jobs
+already do. Separately, cooperative rolling restart timed out with a consumer
+metadata replica at LEO/HWM 8,315 while the committed end had reached 8,322.
+The replica was advancing under continuing writes; no terminal heartbeat fence
+was reported. Port reservation alone is not proof of that failure's cause or
+correction. The unchanged cooperative recovery assertions now run three times
+per validation job to retain evidence of recurrence.
+
 ## Running
 
 Run only one ACK fixture at a time; all its tests own the same dedicated Compose
