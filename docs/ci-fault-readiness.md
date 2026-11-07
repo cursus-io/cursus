@@ -94,3 +94,21 @@ The boundary error is now registered as nonretryable internal failure, with an
 explicit classification regression. The complete protocol package passed Linux
 race tests both normally and with `e2e_faults`. Generated debug config files now
 use mode 0644; only the nonsecret temporary fixture copy changes permissions.
+
+## Delayed follower terminal state
+
+The delayed follower test assumed it must observe another `consumer cleanup`
+read after releasing the handler-open fault. Raft startup instead opens final
+authoritative definitions (`FinalizeRecoveredPartitions`), and a restored
+generation with no pending truncate can reach ready without another cleanup
+scan. CI observed exactly that ready terminal state. Preserve the initial
+injected-read observation, the post-restart handler barrier, and all final
+registration/offset/full-ISR checks. The test accepts either the pending
+cleanup phase or this ready terminal state, and explicitly check topic revision 2,
+lifecycle epoch 2, and replica offset 1 after convergence. Both Raft replay and
+snapshot restore must pass. A transient readiness string is not additional
+recovery work, and this test makes no Kafka-equivalence or I/O-efficiency claim.
+
+The updated Raft-replay path passed locally, including the explicit revision,
+epoch, replica offset, membership, and full-ISR assertions. Snapshot restore and
+the complete hosted cleanup job remain required validation.
