@@ -55,10 +55,12 @@ func TestPartition_RestoresPersistedHWMCheckpoint(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	cfg.DiskFlushIntervalMS = 1
+	cfg.EnabledDistribution = true
 
 	dh, err := disk.NewDiskHandler(cfg, "orders", 0)
 	require.NoError(t, err)
 	p := NewPartition(0, "orders", dh, nil, cfg)
+	require.NoError(t, p.ReconcileCommittedHWM(0))
 
 	require.NoError(t, p.EnqueueSync(types.Message{Payload: "committed"}))
 	require.Equal(t, uint64(1), p.GetHWM())

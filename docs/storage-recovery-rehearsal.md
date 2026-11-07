@@ -50,6 +50,39 @@ Standalone validation does not validate a distributed Raft/PVC backup.
 
 ## Execution evidence
 
+### Stale standalone visibility checkpoint
+
+The first hosted guest run retained all 32 acknowledged records but restarted
+with HWM 26 and LEO 32. The asynchronous HWM checkpoint had lagged the durable
+log; a duplicate retry did not advance that stale visibility boundary.
+
+Kafka 4.1 [ReplicaManager](https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/server/ReplicaManager.scala)
+checkpoints HW periodically, while [Partition](https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/cluster/Partition.scala)
+recomputes it from leader/ISR state on leadership changes, including an ISR of
+one. Cursus should likewise distinguish a checkpoint from the authority that
+determines current visibility. Its standalone log has no replication commit
+decision: every recovered complete append can advance HWM. Distributed mode
+must retain its separate committed-watermark authority and never promote an
+uncommitted local tail merely because it survived.
+
+The correction restores standalone HWM from the recovered durable end,
+after the existing pending-bootstrap guard. Transaction visibility still requires
+its recovered markers and coordinator decision. This avoids an additional
+checkpoint fsync per ACK or a second log scan: recovery adds only a scalar
+boundary assignment, with zero additional log bytes read. A complete append
+whose response was lost may also survive, as already allowed by retry semantics.
+Before implementation, regression checks require stale versioned and legacy
+checkpoints to recover standalone visibility, the same distributed checkpoints
+to preserve their boundary/fencing, open transactions to remain invisible, and
+the unchanged guest power-loss oracle to read all acknowledged records.
+
+The deterministic stale-checkpoint test failed before the correction for both
+versioned and legacy standalone checkpoints. After the correction, the focused
+checkpoint/bootstrap/committed-read suite passed in 103.405 seconds and the
+native process-crash/backup suite passed in 37.385 seconds. The checkpoint crash
+test still checks the exact old-or-new file image separately from reconstructed
+standalone visibility. The hosted guest power-loss rerun remains required.
+
 On 2026-11-07 UTC, the native standalone process-crash and backup suite passed
 in 10.144 seconds. It preserved all 32 acknowledged records (8,768 payload bytes),
 the committed offset 13 and the empty group's offset 0. Retrying producer sequence
