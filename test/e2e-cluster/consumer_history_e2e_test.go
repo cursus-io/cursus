@@ -166,11 +166,11 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 	live, liveGeneration, liveMember := joinRecoveryGroup(t, ctx.GetBrokerAddrs(), "history-unrelated", "history-live")
 	defer live.Close()
 	consumerHistoryCommand(t, live, fmt.Sprintf("COMMIT_OFFSET topic=history-unrelated partition=0 group=history-live offset=17 generation=%d member=%s", liveGeneration, liveMember))
-	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "TRUNCATE topic=history-orders expected_revision=1")
+	consumerHistoryLifecycleCommand(t, ctx.GetBrokerAddrs(), "TRUNCATE topic=history-orders expected_revision=1")
 	requireClusterStatusMaterialized(t, ctx.GetBrokerAddrs())
 	for _, operation := range []string{"truncate", "delete"} {
 		if operation == "delete" {
-			sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic=history-orders")
+			consumerHistoryLifecycleCommand(t, ctx.GetBrokerAddrs(), "DELETE topic=history-orders")
 			requireClusterStatusMaterialized(t, ctx.GetBrokerAddrs())
 			sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "CREATE topic=history-orders partitions=1 replication_factor=3")
 		}
@@ -184,7 +184,21 @@ func TestConsumerHistoryCompactionRecovery(t *testing.T) {
 		client.Close()
 	}
 	consumerHistoryCommand(t, live, fmt.Sprintf("LEAVE_GROUP topic=history-unrelated group=history-live member=%s generation=%d", liveMember, liveGeneration))
-	sendClusterTopicCommand(t, ctx.GetBrokerAddrs(), "DELETE topic=history-unrelated")
+	consumerHistoryLifecycleCommand(t, ctx.GetBrokerAddrs(), "DELETE topic=history-unrelated")
+}
+
+func consumerHistoryLifecycleCommand(t *testing.T, addrs []string, command string) {
+	t.Helper()
+	client := e2e.NewBrokerClient(addrs)
+	defer client.Close()
+	retries := retryHistoryAdmission(t, func() error {
+		response, err := client.SendCommand("admin", command, 10*time.Second)
+		if err == nil {
+			require.True(t, strings.HasPrefix(response, "OK"), response)
+		}
+		return err
+	})
+	t.Logf("lifecycle command=%q admission retries=%d", command, retries)
 }
 
 // Publication briefly closes admission. Count those responses and include their

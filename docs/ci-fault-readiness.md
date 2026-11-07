@@ -41,12 +41,31 @@ excludes automatic assignments while retaining explicit listener binds. The
 scaling test must still complete every restart and retain all recovery byte/work
 measurements; neither its workload nor its deadlines change.
 
+A subsequent boundary run verified the committed transaction and both output
+partitions, then failed to restart its coordinator because port 42002 had been
+claimed. The ACK fixture's three internal-wire host ports also overlap the
+ephemeral range. Reserve 42001-42003 in both jobs that use that fixture. Keep the
+transaction decision, visibility, offset, and full-ISR assertions unchanged.
+
 The fault-enabled ACK fixture also needs its generated, nonsecret debug config
 to be readable by container UID 1000 when the Linux runner uses a different UID.
 Give that temporary file read permission for the broker while retaining the
 unprivileged broker user; do not relax permissions on production configurations.
 The full boundary suite must start all brokers and pass every required scenario
 and subtest without skips on Linux.
+
+## Lifecycle admission follow-up
+
+The same Kafka loading-versus-fatal distinction applies to history lifecycle
+commands and subscription-guard setup. Cursus currently wraps preflight loading
+inside `topic_delete_blocked` or `topic_truncate_blocked`; preserve that public
+protocol and recognize only the two exact wrapped loading reasons in the test
+driver. Do not retry actual active-member, shared-subscription, transaction,
+revision, or transport failures. The proposed bounded five-second retry retains
+the original command, member, and generation. Add classifier regression cases
+for those exclusions, then rerun history compaction/restart/cleanup and all three
+subscription modes. Their offset, data, membership, and recovery-work assertions
+remain unchanged; waiting for admission does not establish reduced recovery I/O.
 
 ## Initial validation
 
@@ -57,6 +76,14 @@ acknowledgements, read faults, retained unrelated data, and byte/work checks.
 The coordinator failover test passed twice (126.58 and 35.70 seconds), preserving
 its strict post-fault offset and generation assertions. The fixture binary was
 built on Windows; Linux CI remains the final integration check.
+
+The lifecycle follow-up passed the classifier regression and static analysis.
+Both isolated E2Es passed twice: subscription guards in 122.79 and 112.10 seconds,
+and history recovery in 233.29 and 226.59 seconds. The first history DELETE
+actually encountered the wrapped loading response and completed after eight
+admission retries. All restart, offset, unrelated-member, and cleanup assertions
+passed. Retained bootstrap with a process crash and missing/damaged lineage
+rebuild also passed locally (144.39 seconds).
 
 A disposable Linux container confirmed that a different UID cannot read the
 original mode-0600 config but can read mode 0644, and that the proposed reserved
