@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,9 +24,13 @@ const ackFaultProject = "cursus-ack-faults"
 const ackFaultPortShift = 23000
 
 type ackFaultJournal struct {
-	t        *testing.T
-	file     *os.File
-	attempts []writeAttempt
+	mu              sync.Mutex
+	t               *testing.T
+	file            *os.File
+	attempts        []writeAttempt
+	compact         bool
+	maxAttempts     int
+	startedAttempts int
 }
 
 // newAckFaultJournal opens a broker-independent history file that survives the fault.
@@ -45,26 +50,59 @@ func newAckFaultJournal(t *testing.T) *ackFaultJournal {
 // record syncs each event before the test proceeds to its next fault or request.
 func (j *ackFaultJournal) record(kind string, value any) {
 	j.t.Helper()
+	require.NoError(j.t, j.recordEvent(kind, value))
+}
+
+// recordEvent is safe for concurrent producers and reports evidence I/O errors
+// to their owner; it never calls FailNow from a background goroutine.
+func (j *ackFaultJournal) recordEvent(kind string, value any) error {
 	event := struct {
 		At    time.Time `json:"at"`
 		Kind  string    `json:"kind"`
 		Value any       `json:"value"`
 	}{time.Now().UTC(), kind, value}
 	data, err := json.Marshal(event)
-	require.NoError(j.t, err)
-	_, err = j.file.Write(append(data, '\n'))
-	require.NoError(j.t, err)
-	require.NoError(j.t, j.file.Sync())
-	j.t.Log(string(data))
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if _, err := j.file.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	if err := j.file.Sync(); err != nil {
+		return err
+	}
+	if !j.compact || (kind != "invoke" && kind != "complete") {
+		j.t.Log(string(data))
+	}
+	return nil
 }
 
 // Exactly one attempt. In particular, no BrokerClient retries can conceal the
 // lost-response window or route a direct stale-leader probe to another broker.
 func (j *ackFaultJournal) publish(addr, topic string, message types.Message) (writeAttempt, bool) {
 	j.t.Helper()
+	attempt, sent, err := j.publishAttempt(addr, topic, message)
+	require.NoError(j.t, err)
+	return attempt, sent
+}
+
+// publishAttempt records exactly one request; broker/transport errors are
+// outcomes, whereas malformed ACKs and journal failures fail the campaign.
+func (j *ackFaultJournal) publishAttempt(addr, topic string, message types.Message) (writeAttempt, bool, error) {
 	attempt := writeAttempt{ID: writeIdentity(message), Target: addr, Message: message,
 		PayloadHash: writePayloadHash(message.Payload), Outcome: "unknown"}
-	j.record("invoke", attempt)
+	j.mu.Lock()
+	if j.maxAttempts > 0 && j.startedAttempts >= j.maxAttempts {
+		j.mu.Unlock()
+		return attempt, false, fmt.Errorf("journal attempt limit %d reached", j.maxAttempts)
+	}
+	j.startedAttempts++
+	j.mu.Unlock()
+	if err := j.recordEvent("invoke", attempt); err != nil {
+		return attempt, false, err
+	}
 	command := fmt.Sprintf("PUBLISH topic=%s partition=0 acks=all producerId=%s epoch=%d seqNum=%d isIdempotent=true message=%s",
 		topic, message.ProducerID, message.Epoch, message.SeqNum, message.Payload)
 	response, sent, err := ackFaultRoundTrip(addr, command)
@@ -76,14 +114,30 @@ func (j *ackFaultJournal) publish(addr, topic string, message types.Message) (wr
 		}
 	} else {
 		var ack types.AckResponse
-		require.NoError(j.t, json.Unmarshal(response, &ack), "%s", response)
-		require.Equal(j.t, "OK", ack.Status, "%s", response)
+		if err := json.Unmarshal(response, &ack); err != nil {
+			return attempt, sent, fmt.Errorf("invalid publish ACK: %w", err)
+		}
+		if ack.Status != "OK" {
+			return attempt, sent, fmt.Errorf("invalid publish ACK status %q", ack.Status)
+		}
 		attempt.Outcome = "acknowledged"
 		attempt.AckOffset = ack.LastOffset
 	}
+	if err := j.recordEvent("complete", attempt); err != nil {
+		return attempt, sent, err
+	}
+	j.mu.Lock()
 	j.attempts = append(j.attempts, attempt)
-	j.record("complete", attempt)
-	return attempt, sent
+	j.mu.Unlock()
+	return attempt, sent, nil
+}
+
+// snapshotAttempts takes a consistent copy; producers must still be drained
+// before comparing a fixed committed end to the complete campaign history.
+func (j *ackFaultJournal) snapshotAttempts() []writeAttempt {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]writeAttempt(nil), j.attempts...)
 }
 
 // ackFaultRoundTrip makes one direct request and reports whether Send completed.
@@ -129,9 +183,14 @@ func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTest
 		data, err := os.ReadFile(config)
 		require.NoError(t, err)
 		config = filepath.Join(t.TempDir(), "config.yaml")
+		level := os.Getenv("CURSUS_ACK_FAULT_LOG_LEVEL")
+		if level == "" {
+			level = "debug"
+		}
+		require.Contains(t, []string{"info", "debug"}, level)
 		// This nonsecret fixture config is bind-mounted into a UID-1000 broker.
 		// Linux CI may create it with a different owner; keep the broker unprivileged.
-		require.NoError(t, os.WriteFile(config, []byte(strings.ReplaceAll(string(data), `log_level: "info"`, `log_level: "debug"`)), 0o644))
+		require.NoError(t, os.WriteFile(config, []byte(strings.ReplaceAll(string(data), `log_level: "info"`, `log_level: "`+level+`"`)), 0o644))
 	}
 	data, err := os.ReadFile(composeFile)
 	require.NoError(t, err)
