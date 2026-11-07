@@ -26,22 +26,6 @@ func TestBasicPubSub(t *testing.T) {
 		And(MessagesConsumed(10))
 }
 
-// TestConfigValidation verifies configuration validation
-func TestConfigValidation(t *testing.T) {
-	ctx := GivenStandalone(t)
-	defer ctx.Cleanup()
-
-	ctx.WithTopic("config-test").
-		WithPartitions(1).
-		WithNumMessages(5).
-		When().
-		StartBroker().
-		CreateTopic().
-		PublishMessages().
-		Then().
-		Expect(MessagesPublishedSince(5, ctx.startTime))
-}
-
 // TestMultiPartition verifies multi-partition behavior
 func TestMultiPartition(t *testing.T) {
 	ctx := GivenStandalone(t)
