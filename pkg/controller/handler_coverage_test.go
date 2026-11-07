@@ -1279,16 +1279,10 @@ func TestHandleBatchMessage_InvalidData(t *testing.T) {
 	assert.Contains(t, resp, "ERROR")
 }
 
-func TestHandleBatchMessage_InvalidAcks(t *testing.T) {
-	ch, tm := newTestHandler(t)
-	require.NoError(t, tm.CreateTopic("batch-acks-topic", 1, false, false))
-
+func TestBatchEncodingRejectsInvalidAcks(t *testing.T) {
 	msgs := []types.Message{{Payload: "m1", ProducerID: "p1", SeqNum: 1}}
-	data, err := util.EncodeBatchMessages("batch-acks-topic", 0, "5", false, msgs)
-	require.NoError(t, err)
-	resp, err := ch.HandleBatchMessage(data, nil)
-	require.NoError(t, err)
-	assert.Equal(t, "ERROR: invalid_acks value=5", resp)
+	_, err := util.EncodeBatchMessages("batch-acks-topic", 0, "5", false, msgs)
+	require.ErrorContains(t, err, `invalid acknowledgements "5"`)
 }
 
 func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {
