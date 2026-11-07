@@ -3,6 +3,7 @@ package e2e_cluster
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/cursus-io/cursus/test/e2e"
@@ -22,11 +23,17 @@ type topicMetadata struct {
 	Partitions []partitionMetadata `json:"partitions"`
 }
 
-func ExpectDataConsistent() e2e.Expectation {
+func ExpectReplicatedMessages(expectedPartitions, expectedReplicas, minISR int, expectedRecords uint64) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
+		if ctx.GetAcks() != "all" {
+			return fmt.Errorf("replication contract requires acks=all, got %q", ctx.GetAcks())
+		}
+		if ctx.GetPublishedCount() != ctx.GetNumMessages() {
+			return fmt.Errorf("published %d messages, want %d", ctx.GetPublishedCount(), ctx.GetNumMessages())
+		}
 		topic := ctx.GetTopic()
 		client := ctx.GetClient()
-		return eventually(ctx.GetT(), fmt.Sprintf("consistent metadata for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
+		return eventually(ctx.GetT(), fmt.Sprintf("replicated committed state for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
 			resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
 			if err != nil {
 				return false, "DESCRIBE failed", err
@@ -35,14 +42,88 @@ func ExpectDataConsistent() e2e.Expectation {
 			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
 				return false, resp, err
 			}
-			for _, partition := range meta.Partitions {
-				if partition.Leader == "" || len(partition.ISR) < 1 {
-					return false, fmt.Sprintf("partition %d leader=%q isr=%v", partition.ID, partition.Leader, partition.ISR), nil
-				}
+			if err := validateTopicMetadata(meta, topic, expectedPartitions, expectedReplicas, minISR, expectedRecords); err != nil {
+				return false, err.Error(), nil
 			}
-			return len(meta.Partitions) > 0, "no partitions", nil
+			return true, fmt.Sprintf("partitions=%d replicas=%d min_isr=%d leo=hwm=%d", expectedPartitions, expectedReplicas, minISR, expectedRecords), nil
 		})
 	}
+}
+
+func validateTopicMetadata(meta topicMetadata, expectedTopic string, expectedPartitions, expectedReplicas, minISR int, expectedRecords uint64) error {
+	if meta.Topic != expectedTopic {
+		return fmt.Errorf("topic=%q, want %q", meta.Topic, expectedTopic)
+	}
+	if len(meta.Partitions) != expectedPartitions {
+		return fmt.Errorf("partitions=%d, want %d", len(meta.Partitions), expectedPartitions)
+	}
+	if expectedReplicas < minISR {
+		return fmt.Errorf("invalid expectation: replicas=%d min_isr=%d", expectedReplicas, minISR)
+	}
+
+	seenPartitions := make(map[int]struct{}, expectedPartitions)
+	for _, partition := range meta.Partitions {
+		if _, exists := seenPartitions[partition.ID]; exists {
+			return fmt.Errorf("partition %d appears more than once", partition.ID)
+		}
+		seenPartitions[partition.ID] = struct{}{}
+		if partition.Leader == "" {
+			return fmt.Errorf("partition %d has no leader", partition.ID)
+		}
+		if err := validateReplicaMembership(partition, expectedReplicas, minISR); err != nil {
+			return err
+		}
+		if partition.LEO != expectedRecords || partition.HWM != expectedRecords {
+			return fmt.Errorf("partition %d leo=%d hwm=%d, want both %d", partition.ID, partition.LEO, partition.HWM, expectedRecords)
+		}
+	}
+	partitionIDs := sortedPartitionIDs(meta)
+	for expectedID, actualID := range partitionIDs {
+		if actualID != expectedID {
+			return fmt.Errorf("partition ids=%v, want contiguous ids starting at zero", partitionIDs)
+		}
+	}
+	return nil
+}
+
+func validateReplicaMembership(partition partitionMetadata, expectedReplicas, minISR int) error {
+	if len(partition.Replicas) != expectedReplicas {
+		return fmt.Errorf("partition %d replicas=%v, want %d replicas", partition.ID, partition.Replicas, expectedReplicas)
+	}
+	if len(partition.ISR) < minISR {
+		return fmt.Errorf("partition %d isr=%v, want at least %d in-sync replicas", partition.ID, partition.ISR, minISR)
+	}
+
+	replicas := make(map[string]struct{}, len(partition.Replicas))
+	for _, replica := range partition.Replicas {
+		if replica == "" {
+			return fmt.Errorf("partition %d contains an empty replica id", partition.ID)
+		}
+		if _, exists := replicas[replica]; exists {
+			return fmt.Errorf("partition %d contains duplicate replica %q", partition.ID, replica)
+		}
+		replicas[replica] = struct{}{}
+	}
+	seenISR := make(map[string]struct{}, len(partition.ISR))
+	for _, replica := range partition.ISR {
+		if _, exists := replicas[replica]; !exists {
+			return fmt.Errorf("partition %d ISR member %q is not assigned", partition.ID, replica)
+		}
+		if _, exists := seenISR[replica]; exists {
+			return fmt.Errorf("partition %d contains duplicate ISR member %q", partition.ID, replica)
+		}
+		seenISR[replica] = struct{}{}
+	}
+	return nil
+}
+
+func sortedPartitionIDs(meta topicMetadata) []int {
+	ids := make([]int, 0, len(meta.Partitions))
+	for _, partition := range meta.Partitions {
+		ids = append(ids, partition.ID)
+	}
+	sort.Ints(ids)
+	return ids
 }
 func ExpectPartitionWatermarks(partitionID int, expectedLEO, expectedHWM uint64) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
@@ -98,42 +179,5 @@ func LeaderChanged(partitionID int, oldLeader string) e2e.Expectation {
 			}
 			return false, "partition not found", nil
 		})
-	}
-}
-func ISRMaintained() e2e.Expectation {
-	return func(ctx *e2e.TestContext) error {
-		return eventually(ctx.GetT(), fmt.Sprintf("non-empty ISR for %s", ctx.GetTopic()), clusterReadyTimeout, func() (bool, string, error) {
-			resp, err := ctx.GetClient().SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", ctx.GetTopic()), 5*time.Second)
-			if err != nil {
-				return false, "DESCRIBE failed", err
-			}
-			var meta topicMetadata
-			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
-				return false, resp, err
-			}
-			for _, partition := range meta.Partitions {
-				if len(partition.ISR) == 0 {
-					return false, fmt.Sprintf("partition %d ISR empty", partition.ID), nil
-				}
-			}
-			return len(meta.Partitions) > 0, "no partitions", nil
-		})
-	}
-}
-
-func MessagesPublishedWithQuorum() e2e.Expectation {
-	return func(ctx *e2e.TestContext) error {
-		if ctx.GetAcks() != "all" {
-			return fmt.Errorf("acks not set to 'all': got %s", ctx.GetAcks())
-		}
-
-		if ctx.GetPublishedCount() != ctx.GetNumMessages() {
-			return fmt.Errorf("expected %d messages to be published with quorum, but got %d",
-				ctx.GetNumMessages(), ctx.GetPublishedCount())
-		}
-
-		ctx.GetT().Logf("Quorum achieved: %d messages published with acks=%s",
-			ctx.GetPublishedCount(), ctx.GetAcks())
-		return nil
 	}
 }

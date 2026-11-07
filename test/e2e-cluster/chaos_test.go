@@ -34,6 +34,7 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 	leaderNode, actions := ctx.WhenCluster().
 		StartCluster().
 		CreateTopic().
+		WaitForTopicReplication(3, 3).
 		PublishMessages().
 		JoinGroup().
 		CommitOffset(0, 50).
@@ -42,8 +43,7 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 	actions.RetryPublishMessages().
 		RecoverFollower(leaderNode)
 	actions.Then().
-		Expect(MessagesPublishedWithQuorum()).
-		And(ExpectDataConsistent()).
+		Expect(ExpectReplicatedMessages(1, 3, 1, 100)).
 		And(ExpectOffsetMatched(0, 50)).
 		And(ExpectPartitionWatermarks(0, 100, 100)).
 		And(e2e.PublisherRetriedSuccessfully())
@@ -71,7 +71,7 @@ func TestChaosTransactionCoordinatorFailoverAbortsTimedOutTransaction(t *testing
 		WithMinInSyncReplicas(2)
 	defer ctx.Cleanup()
 
-	actions := ctx.WhenCluster().StartCluster().CreateTopic().WaitForTopicMetadata()
+	actions := ctx.WhenCluster().StartCluster().CreateTopic().WaitForTopicReplication(3, 3)
 	topic := ctx.GetTopic()
 	txnID := "coordinator-restart-transaction"
 	offsetGroup := "transaction-offset-group"

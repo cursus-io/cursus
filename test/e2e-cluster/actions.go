@@ -354,6 +354,46 @@ func metadataResponseMatchesTopic(response, topic string) bool {
 	}
 	return false
 }
+
+func (a *ClusterActions) WaitForTopicReplication(expectedReplicas, minISR int) *ClusterActions {
+	topic := a.ctx.GetTopic()
+	addrs := a.ctx.GetBrokerAddrs()
+	if err := eventually(a.ctx.GetT(), fmt.Sprintf("replication metadata consensus for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
+		var expectedLeaders string
+		for _, addr := range addrs {
+			tempClient := e2e.NewBrokerClient([]string{addr})
+			resp, err := tempClient.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 2*time.Second)
+			tempClient.Close()
+			if err != nil {
+				return false, fmt.Sprintf("%s: DESCRIBE failed", addr), err
+			}
+
+			var meta topicMetadata
+			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+				return false, fmt.Sprintf("%s: %s", addr, resp), err
+			}
+			if err := validateTopicMetadata(meta, topic, a.ctx.GetPartitions(), expectedReplicas, minISR, 0); err != nil {
+				return false, fmt.Sprintf("%s: %v", addr, err), nil
+			}
+
+			leaders := make([]string, len(meta.Partitions))
+			for _, partition := range meta.Partitions {
+				leaders[partition.ID] = partition.Leader
+			}
+			leaderSet := strings.Join(leaders, ",")
+			if expectedLeaders == "" {
+				expectedLeaders = leaderSet
+			} else if leaderSet != expectedLeaders {
+				return false, fmt.Sprintf("%s: leaders=%s, want %s", addr, leaderSet, expectedLeaders), nil
+			}
+		}
+		return true, fmt.Sprintf("%d brokers agree on leaders=%s", len(addrs), expectedLeaders), nil
+	}); err != nil {
+		a.ctx.GetT().Fatal(err)
+	}
+	return a
+}
+
 func (a *ClusterActions) SimulateLeaderFailure() (int, *ClusterActions) {
 	topic := a.ctx.GetTopic()
 	a.ctx.GetT().Logf("Simulating leader failure for topic: %s", topic)

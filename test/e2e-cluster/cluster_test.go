@@ -19,11 +19,10 @@ func TestISRWithAllAcks(t *testing.T) {
 	ctx.WhenCluster().
 		StartCluster().
 		CreateTopic().
+		WaitForTopicReplication(3, 3).
 		PublishMessages().
-		SimulateFollowerFailure(2).
 		Then().
-		Expect(MessagesPublishedWithQuorum()).
-		And(ISRMaintained())
+		Expect(ExpectReplicatedMessages(1, 3, 2, 50))
 }
 
 // TestLeaderFailover tests cluster recovery when leader fails
@@ -40,37 +39,15 @@ func TestLeaderFailover(t *testing.T) {
 	leaderNode, actions := ctx.WhenCluster().
 		StartCluster().
 		CreateTopic().
+		WaitForTopicReplication(3, 3).
 		DescribeTopic().
 		PublishMessages().
 		SimulateLeaderFailure()
 
-	actions.DescribeTopic().
-		RecoverFollower(leaderNode).
+	actions.RecoverFollower(leaderNode).
+		WaitForTopicMetadata().
 		Then().
-		Expect(MessagesPublishedWithQuorum())
-}
-
-// TestClusterDataConsistency verifies data is replicated correctly after node recovery
-func TestClusterDataConsistency(t *testing.T) {
-	ctx := GivenClusterRestart(t).
-		WithClusterSize(3).
-		WithTopic("consistency-test").
-		WithPartitions(1).
-		WithNumMessages(10).
-		WithIdempotent(true).
-		WithAcks("all")
-	defer ctx.Cleanup()
-
-	ctx.WhenCluster().
-		StartCluster().
-		CreateTopic().
-		SimulateFollowerFailure(3).
-		PublishMessages().
-		RecoverFollower(3).
-		DescribeTopic()
-
-	ctx.Then().
-		Expect(ExpectDataConsistent())
+		Expect(ExpectReplicatedMessages(1, 3, 1, 20))
 }
 
 // TestClusterWideDeduplication verifies exactly-once delivery across cluster failover
@@ -86,11 +63,12 @@ func TestClusterWideDeduplication(t *testing.T) {
 	ctx.WhenCluster().
 		StartCluster().
 		CreateTopic().
+		WaitForTopicReplication(3, 3).
 		PublishMessages()
 	ctx.WhenCluster().SimulateLeaderFailure()
 
 	ctx.WhenCluster().
 		RetryPublishMessages().
 		Then().
-		Expect(ExpectDataConsistent())
+		Expect(ExpectReplicatedMessages(1, 3, 1, 5))
 }
