@@ -293,6 +293,33 @@ func TestAdminClientObservationCoversFeatureAndGroupOffsetEdges(t *testing.T) {
 	})
 }
 
+func TestGroupOffsetsRetriesNonCoordinatorBootstrap(t *testing.T) {
+	const ranges = "OK topic=orders partitions=1 offsets=P0:earliest=0:latest=8:leo=8:hwm=8"
+	first, firstCommands := observationAdminClient(t, []string{
+		ranges, "ERROR: NOT_COORDINATOR host=127.0.0.1 port=9001",
+		ranges, "ERROR: NOT_COORDINATOR host=127.0.0.1 port=9001",
+	})
+	second, secondCommands := observationAdminClient(t, []string{"OK offset=8"})
+	first.config.BrokerAddrs = append(first.config.BrokerAddrs, second.config.BrokerAddrs...)
+	_, err := first.GroupOffsets(context.Background(), "workers", "orders")
+	var brokerErr *BrokerError
+	require.ErrorAs(t, err, &brokerErr)
+	require.Equal(t, "NOT_COORDINATOR", brokerErr.Code)
+
+	config := NewDefaultAdminConfig()
+	config.BrokerAddrs = first.config.BrokerAddrs
+	client, err := NewAdminClient(config)
+	require.NoError(t, err)
+	offsets, err := client.GroupOffsets(context.Background(), "workers", "orders")
+	require.NoError(t, err)
+	require.Equal(t, []GroupOffset{{Partition: 0, Offset: 8, Latest: 8}}, offsets)
+	require.Equal(t, []string{
+		"LIST_OFFSETS topic=orders", "FETCH_OFFSET topic=orders partition=0 group=workers",
+		"LIST_OFFSETS topic=orders", "FETCH_OFFSET topic=orders partition=0 group=workers",
+	}, receiveObservationCommands(t, firstCommands))
+	require.Equal(t, []string{"FETCH_OFFSET topic=orders partition=0 group=workers"}, receiveObservationCommands(t, secondCommands))
+}
+
 func observationAdminClient(t *testing.T, responses []string) (*AdminClient, <-chan []string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

@@ -1,6 +1,7 @@
 package e2e_cluster
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -183,16 +184,25 @@ func waitAckFaultStateWithin(t *testing.T, topic string, nodes []int, excluded s
 // the write journal, and independently compares the public consumer's offsets and payloads.
 func verifyAckFaultRecovery(t *testing.T, ctx *ClusterTestContext, journal *ackFaultJournal) {
 	t.Helper()
-	waitAckFaultState(t, ctx.GetTopic(), []int{1, 2, 3}, "", 3)
+	converged := waitAckFaultState(t, ctx.GetTopic(), []int{1, 2, 3}, "", 3)
+	journal.record("isr_converged", converged)
 	require.NoError(t, eventuallyStable(t, "stable ISR after acknowledged-write recovery", 3*time.Minute, 65*time.Second,
 		func() (bool, string, error) { return fullISRAndZeroUnderReplicated(ctx) }))
 	state := waitAckFaultState(t, ctx.GetTopic(), []int{1, 2, 3}, "", 3)
 	journal.record("full_isr", state)
 	captureAckFaultMetrics(t, journal, "recovered-before-readback")
 	var canonical []types.Message
+	attempts := journal.snapshotAttempts()
+	var payloadBytes int64
+	for _, attempt := range attempts {
+		payloadBytes += 2 * int64(len(attempt.Message.Payload)+256)
+	}
+	// Bound long-campaign inspection by recorded payload work, including
+	// framing allowance, rather than applying the tiny fixture's fixed 30s.
+	readbackTimeout := 30*time.Second + time.Duration(payloadBytes/(512<<10))*time.Second
 	for node := 1; node <= 3; node++ {
-		records := readRecoveryHistory(t, ctx.GetTopic(), node, coordinatorNode(t, state.Leader), state.LeaderEpoch, state.CommittedHWM)
-		require.NoError(t, checkWriteHistory(journal.attempts, records), "replica %d", node)
+		records := readRecoveryHistoryFrom(t, ctx.GetTopic(), node, node%3+1, coordinatorNode(t, state.Leader), state.LeaderEpoch, state.CommittedHWM, readbackTimeout)
+		require.NoError(t, checkWriteHistory(attempts, records), "replica %d", node)
 		if node == 1 {
 			canonical = records
 		} else {
@@ -206,7 +216,12 @@ func verifyAckFaultRecovery(t *testing.T, ctx *ClusterTestContext, journal *ackF
 	consumer := e2e.NewBrokerClient([]string{ctx.GetBrokerAddrs()[coordinatorNode(t, state.Leader)-1]})
 	defer consumer.Close()
 	var consumed uint64
+	lastHeartbeat := time.Now()
 	for consumed < state.CommittedHWM {
+		if time.Since(lastHeartbeat) >= 2*time.Second {
+			heartbeatGroup(t, reader, ctx.GetTopic(), group, generation, member)
+			lastHeartbeat = time.Now()
+		}
 		payloads, offsets, err := consumer.ConsumeMessagesAtOffsetWithOffsets(ctx.GetTopic(), 0, consumed, group, member, generation, 5*time.Second)
 		require.NoError(t, err)
 		require.NotEmpty(t, payloads, "consumer stopped before the captured committed end")
@@ -219,7 +234,19 @@ func verifyAckFaultRecovery(t *testing.T, ctx *ClusterTestContext, journal *ackF
 		}
 	}
 	require.Equal(t, state.CommittedHWM, consumed)
-	journal.record("verified_records", canonical)
+	if journal.compact {
+		digest := sha256.New()
+		encoder := json.NewEncoder(digest)
+		for _, record := range canonical {
+			require.NoError(t, encoder.Encode(record))
+		}
+		journal.record("verified_history", map[string]any{"records": len(canonical), "attempts": len(attempts), "sha256_json_lines": fmt.Sprintf("%x", digest.Sum(nil))})
+	} else {
+		journal.record("verified_records", canonical)
+	}
+	leave, err := reader.SendCommand("", fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d", ctx.GetTopic(), group, member, generation), 15*time.Second)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(leave, "OK"), leave)
 	captureAckFaultMetrics(t, journal, "after-readback")
 }
 
@@ -238,7 +265,9 @@ func captureAckFaultMetrics(t *testing.T, journal *ackFaultJournal, phase string
 		require.Equal(t, http.StatusOK, response.StatusCode)
 		var lines []string
 		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "cursus_recovery_work_total{") || strings.HasPrefix(line, "cursus_recovery_attempts_total{") || strings.HasPrefix(line, "process_start_time_seconds ") {
+			if strings.HasPrefix(line, "cursus_recovery_work_total{") || strings.HasPrefix(line, "cursus_recovery_attempts_total{") ||
+				strings.HasPrefix(line, "process_start_time_seconds ") || strings.HasPrefix(line, "process_resident_memory_bytes ") ||
+				strings.HasPrefix(line, "process_cpu_seconds_total ") || strings.HasPrefix(line, "go_memstats_heap_alloc_bytes ") {
 				lines = append(lines, line)
 			}
 		}

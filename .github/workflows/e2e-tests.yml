@@ -55,15 +55,18 @@ jobs:
           # The internal-wire host ports overlap Linux's ephemeral range.
           existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
           sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}42001-42003"
-      - name: Verify acknowledged writes across response loss and leader isolation
+      - name: Verify acknowledged writes across individual and compound faults
         env:
           RUN_E2E_ACK_FAULTS: "1"
+          RUN_E2E_COMPOUND_FAULTS: "1"
+          CURSUS_COMPOUND_SEED: "3271337"
+          CURSUS_COMPOUND_ROUNDS: "3"
           CURSUS_ACK_FAULT_RESULTS: ${{ github.workspace }}/ack-fault-results
         run: |
           set -o pipefail
           mkdir -p ack-fault-results
           go test -json -race -count=1 -timeout 25m ./test/e2e-cluster \
-            -run '^Test(WriteHistoryOracle|AckFaultReplyProxy|AcknowledgedWritesSurviveLostReplyAndLeaderKill|AcknowledgedWritesFenceIsolatedLeader)$' \
+            -run '^Test(WriteHistoryOracle|AckFaultReplyProxy|AckFaultConcurrentJournal|AckFaultJournalErrorsReturnToOwner|CompoundScheduleAndBounds|AcknowledgedWritesSurviveLostReplyAndLeaderKill|AcknowledgedWritesFenceIsolatedLeader|AcknowledgedWritesSurviveCompoundFaults)$' \
             | tee ack-fault-results/tests.jsonl
           python3 - <<'PY'
           import json
@@ -72,8 +75,12 @@ jobs:
           required = {
               "TestWriteHistoryOracle",
               "TestAckFaultReplyProxy",
+              "TestAckFaultConcurrentJournal",
+              "TestAckFaultJournalErrorsReturnToOwner",
+              "TestCompoundScheduleAndBounds",
               "TestAcknowledgedWritesSurviveLostReplyAndLeaderKill",
               "TestAcknowledgedWritesFenceIsolatedLeader",
+              "TestAcknowledgedWritesSurviveCompoundFaults",
           }
           passed = {e.get("Test") for e in events if e.get("Action") == "pass"}
           skipped = {e.get("Test") for e in events if e.get("Action") == "skip"}
@@ -553,6 +560,12 @@ jobs:
         with:
           go-version: '1.26.2'
           cache: false
+      - name: Reserve replay fixture ports across broker restarts
+        run: |
+          # Offset 32000 overlaps the outbound ephemeral allocation range.
+          ports=40000-40002,41001-41003,41081-41083,41101-41103,51001-51003
+          existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}$ports"
       - name: Verify fault accounting and repeated source reads
         run: |
           python3 -m py_compile test/e2e-cluster/history_measure.py test/e2e-cluster/summarize_history_measure.py
@@ -630,16 +643,24 @@ jobs:
         with:
           go-version: '1.26.2'
           cache: true
+      - name: Reserve cooperative fixture ports across broker restarts
+        run: |
+          ports=32000-32002,33001-33003,33081-33083,33101-33103,43001-43003
+          existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}$ports"
       - name: Verify cooperative broker and Go client fault recovery
         env:
           RUN_E2E_COOPERATIVE: "1"
+          CURSUS_COOPERATIVE_RESULTS: ${{ github.workspace }}/cooperative-results
         run: |
           set -o pipefail
-          go test -v -timeout 20m ./test/e2e-cluster -run '^TestCooperativeBrokerGoFaultRecovery$' -count=1 | tee cooperative-go.log
+          go test -v -timeout 20m ./test/e2e-cluster -run '^TestCooperativeBrokerGoFaultRecovery$' -count=3 | tee cooperative-go.log
       - name: Upload fault recovery measurements
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: cooperative-broker-go
-          path: cooperative-go.log
+          path: |
+            cooperative-go.log
+            cooperative-results
           if-no-files-found: ignore

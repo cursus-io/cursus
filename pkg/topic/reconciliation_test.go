@@ -12,7 +12,7 @@ import (
 // Clearing an outcome must not bypass unknown HWM, a storage fault, snapshot
 // recovery, a replaced marker, or a still-uncommitted retained record.
 func TestCompleteReconciliationRequiresExactCommittedState(t *testing.T) {
-	for _, kind := range []string{"success", "nil_marker", "replacement", "storage", "snapshot", "hwm", "leo", "unknown_hwm"} {
+	for _, kind := range []string{"success", "nil_marker", "replacement", "storage", "transaction", "producer", "snapshot", "hwm", "leo", "unknown_hwm"} {
 		t.Run(kind, func(t *testing.T) {
 			storage := new(MockStorageHandler)
 			storage.On("GetLatestOffset").Return(uint64(1)).Once()
@@ -26,6 +26,10 @@ func TestCompleteReconciliationRequiresExactCommittedState(t *testing.T) {
 				p.MarkReconciliationPending(errors.New("new failure"))
 			case "storage":
 				p.setRecoveryError(errors.New("corrupt storage"))
+			case "transaction":
+				p.txnRecoveryErr = errors.New("corrupt transaction index")
+			case "producer":
+				p.producerRecoveryErr = errors.New("corrupt producer index")
 			case "snapshot":
 				p.snapshotRecovery = true
 			case "hwm":
@@ -36,6 +40,10 @@ func TestCompleteReconciliationRequiresExactCommittedState(t *testing.T) {
 				p.hwmAuthoritative = false
 			}
 			err := p.CompleteReconciliation(marker, 1)
+			if kind == "storage" || kind == "transaction" || kind == "producer" || kind == "snapshot" {
+				require.Nil(t, p.ReconciliationOnlyError(), "independent failure must not become retryable")
+				require.Error(t, p.ValidateReconciliationRecord(marker, types.Message{Offset: 0}))
+			}
 			if kind == "success" {
 				require.NoError(t, err)
 				require.NoError(t, p.RecoveryError())

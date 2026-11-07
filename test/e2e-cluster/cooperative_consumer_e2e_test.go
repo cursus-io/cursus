@@ -64,6 +64,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	t.Setenv("CURSUS_CLEANUP_PORT_OFFSET", "24000")
 	fixture := givenCleanupCluster(t, composeFile, "docker-compose.consumer-cleanup.yml", "docker-compose.cooperative.yml")
 	defer fixture.Cleanup()
+	defer captureCooperativeRecoveryFailure(t)
 	addrs := fixture.GetBrokerAddrs()
 	// Docker Desktop's IPv6 loopback proxy can stall parallel Wire clients.
 	// Pin this isolated host-published fixture to the advertised IPv4 addresses.
@@ -285,10 +286,28 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	require.Equal(t, uint64(12), a.Stats().WorkerStarts, "broker restarts should retain valid SDK workers")
 	stopPublishing()
 	<-publishDone
-	admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, RequestTimeoutMS: 2000})
+	adminCfg := sdk.NewDefaultAdminConfig()
+	adminCfg.BrokerAddrs = append([]string(nil), addrs...)
+	adminCfg.RequestTimeoutMS = 2000
+	// Start on a non-coordinator so the final oracle always exercises routing.
+	// A zero-value MaxRetries would repeatedly query only the first broker.
+	coordinator := coordinatorNode(t, findGroupCoordinator(t, 1, cfg.GroupID))
+	if coordinator == 1 {
+		adminCfg.BrokerAddrs[0], adminCfg.BrokerAddrs[1] = adminCfg.BrokerAddrs[1], adminCfg.BrokerAddrs[0]
+	}
+	admin, err := sdk.NewAdminClient(adminCfg)
 	require.NoError(t, err)
+	var lastObservation time.Time
 	require.Eventually(t, func() bool {
 		offsets, err := admin.GroupOffsets(ctx, cfg.GroupID, cfg.Topic)
+		if time.Since(lastObservation) >= 5*time.Second {
+			var acknowledged [6]uint64
+			for p := range acknowledged {
+				acknowledged[p] = published[p].Load()
+			}
+			t.Logf("drain_observation offsets=%+v acknowledged=%v error=%v", offsets, acknowledged, err)
+			lastObservation = time.Now()
+		}
 		if err != nil || len(offsets) != 6 {
 			return false
 		}

@@ -409,7 +409,16 @@ func readPartitionPage(p *topic.Partition, offset uint64, maxRecords, maxBytes i
 		}
 		return messages, bytes, next, err
 	}
-	return p.ReadCommittedPage(offset, maxRecords, maxBytes, allowOversizedFirst)
+	messages, bytes, next, err := p.ReadCommittedPage(offset, maxRecords, maxBytes, allowOversizedFirst)
+	if err != nil {
+		var pending *partitionCommitOutcome
+		if errors.As(p.ReconciliationOnlyError(), &pending) {
+			// Preserve read isolation while allowing consumers to survive the
+			// bounded write-side reconciliation after metadata quorum recovery.
+			err = fmt.Errorf("ERROR: recovery_busy reason=%q", err)
+		}
+	}
+	return messages, bytes, next, err
 }
 
 func (ch *CommandHandler) validateStreamSyntax(cmd, raw string) string {
