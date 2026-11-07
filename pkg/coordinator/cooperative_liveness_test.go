@@ -59,8 +59,7 @@ func TestCooperativeHeartbeatDuringPeerExpiration(t *testing.T) {
 				require.ErrorContains(t, err, "coordinator_not_available", "pending grants must not be acknowledged")
 			case <-time.After(time.Second):
 				unblock()
-				<-expired
-				<-heartbeat
+				t.Logf("released expiration=%v heartbeat=%v", <-expired, <-heartbeat)
 				t.Fatal("live heartbeat waited behind another member's expiration append")
 			}
 			c.mu.RLock()
@@ -139,8 +138,7 @@ func TestCooperativeHeartbeatDoesNotPublishPendingRevocation(t *testing.T) {
 			require.ErrorContains(t, err, "coordinator_not_available")
 		case <-time.After(time.Second):
 			unblock()
-			<-done
-			<-result
+			t.Logf("released revocation=%v heartbeat=%v", <-done, <-result)
 			t.Fatal("pending revocation blocked a session heartbeat")
 		}
 	}

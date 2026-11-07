@@ -85,9 +85,12 @@ The keeper owns a separate socket, so it does not prevent the original managemen
 socket from crossing the broker's 60-second idle timeout during setup. Reopen
 that transport before sending LEAVE once with the original member/generation.
 Do not classify an ambiguous mutation as rejected or retry it automatically.
-A follow-up 65-second hold checks both the 30-second session and 60-second idle
-connection limits; results remain pending until that run finishes. The Windows
-socket error alone is not proof that IPv6 or the host proxy caused it.
+A follow-up 65-second hold passed both the 30-second session and 60-second idle
+connection limits: Raft replay completed in 348.73 seconds and snapshot restore
+in 533.50 seconds (882.23 seconds total, including fixture builds and startup).
+Both paths retained the original membership through setup, completed LEAVE on
+fresh transport and restored full ISR. Idempotent read retries still occurred;
+the Windows socket error alone is not proof that IPv6 or the host proxy caused it.
 
 The real-Wire closed-management-connection regression passed natively and with
 the Linux race detector. It requires one LEAVE on fresh transport with the
