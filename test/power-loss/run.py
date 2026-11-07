@@ -1,4 +1,4 @@
-"""Kill an isolated ext4 guest at each journal phase, then boot the same disk.
+"""Cut guest power after acknowledged writes or journal phases, then recover.
 
 This models guest kernel/page-cache loss, not physical host/device power loss.
 QEMU writeback honors guest flushes; unsafe caching and -snapshot are forbidden.
@@ -10,6 +10,7 @@ import tempfile
 import time
 
 PHASES = (
+    "acknowledged_prefix",
     "journal_synced", "journal_renamed", "journal_directory_synced",
     "journal_manifest_written", "journal_manifest_synced", "journal_manifest_directory_synced",
 )

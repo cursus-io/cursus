@@ -247,3 +247,11 @@ single backup generation and start the previously compatible release as a
 quorum. Re-run the readiness and read-only checks above before admitting
 clients. A partial file restore, a missing compaction sidecar, or mixing files
 from generations is not a supported recovery procedure.
+
+The [storage recovery rehearsal](../storage-recovery-rehearsal.md) verifies
+acknowledged data and consumer offsets after guest power loss, standalone backup
+restore, authoritative-record corruption and derived-index damage. Its distributed
+case stops all three writers, compares source/copy digests, and restores one
+complete backup generation into fresh writable member volumes. These same-image
+checks exercise the restore procedure; cross-version compatibility still follows
+the support matrix above.

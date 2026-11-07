@@ -21,7 +21,7 @@ if ! mount -t ext4 -o data=ordered /dev/vda /data; then
 fi
 export CURSUS_POWER_ROOT=/data/broker
 export CURSUS_E2E_FAULTS=1
-/broker-tests -test.v -test.run='^TestStandaloneBrokerTruncateJournalCrashRecovery$' -test.timeout=10m
+/broker-tests -test.v -test.run='^TestStandaloneBroker(TruncateJournalCrashRecovery|AcknowledgedPrefixPowerRecovery)$' -test.timeout=10m
 result=$?
 echo POWER_TEST_EXIT=$result
 poweroff -f
