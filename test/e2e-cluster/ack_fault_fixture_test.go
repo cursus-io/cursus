@@ -115,6 +115,10 @@ func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	data, err := os.ReadFile(composeFile)
 	require.NoError(t, err)
 	text := strings.ReplaceAll(string(data), "context: ../..", "context: "+filepath.ToSlash(root))
+	// As in test/cluster, only broker 1 initializes the static voter set.
+	// Bootstrapping all three races with receiving the first Raft log entry.
+	text = strings.ReplaceAll(text, "- BOOTSTRAP_CLUSTER=true", "- BOOTSTRAP_CLUSTER=false")
+	text = strings.Replace(text, "- BOOTSTRAP_CLUSTER=false", "- BOOTSTRAP_CLUSTER=true", 1)
 	text = strings.ReplaceAll(text, "../cluster/config.yaml", filepath.ToSlash(config))
 	text = strings.ReplaceAll(text, "dockerfile: Dockerfile", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults")
 	text = strings.ReplaceAll(text, "name: cluster_network", "name: "+ackFaultProject)
