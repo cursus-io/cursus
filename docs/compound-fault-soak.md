@@ -73,6 +73,22 @@ Per-process recovery counters and complete broker logs are retained separately
 from the compact verified-history digests. The 24-hour campaign is a separate
 acceptance run; no 24-hour result is included in these short-run measurements.
 
+The first 24-hour attempt on 2026-11-07 UTC failed after 547.69 total test seconds
+in round 1, before complete content readback. After the interrupted receiver
+rejoined, all three metadata observations agreed at committed end 110, but the
+host's broker-2 metrics requests timed out during the required stable window.
+The captured receiver stack showed its metrics listener waiting for connections,
+without an active metrics handler or a demonstrated lock cycle. That does not
+prove whether the cause was broker availability or the host/Docker network path;
+the run is a failure, not evidence of either data loss or successful recovery.
+
+Failure capture now records container state and in-container metrics/readiness
+before requesting Go stacks. It does not substitute those probes for the public
+path or relax the stability/identity oracle. An immediate three-round rerun of
+seed 20261107 with the same info logging passed in 457.88 total seconds (347.449
+campaign seconds, 126 attempts). The intermittent first-run timeout remains
+unexplained; its artifacts are preserved separately from subsequent campaigns.
+
 ## Running
 
 Run only one ACK fixture at a time; all its tests own the same dedicated Compose

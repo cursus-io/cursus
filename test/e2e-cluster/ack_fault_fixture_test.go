@@ -226,6 +226,35 @@ func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTest
 	}
 	require.NoError(t, os.MkdirAll(logDir, 0o750))
 	t.Cleanup(func() {
+		if t.Failed() {
+			// Capture container state and the in-container HTTP path before
+			// SIGQUIT changes process state. A host scrape timeout alone cannot
+			// distinguish a broker stall from a Docker port-forwarding failure.
+			for node := 1; node <= 3; node++ {
+				path := filepath.Join(logDir, fmt.Sprintf("%s-broker-%d-diagnostics.log", strings.ReplaceAll(t.Name(), "/", "_"), node))
+				file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+				if err != nil {
+					t.Logf("broker diagnostics artifact: %v", err)
+					continue
+				}
+				for _, args := range [][]string{
+					{"inspect", "--format", "{{json .State}} {{json .NetworkSettings.Ports}}", ackFaultContainer(node)},
+					{"exec", ackFaultContainer(node), "curl", "--silent", "--show-error", "--max-time", "3", "http://127.0.0.1:9100/metrics"},
+					{"exec", ackFaultContainer(node), "curl", "--silent", "--show-error", "--max-time", "3", "http://127.0.0.1:9080/ready"},
+				} {
+					captureCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+					cmd := exec.CommandContext(captureCtx, "docker", args...)
+					cmd.Stdout, cmd.Stderr = file, file
+					if err := cmd.Run(); err != nil {
+						t.Logf("broker-%d diagnostic %s: %v", node, args[0], err)
+					}
+					cancel()
+				}
+				if err := file.Close(); err != nil {
+					t.Logf("broker diagnostics close: %v", err)
+				}
+			}
+		}
 		// Preserve complete process lifetimes before topic/container cleanup.
 		// The generic failure tail can omit the recovery error under debug load.
 		for node := 1; node <= 3; node++ {
