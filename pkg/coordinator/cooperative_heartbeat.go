@@ -27,18 +27,32 @@ func (c *Coordinator) ValidateCooperativeSubscription(groupName, topic string) e
 }
 
 // refreshCooperativeHeartbeat updates only volatile liveness for an unchanged
-// durable assignment. Membership, topology, reservation-driven grants and
-// revocation acknowledgements still use the exclusive lifecycle transition.
-func (c *Coordinator) refreshCooperativeHeartbeat(groupName, member string, registration, session uint64, partitions []CooperativePartition) (CooperativeMembership, bool, error) {
+// durable assignment. A surviving session may refresh during a pending lifecycle
+// append, but receives no grants or revocation acknowledgement until publication.
+func (c *Coordinator) refreshCooperativeHeartbeat(groupName, member string, registration, session uint64, partitions []CooperativePartition, hasAcks bool) (CooperativeMembership, bool, error) {
 	c.mu.state.Lock()
 	defer c.mu.state.Unlock()
 	group := c.groups[groupName]
-	if group == nil || group.Cooperative == nil || c.lifecyclePending[groupName] {
+	if group == nil || group.Cooperative == nil {
 		return CooperativeMembership{}, false, nil
 	}
 	state := group.Cooperative
 	if member == "" || registration != group.RegistrationEpoch || state.session(member) != session || group.Members[member] == nil {
 		return CooperativeMembership{}, true, fmt.Errorf("ERROR: cooperative_fenced")
+	}
+	if c.lifecyclePending[groupName] {
+		pending := c.cooperativePending[groupName]
+		if pending != nil && pending.RegistrationEpoch == registration && pending.session(member) == session {
+			now := time.Now()
+			group.Members[member].LastHeartbeat = now
+			group.LastActivity = now
+		}
+		// A removal already selected for publication cannot be undone by a late
+		// heartbeat. An ambiguous append has no candidate and cannot refresh.
+		return CooperativeMembership{}, true, fmt.Errorf("ERROR: coordinator_not_available")
+	}
+	if hasAcks {
+		return CooperativeMembership{}, false, nil
 	}
 	if !slices.Equal(state.Partitions, partitions) {
 		return CooperativeMembership{}, false, nil

@@ -277,7 +277,8 @@ jobs:
         env:
           RUN_E2E_CLEANUP_RECOVERY: "1"
           RUN_E2E_CLEANUP_LARGE: "1"
-        run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^(TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot|TestTruncateReregistrationConvergesDelayedFollower)$'
+          CURSUS_CLEANUP_SETUP_HOLD: "65s"
+        run: go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^(TestCleanupLeaveAfterIdleConnectionClose|TestCommittedConsumerCleanupSurvivesFailoverAndSnapshot|TestTruncateReregistrationConvergesDelayedFollower)$'
       - name: Show cleanup recovery cluster logs
         if: failure()
         working-directory: test/e2e-cluster
