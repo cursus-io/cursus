@@ -89,6 +89,18 @@ seed 20261107 with the same info logging passed in 457.88 total seconds (347.449
 campaign seconds, 126 attempts). The intermittent first-run timeout remains
 unexplained; its artifacts are preserved separately from subsequent campaigns.
 
+A later attempt using the diagnostic harness `ee5b475` started at
+2026-11-07 16:38:34 UTC and was stopped at 16:42:19 UTC because the laptop was
+about to sleep. Broker logs and container state were captured before removing
+the fixture's containers and volumes. Its manifest records
+`interrupted_for_user_sleep`; it is neither a product failure nor a completed
+duration run. A fresh 24-hour attempt started at 17:16:03 UTC using the same
+diagnostic binary (SHA-256
+`65ed5f8c23755d607c6e6b6f3b96bede9914e13ec3024d842ef0b7e751312b06`).
+Waiting, sleep and earlier attempts do not count toward that campaign. Its
+completed duration and final history verification must be recorded separately
+before claiming a 24-hour pass.
+
 ## Running
 
 Run only one ACK fixture at a time; all its tests own the same dedicated Compose
