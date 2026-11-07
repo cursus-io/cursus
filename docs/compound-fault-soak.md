@@ -53,19 +53,25 @@ the 24-hour campaign. Do not introduce task-branch CI exceptions.
 
 ## Execution evidence
 
-The first native Windows driver run against Linux Docker brokers passed with
-seed `3271337` on 2026-11-07 UTC. All three fault rounds completed, including
-observed loss of quorum and a receiver crash at the durable catch-up boundary.
-The campaign took 350.069 seconds; total test time including fixture startup and
-cleanup was 553.70 seconds. The journal contains 113 completed request attempts;
-the final readback verified 97 records on all replicas and through the public
-consumer. Every round also required 65 seconds of stable full ISR.
+Three native Windows driver runs against Linux Docker brokers passed on
+2026-11-07 UTC. Each seed completed all three fault rounds, including observed
+loss of quorum and a receiver crash at the durable catch-up boundary. Every
+round required 65 seconds of stable full ISR and complete replica/public-consumer
+readback. The source is the harness implementation `397227d` on broker baseline
+`c7384a5`; separate consumer-liveness and lineage-work changes are not included.
 
-The next background ACK after each heal request was observed in 301, 1,300 and
-800 ms. These are fixture observations, not a production availability SLO.
+| Seed | Campaign seconds | Total test seconds | Completed attempts | Final verified records |
+| --- | ---: | ---: | ---: | ---: |
+| 3271337 | 350.069 | 553.70 | 113 | 97 |
+| 20261107 | 360.869 | 491.26 | 110 | 100 |
+| 1 | 408.419 | 460.50 | 143 | 109 |
+
+Total test time includes fixture startup and cleanup. The next background ACK
+after each heal request was observed between 101 and 3,629 ms across these nine
+rounds. These are fixture observations, not a production availability SLO.
 Per-process recovery counters and complete broker logs are retained separately
-from the compact verified-history digests. Additional seeds and the 24-hour
-campaign remain pending; this short run is not a long-duration result.
+from the compact verified-history digests. The 24-hour campaign is a separate
+acceptance run; no 24-hour result is included in these short-run measurements.
 
 ## Running
 
