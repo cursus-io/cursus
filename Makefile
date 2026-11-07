@@ -36,12 +36,12 @@ test:
 .PHONY: e2e
 e2e: e2e-build e2e-up
 	@echo "Running E2E tests..."
-	$(call run_e2e_test,$(GO) test -v -race -timeout 10m ./test/e2e/... && CURSUS_INTEGRATION_ADDRS=localhost:10000 $(GO) test -v -race -timeout 10m ./sdk -run '^TestTransactionalProducerAgainstBroker$$' -count=1)
+	$(call run_e2e_test,CURSUS_INTEGRATION_ADDRS=localhost:10000 $(GO) test -v -race -timeout 10m ./sdk -run '^TestTransactionalProducerAgainstBroker$$' -count=1 && $(GO) test -v -race -timeout 10m ./test/e2e/...)
 
 .PHONY: e2e-verbose
 e2e-verbose: e2e-build e2e-up
 	@echo "Running E2E tests (verbose)..."
-	$(call run_e2e_test,$(GO) test -v -race -timeout 10m ./test/e2e/... && CURSUS_INTEGRATION_ADDRS=localhost:10000 $(GO) test -v -race -timeout 10m ./sdk -run '^TestTransactionalProducerAgainstBroker$$' -count=1)
+	$(call run_e2e_test,CURSUS_INTEGRATION_ADDRS=localhost:10000 $(GO) test -v -race -timeout 10m ./sdk -run '^TestTransactionalProducerAgainstBroker$$' -count=1 && $(GO) test -v -race -timeout 10m ./test/e2e/...)
 
 .PHONY: e2e-coverage
 e2e-coverage: e2e-build e2e-up
