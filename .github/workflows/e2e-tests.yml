@@ -101,6 +101,11 @@ jobs:
         with:
           go-version: '1.26.2'
           cache: true
+      - name: Reserve fault fixture ports across broker restarts
+        run: |
+          # The internal-wire host ports overlap Linux's ephemeral range.
+          existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}42001-42003"
       - name: Verify storage operations and gated fault hooks
         run: |
           go test -race -tags=e2e_faults -count=1 ./internal/faultpoint ./pkg/disk \
