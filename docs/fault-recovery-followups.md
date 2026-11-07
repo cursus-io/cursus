@@ -2,7 +2,7 @@
 
 The acknowledged-write oracle is the foundation. These follow-ups exercise
 commit-application boundaries, transaction decisions, storage failures and
-recovery under foreground load. Changes stay local until publication is requested.
+recovery under foreground load. The foundation and these follow-ups are merged.
 
 ## Comparisons and regression contracts, defined before implementation
 
@@ -101,10 +101,25 @@ seconds; final changed-package static analysis reported zero issues.
 Normal-build disk, partition-commit and transaction regressions passed with the
 Linux race detector, as did tagged faultpoint/storage/recovery-counter tests.
 The changed-package static check reported zero issues. Workflow YAML parsed.
-Hosted CI has not run: changes and commits remain local. The new CI job requires
-explicit passes for all four scenarios and all eight transaction/storage
-subtests. The full controller package also passes with the Linux race detector
-after the uncertain-commit correction.
+Hosted validation completed on 2026-11-07 for commit `47967ab`: all eight
+workflows and all 36 PR checks passed, including all 19 E2E jobs.
+[The boundary run](https://github.com/cursus-io/cursus/actions/runs/42376965677/job/128416433104)
+passed all four scenarios and all eight transaction/storage subtests without
+skips. The full controller package also passes with the Linux race detector
+after the uncertain-commit correction. These hosted results do not erase the
+separate local transport/session failures recorded in
+[ci-fault-readiness.md](ci-fault-readiness.md) and
+[offset-snapshot-attempts.md](offset-snapshot-attempts.md).
+
+The hosted interrupted-recovery run completed in 272.35 seconds. Its unchanged
+50-second foreground window completed 2,913 produce, consume and offset-commit
+operations each with zero errors; small-replica full ISR took 12,026 ms. The
+replacement receiver recorded 419,214,612 logical lineage read bytes before
+verification for a 34,686,641-byte payload fixture. This is application work,
+not physical disk I/O or total cluster traffic, and still warrants a separate
+recovery-amplification investigation. The JSON's window-end `final_isr` is not
+the later healed state: the journal separately verifies all recovery topics
+after healing.
 
 ## Original failure evidence and correction
 
