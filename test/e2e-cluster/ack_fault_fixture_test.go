@@ -36,7 +36,7 @@ func newAckFaultJournal(t *testing.T) *ackFaultJournal {
 		dir = t.TempDir()
 	}
 	require.NoError(t, os.MkdirAll(dir, 0o750))
-	file, err := os.OpenFile(filepath.Join(dir, t.Name()+".jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "_")+".jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, file.Close()) })
 	return &ackFaultJournal{t: t, file: file}
@@ -112,6 +112,11 @@ func ackFaultRoundTrip(addr, command string) ([]byte, bool, error) {
 // Only broker 1 bootstraps Raft; fault restarts preserve each broker's existing volume.
 func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	t.Helper()
+	return newAckFaultClusterMode(t, topic, false)
+}
+
+func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTestContext {
+	t.Helper()
 	require.Empty(t, os.Getenv("CURSUS_CLEANUP_PORT_OFFSET"), "cleanup fixture overrides cannot be combined")
 	t.Setenv("CURSUS_E2E_PORT_SHIFT", strconv.Itoa(ackFaultPortShift))
 	root, err := filepath.Abs("../..")
@@ -127,6 +132,10 @@ func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	text = strings.Replace(text, "- BOOTSTRAP_CLUSTER=false", "- BOOTSTRAP_CLUSTER=true", 1)
 	text = strings.ReplaceAll(text, "../cluster/config.yaml", filepath.ToSlash(config))
 	text = strings.ReplaceAll(text, "dockerfile: Dockerfile", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults")
+	if hooks {
+		text = strings.ReplaceAll(text, "dockerfile: test/e2e-cluster/Dockerfile.ack-faults", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults\n      args:\n        E2E_BUILD_TAGS: e2e_faults")
+		text = strings.ReplaceAll(text, "- CONFIG_PATH=/app/config.yaml", "- CONFIG_PATH=/app/config.yaml\n      - CURSUS_E2E_FAULTS=1")
+	}
 	text = strings.ReplaceAll(text, "name: cluster_network", "name: "+ackFaultProject)
 	for node := 1; node <= 3; node++ {
 		text = strings.ReplaceAll(text, fmt.Sprintf("container_name: broker-%d", node),

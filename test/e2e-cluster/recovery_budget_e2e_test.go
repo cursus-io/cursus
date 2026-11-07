@@ -2,11 +2,13 @@ package e2e_cluster
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 	"github.com/cursus-io/cursus/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,12 +35,33 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 	require.GreaterOrEqual(t, clusterPortShift(), 10000)
 	ctx := GivenCluster(t).WithTopic("c-large").WithPartitions(1).WithAcks("all")
 	ctx.WhenCluster().StartCluster()
+	runRecoveryBudgetMixedLoad(t, ctx, prefix, output, false)
+}
+
+func TestRecoveryBudgetInterruptedMixedLoad(t *testing.T) {
+	if os.Getenv("RUN_E2E_RECOVERY_BOUNDARIES") != "1" {
+		t.Skip("set RUN_E2E_RECOVERY_BOUNDARIES=1 for deterministic recovery faults")
+	}
+	ctx := newAckFaultClusterMode(t, "c-large", true)
+	dir := os.Getenv("CURSUS_ACK_FAULT_RESULTS")
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	output := filepath.Join(dir, t.Name()+".json")
+	runRecoveryBudgetMixedLoad(t, ctx, ackFaultProject+"-", output, true)
+}
+
+func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, output string, interrupt bool) {
+	t.Helper()
 	addrs := ctx.GetBrokerAddrs()
 	admin := e2e.NewBrokerClient(addrs[:2])
 	defer admin.Close()
 	names := []string{"a-unresponsive", "b-slow", "c-large", "z-small"}
 	for _, name := range names {
-		sendClusterTopicCommand(t, addrs, "CREATE topic="+name+" partitions=1 replication_factor=3 idempotent=true")
+		if !interrupt || name != ctx.GetTopic() {
+			sendClusterTopicCommand(t, addrs, "CREATE topic="+name+" partitions=1 replication_factor=3 idempotent=true")
+		}
 		requireReplicaOffsetsEventually(t, addrs, name, 0)
 		require.NoError(t, admin.PublishIdempotentToPartition(name, "seed", 0, 1, 0, "seed", "all", true))
 	}
@@ -49,6 +73,13 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 		}
 		sendClusterTopicCommand(t, addrs, fmt.Sprintf("ELECT_LEADER topic=%s partition=0 broker=broker-%d-9000", name, leader))
 	}
+	var journal *ackFaultJournal
+	var boundary string
+	if interrupt {
+		journal = newAckFaultJournal(t)
+		boundary = armRecoveryBoundary(t, 3, "replica-catchup", "c-large-0")
+		captureAckFaultMetrics(t, journal, "before-recovery-backlog")
+	}
 	recoveryDocker(t, "stop", prefix+"broker-3")
 	waitForBrokerEvictedFromISR(t, ctx, 3)
 	// The live topic has only the two remaining brokers, so its successful
@@ -57,16 +88,12 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 	sendClusterTopicCommand(t, addrs[:2], "CREATE topic="+live+" partitions=1 replication_factor=2 idempotent=true")
 	requireReplicaOffsetsEventually(t, addrs[:2], live, 0)
 	sendClusterTopicCommand(t, addrs[:2], "ELECT_LEADER topic="+live+" partition=0 broker=broker-1-9000")
-	reader, generation, member := joinRecoveryBudgetGroup(t, addrs[:2], live, group)
-	defer reader.Close()
-	consumer := e2e.NewBrokerClient(addrs[:1])
-	defer consumer.Close()
 	for i, name := range names {
 		count := []int{1, 128, 4096, 2}[i]
 		for start := 0; start < count; start += 128 {
 			messages := make([]types.Message, min(128, count-start))
 			for j := range messages {
-				messages[j] = types.Message{ProducerID: "seed", SeqNum: uint64(start + j + 2), Payload: strings.Repeat("x", 8192)}
+				messages[j] = types.Message{ProducerID: "seed", SeqNum: uint64(start + j + 2), Payload: recoveryBudgetPayload(name, uint64(start+j+1))}
 			}
 			payload, err := util.EncodeBatchMessages(name, 0, "all", true, messages)
 			require.NoError(t, err)
@@ -95,6 +122,12 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 	}
 	recoveryDocker(t, "exec", prefix+"broker-1", "sh", "-c", "printf 2m > /run/cursus-e2e-faults/recovery-source/a-unresponsive")
 	recoveryDocker(t, "exec", prefix+"broker-1", "sh", "-c", "printf 200ms > /run/cursus-e2e-faults/recovery-source/b-slow")
+	// Join after backlog creation: slow seeding must not consume the member's
+	// session timeout before the measured heartbeat loop starts.
+	reader, generation, member := joinRecoveryBudgetGroup(t, addrs[:2], live, group)
+	defer reader.Close()
+	consumer := e2e.NewBrokerClient(addrs[:1])
+	defer consumer.Close()
 	before := recoveryBudgetResources(t, prefix, 2)
 	started := time.Now()
 	recoveryDocker(t, "start", prefix+"broker-3")
@@ -104,10 +137,38 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 	var seq, consumed uint64
 	var emptyReads int
 	nextProbe := started
+	interrupted := false
+	commitsBeforeCrash := 0
+	successfulCommits := 0
 	for time.Since(started) < 50*time.Second {
 		time.Sleep(5 * time.Millisecond)
 		if time.Now().After(nextProbe) {
-			heartbeatGroup(t, reader, live, group, generation, member)
+			if interrupt && !interrupted && successfulCommits >= 10 {
+				entered := ackFaultDocker(t, "exec", ackFaultContainer(3), "sh", "-c", "if test -f "+boundary+".entered; then echo entered; else echo waiting; fi")
+				if entered == "entered" {
+					journal.record("recovery_interrupted_after_durable_append", boundary)
+					var interruptedWork map[string]any
+					require.NoError(t, json.Unmarshal([]byte(ackFaultDocker(t, "exec", ackFaultContainer(3), "cat", boundary+".work.json")), &interruptedWork))
+					journal.record("interrupted_process_work", interruptedWork)
+					journal.record("interrupted_process_started_at", ackFaultDocker(t, "inspect", "--format", "{{.State.StartedAt}}", ackFaultContainer(3)))
+					journal.record("process_resources_before_interruption", recoveryBudgetResources(t, prefix, 3))
+					ackFaultDocker(t, "kill", "--signal=KILL", ackFaultContainer(3))
+					sendClusterTopicCommand(t, addrs[:2], "ELECT_LEADER topic=c-large partition=0 broker=broker-1-9000")
+					journal.record("recovery_source_changed", "broker-2-9000 -> broker-1-9000")
+					ackFaultDocker(t, "start", ackFaultContainer(3))
+					commitsBeforeCrash = successfulCommits
+					interrupted = true
+				}
+			}
+			if interrupt {
+				response, err := reader.SendCommand("", fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d", live, group, member, generation), 3*time.Second)
+				if err != nil || !strings.HasPrefix(response, "OK") {
+					errorsByClass["heartbeat"]++
+					journal.record("foreground_heartbeat_error", map[string]any{"response": response, "error": fmt.Sprint(err), "elapsed_ms": time.Since(started).Milliseconds()})
+				}
+			} else {
+				heartbeatGroup(t, reader, live, group, generation, member)
+			}
 			response, err := admin.SendCommand("", "DESCRIBE topic=z-small", 3*time.Second)
 			if err == nil && completion < 0 {
 				var meta topicMetadata
@@ -118,7 +179,7 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 			nextProbe = time.Now().Add(100 * time.Millisecond)
 		}
 		begin := time.Now()
-		err := admin.PublishIdempotentToPartition(live, "live-producer", 0, seq+1, 0, strings.Repeat("p", 1024), "all", true)
+		err := admin.PublishIdempotentToPartition(live, "live-producer", 0, seq+1, 0, fmt.Sprintf("live-%d", seq), "all", true)
 		produce = append(produce, time.Since(begin).Microseconds())
 		if err != nil {
 			errorsByClass["produce"]++
@@ -139,12 +200,24 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 			emptyReads++
 			continue
 		}
+		require.Len(t, offsets, len(messages))
+		for i, payload := range messages {
+			require.Equal(t, consumed+uint64(i), offsets[i], "foreground offsets must not skip or repeat")
+			require.Equal(t, fmt.Sprintf("live-%d", offsets[i]), payload)
+		}
 		consumed = offsets[len(offsets)-1] + 1
 		begin = time.Now()
 		response, err := reader.SendCommand("", fmt.Sprintf("COMMIT_OFFSET topic=%s partition=0 group=%s offset=%d generation=%d member=%s", live, group, consumed, generation, member), 3*time.Second)
 		commit = append(commit, time.Since(begin).Microseconds())
 		if err != nil || !strings.HasPrefix(response, "OK") {
+			if interrupt {
+				var brokerError *wire.BrokerError
+				_ = errors.As(err, &brokerError)
+				journal.record("foreground_commit_error", map[string]any{"offset": consumed, "response": response, "error": fmt.Sprint(err), "broker_error": brokerError, "elapsed_ms": time.Since(started).Milliseconds(), "interrupted": interrupted})
+			}
 			errorsByClass["commit"]++
+		} else {
+			successfulCommits++
 		}
 	}
 	percentiles := func(samples []int64) map[string]int64 {
@@ -168,13 +241,67 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 	}
 	resources := recoveryBudgetResources(t, prefix, 3)
 	result := map[string]any{"window_seconds": 50, "small_first_ms": time.Unix(0, first).Sub(started).Milliseconds(), "small_exact_isr_ms": completion.Milliseconds(), "final_isr": finalISR, "produce": percentiles(produce), "consume": percentiles(consume), "offset_commit": percentiles(commit), "empty_reads": emptyReads, "consumed_records": consumed, "errors": errorsByClass, "resources_before": before, "resources_after": resources}
+	result["successful_offset_commits"] = successfulCommits
 	data, err := json.MarshalIndent(result, "", "  ")
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(output, data, 0600))
 	t.Log(string(data))
 	require.Greater(t, completion, time.Duration(0), "small replica never rejoined exact ISR")
-	require.Empty(t, errorsByClass)
-	require.Greater(t, len(commit), 100, "foreground must exercise actual offset commits")
+	// Keep failures visible while collecting post-heal data and recovery work.
+	assert.Empty(t, errorsByClass)
+	assert.Greater(t, successfulCommits, 100, "foreground must exercise successful offset commits")
+	if interrupt {
+		require.True(t, interrupted, "large recovery must actually reach its durable append boundary")
+		assert.Greater(t, successfulCommits-commitsBeforeCrash, 10, "foreground must progress after interruption")
+		for node := 1; node <= 3; node++ {
+			for _, command := range []string{"CLUSTER_STATUS", "LIST_OFFSETS topic=__consumer_offsets"} {
+				response, _, err := ackFaultRoundTrip(addrs[node-1], command)
+				journal.record("post_window_state", map[string]any{"node": node, "command": command, "response": string(response), "error": fmt.Sprint(err)})
+			}
+		}
+		for node := 1; node <= 2; node++ {
+			ackFaultDocker(t, "exec", ackFaultContainer(node), "rm", "-f", "/run/cursus-e2e-faults/recovery-source/a-unresponsive", "/run/cursus-e2e-faults/recovery-source/b-slow")
+		}
+		for _, name := range names {
+			waitAckFaultState(t, name, []int{1, 2, 3}, "", 3)
+		}
+		captureAckFaultMetrics(t, journal, "interrupted-recovery-before-readback")
+		for i, name := range names {
+			state := waitAckFaultState(t, name, []int{1, 2, 3}, "", 3)
+			records := readRecoveryHistory(t, name, 3, coordinatorNode(t, state.Leader), state.LeaderEpoch, state.CommittedHWM)
+			require.Len(t, records, []int{2, 129, 4097, 3}[i])
+			for offset, record := range records {
+				require.Equal(t, uint64(offset), record.Offset)
+				require.Equal(t, uint64(offset+1), record.SeqNum)
+				require.Equal(t, "seed", record.ProducerID)
+				want := "seed"
+				if offset > 0 {
+					want = recoveryBudgetPayload(name, uint64(offset))
+				}
+				require.Equal(t, want, record.Payload)
+			}
+			journal.record("recovered_topic_verified", map[string]any{"topic": name, "records": len(records)})
+		}
+		liveState := waitAckFaultState(t, live, []int{1, 2}, "", 2)
+		require.Equal(t, seq, liveState.CommittedHWM)
+		for node := 1; node <= 2; node++ {
+			records := readRecoveryHistory(t, live, node, coordinatorNode(t, liveState.Leader), liveState.LeaderEpoch, liveState.CommittedHWM)
+			require.Len(t, records, int(seq))
+			for offset, record := range records {
+				require.Equal(t, uint64(offset), record.Offset)
+				require.Equal(t, uint64(offset+1), record.SeqNum)
+				require.Equal(t, "live-producer", record.ProducerID)
+				require.Equal(t, fmt.Sprintf("live-%d", offset), record.Payload)
+			}
+		}
+		journal.record("foreground_acknowledged_records_verified", seq)
+		require.Equal(t, consumed, fetchCommittedOffset(t, reader, live, group))
+		captureAckFaultMetrics(t, journal, "after-interrupted-recovery-readback")
+	}
+}
+
+func recoveryBudgetPayload(topic string, offset uint64) string {
+	return fmt.Sprintf("%s-%05d-", topic, offset) + strings.Repeat("x", 8192)
 }
 
 func recoveryBudgetResources(t *testing.T, prefix string, nodes int) map[string]string {
@@ -207,7 +334,7 @@ func recoveryBudgetResources(t *testing.T, prefix string, nodes int) map[string]
 		}
 		var selected []string
 		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "cursus_recovery_") || strings.HasPrefix(line, "cursus_cluster_under_replicated_") || strings.HasPrefix(line, "process_cpu_") || strings.HasPrefix(line, "process_resident_") {
+			if strings.HasPrefix(line, "cursus_recovery_") || strings.HasPrefix(line, "cursus_cluster_under_replicated_") || strings.HasPrefix(line, "process_cpu_") || strings.HasPrefix(line, "process_resident_") || strings.HasPrefix(line, "process_start_time_seconds ") {
 				selected = append(selected, line)
 			}
 		}

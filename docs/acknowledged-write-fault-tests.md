@@ -62,9 +62,11 @@ These small fixtures establish correctness, not a recovery amplification bound
 or a production latency SLO. Full retained scans, bootstrap and cold/warm scaling
 remain separate measurements; RPC counts alone cannot establish efficiency.
 
-Transactions, retention, compaction, SDK auto-retry behavior, sustained concurrent
-traffic, randomized schedules and disk/power faults are later increments. Their
-different visibility/deletion contracts must not be inferred from this oracle.
+Transaction, storage and interrupted mixed-load follow-ups are documented in
+[fault-recovery-followups.md](fault-recovery-followups.md), including a currently
+failing consumer-metadata availability regression. Their different visibility
+and deletion contracts must not be inferred from this oracle. Randomized
+schedules, broad SDK retry coverage and power faults remain separate work.
 
 ## Running and interpreting evidence
 
@@ -78,7 +80,8 @@ On a Docker host, run both fault scenarios (do not run two copies concurrently):
 
 ```sh
 RUN_E2E_ACK_FAULTS=1 CURSUS_ACK_FAULT_RESULTS="$PWD/ack-fault-results" \
-  go test -v -count=1 -timeout 25m ./test/e2e-cluster -run '^TestAcknowledgedWrites'
+  go test -v -count=1 -timeout 25m ./test/e2e-cluster \
+  -run '^Test(AcknowledgedWritesSurviveLostReplyAndLeaderKill|AcknowledgedWritesFenceIsolatedLeader)$'
 ```
 
 The reserved Compose project/network/container prefix is `cursus-ack-faults`;

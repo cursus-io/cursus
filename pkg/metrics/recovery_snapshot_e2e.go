@@ -1,4 +1,4 @@
-//go:build e2e_faults && linux
+//go:build e2e_faults
 
 package metrics
 

@@ -4,12 +4,15 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/cursus-io/cursus/internal/e2efaults"
+	"github.com/cursus-io/cursus/internal/faultpoint"
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 )
@@ -62,6 +65,25 @@ func injectedReplicaCatchupCrash(name string, partition int) {
 		return
 	}
 	path := filepath.Join(e2efaults.SentinelRoot, "replica-catchup-crash", fmt.Sprintf("%s-%d", name, partition))
+	boundary := filepath.Join(e2efaults.SentinelRoot, "replica-catchup", fmt.Sprintf("%s-%d", name, partition))
+	if _, err := os.Stat(boundary); err == nil {
+		// The HTTP exporter may not be serving during startup reconciliation.
+		// Snapshot only recovery counters, without re-entering partition locks.
+		work, err := metrics.RecoveryWorkSnapshotForFault()
+		if err != nil {
+			panic(err)
+		}
+		data, err := json.Marshal(map[string]any{"at": time.Now().UTC(), "pid": os.Getpid(), "work": work})
+		if err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(boundary+".work.json", data, 0o600); err != nil {
+			panic(err)
+		}
+	}
+	if err := faultpoint.Pause("replica-catchup", fmt.Sprintf("%s-%d", name, partition)); err != nil {
+		panic(err) // A reached but unreleased test boundary must fail visibly.
+	}
 	if os.Remove(path) == nil {
 		os.Exit(88)
 	}

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cursus-io/cursus/internal/faultpoint"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
@@ -617,6 +618,9 @@ func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 		return fmt.Errorf("unmarshal partition commit: %w", err)
 	}
 	key := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
+	if err := faultpoint.PauseOffset("partition-commit", cmd.Topic, cmd.Partition, cmd.HWM); err != nil {
+		return err
+	}
 
 	f.mu.Lock()
 	if err := f.validateConsumerMetadataRouteLocked(cmd.Topic, cmd.Partition, cmd.ConsumerRoute); err != nil {

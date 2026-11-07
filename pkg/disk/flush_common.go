@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/cursus-io/cursus/internal/faultpoint"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -70,7 +72,14 @@ func (d *DiskHandler) flushLoop() {
 				}
 			}
 			if d.file != nil {
-				if err := d.syncFile(d.file); err != nil {
+				var syncErr error
+				if end := atomic.LoadUint64(&d.FlushedOffset); end > 0 {
+					syncErr = faultpoint.FailOffset("disk-sync", d.topicName, d.partitionID, end-1, syscall.EIO)
+				}
+				if syncErr == nil {
+					syncErr = d.syncFile(d.file)
+				}
+				if err := syncErr; err != nil {
 					_ = d.markWriteUnavailable(fmt.Errorf("sync on request: %w", err))
 				}
 			}
@@ -260,6 +269,9 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 
 		sLen, _ := util.SafeIntToUint32(len(serialized)) // validated in pre-loop
 		binary.BigEndian.PutUint32(lenBuf[:], sLen)
+		if err := faultpoint.FailOffset("disk-append", msg.Topic, int(msg.Partition), msg.Offset, syscall.ENOSPC); err != nil {
+			return d.markWriteUnavailable(err)
+		}
 		if _, err := d.writer.Write(lenBuf[:]); err != nil {
 			return d.markWriteUnavailable(fmt.Errorf("write length failed: %w", err))
 		}
@@ -279,6 +291,11 @@ func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error
 		}
 	}
 	if syncData {
+		for _, msg := range batch {
+			if err := faultpoint.FailOffset("disk-sync", msg.Topic, int(msg.Partition), msg.Offset, syscall.EIO); err != nil {
+				return d.markWriteUnavailable(err)
+			}
+		}
 		if err := d.syncFile(d.file); err != nil {
 			return d.markWriteUnavailable(fmt.Errorf("sync disk batch: %w", err))
 		}
@@ -400,6 +417,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], serLen)
 
+	if err := faultpoint.FailOffset("disk-append", topic, partition, msg.Offset, syscall.ENOSPC); err != nil {
+		return d.markWriteUnavailable(err)
+	}
 	if _, err := d.writer.Write(lenBuf[:]); err != nil {
 		return d.markWriteUnavailable(fmt.Errorf("write record length: %w", err))
 	}
@@ -411,6 +431,9 @@ func (d *DiskHandler) WriteDirect(topic string, partition int, msg types.Message
 	}
 	// WriteDirect backs acknowledged application writes, follower replication,
 	// and consumer metadata. All must cross the filesystem sync boundary.
+	if err := faultpoint.FailOffset("disk-sync", topic, partition, msg.Offset, syscall.EIO); err != nil {
+		return d.markWriteUnavailable(err)
+	}
 	if err := d.syncFile(d.file); err != nil {
 		return d.markWriteUnavailable(fmt.Errorf("sync disk log: %w", err))
 	}
