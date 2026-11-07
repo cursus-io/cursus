@@ -88,7 +88,14 @@ func TestTransactionDecisionsSurviveCoordinatorBoundaries(t *testing.T) {
 					return err == nil, fmt.Sprint(err), nil
 				}))
 				require.Equal(t, session, producer.Session(), "same-decision retry must retain the original epoch")
-				require.Error(t, sdkClient.EndTransaction(id, session.ProducerID, session.Epoch, decision != "commit"), "a durable decision cannot be reversed")
+				reverseErr := sdkClient.EndTransaction(id, session.ProducerID, session.Epoch, decision != "commit")
+				var brokerErr *sdk.BrokerError
+				require.ErrorAs(t, reverseErr, &brokerErr, "the broker must reject reversing a durable decision")
+				wantCode := "transaction_already_committed"
+				if decision == "abort" {
+					wantCode = "transaction_aborted"
+				}
+				require.Equal(t, wantCode, brokerErr.Code)
 				verify := func(addrs []string) {
 					admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, RequestTimeoutMS: 3000, MaxRetries: 5, RetryBackoffMS: 100})
 					require.NoError(t, err)
