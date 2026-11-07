@@ -66,5 +66,39 @@ append/rotation/retention. The Linux lineage and raw-frame race suite passed in
 15.099 seconds, including the added growing-tail check and stale-cursor rejection
 after truncate/reappend. These local measurements do not establish a new cluster
 recovery cost or availability SLO. The endpoint microcase improvement must not
-be applied as a ratio to the earlier hosted recovery measurement; the interrupted
-mixed-load fixture must still measure that workload independently.
+be applied as a ratio to the earlier hosted recovery measurement. The independent
+cluster measurement follows.
+
+## Hosted interrupted-recovery measurement
+
+The three-broker `TestRecoveryBudgetInterruptedMixedLoad` run on implementation
+`1f6c7c7` passed on 2026-11-07 UTC. Its receiver was killed after a durable catch-up
+append, restarted, and recovered after the source changed. All four backlog topics
+and all 2,762 acknowledged foreground records were verified. During the 50-second
+foreground window, produce, consume and offset commit each completed 2,762
+operations with no recorded errors. The small partition regained exact ISR in
+12,100 ms. These observations are not a production latency or availability SLO.
+
+The restarted receiver's **pre-readback** lineage counters were 102,175,586
+logical read bytes, 102,483,962 canonical hash bytes and 12,278 decoded frames
+for 34,686,641 backlog payload bytes. This is about 2.95 logical read bytes per
+payload byte. The earlier baseline run at `47967ab` measured 419,214,612 receiver
+logical read bytes for the same backlog payload volume, about 12.09 per byte.
+The observed read reduction is about 76%; these separate fault runs are not a
+controlled throughput benchmark. Scheduling, probe counts and retained cache
+state can differ. The deterministic work regressions establish the narrower
+no-overlapping-prefix guarantee described above.
+
+The killed receiver's separate work snapshot recorded 923,326 transferred bytes
+and 479 lineage read bytes before exit. Its counters are not a continuation of
+the restarted receiver's counters. Sender counters, catch-up transfer bytes,
+retained-page reads, filesystem I/O and verification reads remain distinct.
+The initial process started at `2026-11-07T15:55:35.100979018Z`; the restarted
+receiver's exported process start was `1794066946.3` seconds since the epoch.
+
+Cold reconstruction, cache eviction, invalidation after replacement and full
+retained-history replay still require real work. A lost quorum deliberately
+stops acknowledged progress. Global consumer replay admission and in-flight OS
+reads/fsyncs remain availability limits; this optimization changes none of those
+safety boundaries. Capacity planning must use recovery bytes, work and elapsed
+time at the intended data size, alongside foreground error/latency measurements.
