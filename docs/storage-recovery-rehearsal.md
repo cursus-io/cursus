@@ -128,6 +128,20 @@ rehearsal stopped at an overly strict cross-member image equality assertion; it
 was corrected to pin and compare each member's own image before the successful
 run. No mixed-version upgrade was exercised.
 
+The subsequent coordinated-upgrade run passed in 122.49 total test seconds.
+It wrote with source `c7384a5` and restored with candidate checkout `80ee305`
+(the hosted test merge of `22e83e1` into `c7384a5`), image
+`sha256:ebd42a4bde6d608687a762a46dc9d23f7bef6d5d1c1edaef41deb085a3e40ec9`.
+Its complete backup contained 157,699,842 bytes. Source/copy/clone inventories
+matched; candidate recovery, stable ISR and readback took 69.453 seconds and
+verified 33 acknowledged records and consumer offset 13. The original backup
+digests remained unchanged. The same-image case in that run also passed in
+132.09 total seconds, with 157,699,848 copied bytes and a 70.054-second recovery
+and verification window. Both Linux test drivers used the race detector; broker
+images were ordinary production builds. This validates
+the recorded compatible revision change, not mixed-version operation, historical
+format migrations, or an in-place downgrade.
+
 ## Reproduction
 
 ```sh
