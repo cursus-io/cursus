@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// armRecoveryBoundary arms one deterministic boundary in the selected test broker.
 func armRecoveryBoundary(t *testing.T, node int, point, key string) string {
 	t.Helper()
 	path := "/run/cursus-e2e-faults/" + point + "/" + key
@@ -16,6 +17,7 @@ func armRecoveryBoundary(t *testing.T, node int, point, key string) string {
 	return path
 }
 
+// waitRecoveryBoundary waits for and records proof that the armed boundary was entered.
 func waitRecoveryBoundary(t *testing.T, node int, path string, journal *ackFaultJournal) {
 	t.Helper()
 	require.NoError(t, eventually(t, "fault boundary entered", 30*time.Second, func() (bool, string, error) {
@@ -25,6 +27,7 @@ func waitRecoveryBoundary(t *testing.T, node int, path string, journal *ackFault
 	journal.record("fault_boundary_entered", map[string]any{"node": node, "path": path})
 }
 
+// TestAcknowledgedWritesSurviveCommitApplicationCrash recovers acknowledged data after crashing a follower before watermark application and removing its leader.
 func TestAcknowledgedWritesSurviveCommitApplicationCrash(t *testing.T) {
 	if os.Getenv("RUN_E2E_RECOVERY_BOUNDARIES") != "1" {
 		t.Skip("set RUN_E2E_RECOVERY_BOUNDARIES=1 for deterministic recovery faults")

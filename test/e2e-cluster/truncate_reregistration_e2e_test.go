@@ -22,6 +22,7 @@ func TestTruncateReregistrationConvergesDelayedFollower(t *testing.T) {
 	}
 }
 
+// runTruncateReregistrationRecovery checks a delayed follower preserves the new registration after replay or snapshot restore of an old truncate.
 func runTruncateReregistrationRecovery(t *testing.T, snapshot bool) {
 	files := []string{composeFile}
 	if snapshot {

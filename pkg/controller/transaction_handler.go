@@ -536,6 +536,7 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 	return fmt.Sprintf("OK transactional_id=%s staged_offsets=%d", txnID, len(ops))
 }
 
+// handleEndTxn validates the producer and drives the durable transaction decision and marker sequence.
 func (ch *CommandHandler) handleEndTxn(cmd string, contexts ...*ClientContext) string {
 	ctx := firstClientContext(contexts)
 	args := parseKeyValueArgs(cmd[len("END_TXN "):])

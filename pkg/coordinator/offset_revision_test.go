@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestOffsetSnapshotLostReplyDoesNotReuseRevision replays changed writes after a lost reply without revision collisions or premature offset visibility.
 func TestOffsetSnapshotLostReplyDoesNotReuseRevision(t *testing.T) {
 	for _, mode := range []string{"single", "bulk", "cooperative", "multi-topic", "transaction"} {
 		for _, replace := range []bool{false, true} {
@@ -84,6 +85,7 @@ func TestOffsetSnapshotLostReplyDoesNotReuseRevision(t *testing.T) {
 	}
 }
 
+// TestOffsetRevisionOverflowAndNewRegistration rejects exhausted revisions without appending and resets attempt history for a new epoch.
 func TestOffsetRevisionOverflowAndNewRegistration(t *testing.T) {
 	c, _, records := runtimeCooperativeFixture(t, 1)
 	group := c.GetGroup("workers")
@@ -102,6 +104,7 @@ func TestOffsetRevisionOverflowAndNewRegistration(t *testing.T) {
 	require.Equal(t, uint64(1), (*records)[len(*records)-1].Revision)
 }
 
+// TestOffsetAttemptRevisionSurvivesStrictAndLegacyReplay keeps uncertain attempt floors across in-process replay while retaining acknowledged offsets.
 func TestOffsetAttemptRevisionSurvivesStrictAndLegacyReplay(t *testing.T) {
 	for _, strict := range []bool{false, true} {
 		name := "legacy"

@@ -64,6 +64,7 @@ func readRecoveryHistory(t *testing.T, history string, node, leader, epoch int, 
 	return readRecoveryHistoryFrom(t, history, node, node%3+1, leader, epoch, end, 30*time.Second)
 }
 
+// readRecoveryHistoryFrom reads retained history from the selected receiver under the supplied leader fence and deadline.
 func readRecoveryHistoryFrom(t *testing.T, history string, node, receiver, leader, epoch int, end uint64, timeout time.Duration) []types.Message {
 	t.Helper()
 	request := fsm.ReplicaCatchupRequest{

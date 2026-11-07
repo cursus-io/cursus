@@ -153,6 +153,7 @@ func waitAckFaultState(t *testing.T, topic string, nodes []int, excluded string,
 	return waitAckFaultStateWithin(t, topic, nodes, excluded, expectedISR, 2*clusterReadyTimeout)
 }
 
+// waitAckFaultStateWithin waits within the supplied deadline for a stable leader, ISR, and committed watermark.
 func waitAckFaultStateWithin(t *testing.T, topic string, nodes []int, excluded string, expectedISR int, timeout time.Duration) ackFaultPartition {
 	t.Helper()
 	var result ackFaultPartition

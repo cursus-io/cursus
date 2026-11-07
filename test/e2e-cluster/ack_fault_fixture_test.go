@@ -115,6 +115,7 @@ func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 	return newAckFaultClusterMode(t, topic, false)
 }
 
+// newAckFaultClusterMode starts an isolated three-broker fixture with optional explicitly gated fault hooks.
 func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTestContext {
 	t.Helper()
 	require.Empty(t, os.Getenv("CURSUS_CLEANUP_PORT_OFFSET"), "cleanup fixture overrides cannot be combined")

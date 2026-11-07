@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// Pause waits at an armed test boundary until explicit release or timeout.
 func Pause(point, key string) error {
 	path, armed, err := consume(point, key)
 	if err != nil || !armed {
@@ -33,6 +34,7 @@ func Pause(point, key string) error {
 	}
 }
 
+// Fail returns the injected error once for an armed test boundary.
 func Fail(point, key string, failure error) error {
 	_, armed, err := consume(point, key)
 	if err != nil || !armed {
@@ -41,14 +43,17 @@ func Fail(point, key string, failure error) error {
 	return fmt.Errorf("injected %s/%s: %w", point, key, failure)
 }
 
+// FailOffset targets an injected failure at one topic, partition, and offset.
 func FailOffset(point, topic string, partition int, offset uint64, failure error) error {
 	return Fail(point, fmt.Sprintf("%s-%d-%d", topic, partition, offset), failure)
 }
 
+// PauseOffset targets a pause at one topic, partition, and offset.
 func PauseOffset(point, topic string, partition int, offset uint64) error {
 	return Pause(point, fmt.Sprintf("%s-%d-%d", topic, partition, offset))
 }
 
+// consume atomically claims a fault sentinel only when the runtime test gate is enabled.
 func consume(point, key string) (string, bool, error) {
 	if os.Getenv("CURSUS_E2E_FAULTS") != "1" {
 		return "", false, nil

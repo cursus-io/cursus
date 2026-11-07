@@ -41,3 +41,8 @@ does not repair previously conflicting records.
 Local cooperative E2E reruns encountered repeated Wire timeouts and member
 fencing before reaching the CI failure's rolling-restart phase. They do not
 establish end-to-end success for this fix; hosted CI remains required.
+
+On commit `39ac3f9`, hosted coordinator race/coverage tests and cooperative E2E
+passed. The E2E completed coordinator failover, coordinator restart, and all
+three rolling broker restarts, delivering 464 records with zero duplicate
+deliveries. This hosted result does not erase the local transport/fencing failures.

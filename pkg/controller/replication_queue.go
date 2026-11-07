@@ -327,6 +327,8 @@ func (l *partitionReplicationLane) run() {
 	}
 }
 
+// process replicates under the task's ownership fence and resolves its commit
+// before completion; an uncertain outcome retains the tail for reconciliation.
 func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 	backoff := 25 * time.Millisecond
 	failures := uint64(0)
@@ -446,6 +448,7 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 				if err != nil && !commitResult.accepted {
 					// The command may still apply. Neither a timeout nor a new
 					// fence proves that the old local watermark is authoritative.
+					util.Error("partition commit outcome unresolved; tail preserved topic=%s partition=%d ack_mode=%s commit_hwm=%d error=%v", task.topic, task.partition, task.ackMode, task.commitHWM, err)
 					if task.partitionRef != nil {
 						task.partitionRef.MarkReconciliationPending(err)
 					}

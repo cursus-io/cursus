@@ -170,6 +170,7 @@ func (d *DiskHandler) WriteBatchSync(batch []types.DiskMessage) error {
 	return d.writeBatch(batch, true)
 }
 
+// writeBatch writes an ordered batch and optionally synchronizes it before reporting completion.
 func (d *DiskHandler) writeBatch(batch []types.DiskMessage, syncData bool) error {
 	if len(batch) == 0 {
 		return nil

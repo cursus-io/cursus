@@ -18,6 +18,7 @@ type identityTestStream struct {
 	accepts atomic.Int64
 }
 
+// Accept counts accepted connections to detect reuse of a misdirected stream.
 func (s *identityTestStream) Accept() (net.Conn, error) {
 	c, e := s.Listener.Accept()
 	if e == nil {
@@ -25,10 +26,13 @@ func (s *identityTestStream) Accept() (net.Conn, error) {
 	}
 	return c, e
 }
+
+// Dial connects the test transport to its requested peer address.
 func (s *identityTestStream) Dial(a raft.ServerAddress, d time.Duration) (net.Conn, error) {
 	return net.DialTimeout("tcp", string(a), d)
 }
 
+// identityTestPeer serves Raft test RPCs with a mutable response identity.
 func identityTestPeer(t *testing.T, id *atomic.Value) (*raft.NetworkTransport, *identityTestStream) {
 	t.Helper()
 	l, e := net.Listen("tcp", "127.0.0.1:0")
@@ -66,6 +70,7 @@ func identityTestPeer(t *testing.T, id *atomic.Value) (*raft.NetworkTransport, *
 	return peer, s
 }
 
+// TestRaftTransportRequiresTargetIdentity rejects wrong-voter responses on direct and pipelined RPCs.
 func TestRaftTransportRequiresTargetIdentity(t *testing.T) {
 	for _, id := range []string{"expected", "different", ""} {
 		t.Run("response-"+id, func(t *testing.T) {
@@ -129,6 +134,7 @@ func TestRaftTransportRequiresTargetIdentity(t *testing.T) {
 	}
 }
 
+// TestRaftTransportPreservesHeaderlessSnapshotAndTransfer preserves the headerless snapshot and transfer responses used by Raft 1.7.3.
 func TestRaftTransportPreservesHeaderlessSnapshotAndTransfer(t *testing.T) {
 	var identity atomic.Value
 	identity.Store("expected")
@@ -141,6 +147,7 @@ func TestRaftTransportPreservesHeaderlessSnapshotAndTransfer(t *testing.T) {
 	require.NoError(t, client.TimeoutNow("expected", peer.LocalAddr(), &raft.TimeoutNowRequest{RPCHeader: header}, &raft.TimeoutNowResponse{}))
 }
 
+// TestRaftTransportDropsMisdirectedPooledConnection requires a fresh connection after an address resolves to the wrong voter.
 func TestRaftTransportDropsMisdirectedPooledConnection(t *testing.T) {
 	var identity atomic.Value
 	identity.Store("wrong")

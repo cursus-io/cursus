@@ -612,6 +612,7 @@ type partitionCommitCommand struct {
 	LifecycleEpoch uint64                       `json:"lifecycle_epoch,omitempty"`
 }
 
+// applyPartitionCommitCommand decodes and applies the committed partition watermark, with a test-only pre-apply boundary.
 func (f *BrokerFSM) applyPartitionCommitCommand(jsonData string) interface{} {
 	var cmd partitionCommitCommand
 	if err := json.Unmarshal([]byte(jsonData), &cmd); err != nil {

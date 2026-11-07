@@ -69,6 +69,7 @@ func (c *Coordinator) commitOffsetForGroupLocked(gm *GroupMetadata, groupName, t
 	return c.commitAuthorizedOffsetForGroupLocked(gm, groupName, topic, partition, offset)
 }
 
+// commitAuthorizedOffsetForGroupLocked persists one authorized offset and publishes it only after acknowledgement; gm.mu must be held.
 func (c *Coordinator) commitAuthorizedOffsetForGroupLocked(gm *GroupMetadata, groupName, topic string, partition int, offset uint64) error {
 	if err := reservedOffsetError(gm, groupName, topic, partition); err != nil {
 		return err
@@ -184,6 +185,7 @@ func (c *Coordinator) commitOffsetsBulkForGroupLocked(gm *GroupMetadata, groupNa
 	return c.commitAuthorizedOffsetsBulkForGroupLocked(gm, groupName, topic, offsets)
 }
 
+// commitAuthorizedOffsetsBulkForGroupLocked persists a merged topic snapshot before publishing acknowledged offsets; gm.mu must be held.
 func (c *Coordinator) commitAuthorizedOffsetsBulkForGroupLocked(gm *GroupMetadata, groupName, topic string, offsets []OffsetItem) error {
 	if err := validateOffsetBatchLocked(gm, groupName, topic, offsets); err != nil {
 		return err
@@ -264,6 +266,7 @@ func (c *Coordinator) ValidateAndCommitTopicOffsetsBulkForEpoch(groupName, membe
 	return c.validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID, generation, registrationEpoch, offsets)
 }
 
+// validateAndCommitTopicOffsetsBulkForEpoch fences stale members and commits each topic snapshot without reusing uncertain revisions.
 func (c *Coordinator) validateAndCommitTopicOffsetsBulkForEpoch(groupName, memberID string, generation int, registrationEpoch uint64, offsets map[string][]OffsetItem) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

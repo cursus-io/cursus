@@ -109,6 +109,9 @@ lifecycle epoch 2, and replica offset 1 after convergence. Both Raft replay and
 snapshot restore must pass. A transient readiness string is not additional
 recovery work, and this test makes no Kafka-equivalence or I/O-efficiency claim.
 
-The updated Raft-replay path passed locally, including the explicit revision,
-epoch, replica offset, membership, and full-ISR assertions. Snapshot restore and
-the complete hosted cleanup job remain required validation.
+The updated Raft-replay path passed twice locally and snapshot restore passed
+once, including the explicit revision, epoch, replica offset, membership, and
+full-ISR assertions. The second local snapshot run failed with `member_not_found`
+during the initial member leave after transport delays, before the delayed-replay
+fault was armed. On commit `39ac3f9`, the complete hosted cleanup fault-recovery
+job passed both recovery modes. Local repetition is therefore not uniformly green.

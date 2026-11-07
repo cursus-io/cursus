@@ -1100,6 +1100,7 @@ func (c *Coordinator) importStateValidated(state map[string]*GroupStateSnapshot)
 	return c.importStateLocked(state)
 }
 
+// importStateLocked replaces coordinator state while retaining same-epoch runtime attempt floors; c.mu must be held.
 func (c *Coordinator) importStateLocked(state map[string]*GroupStateSnapshot) error {
 	c.stateImportGeneration++
 

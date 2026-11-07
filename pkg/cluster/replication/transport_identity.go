@@ -12,6 +12,7 @@ import (
 // RPCHeader.ID is already present in the current Raft protocol; no wire changes.
 type identityRaftTransport struct{ *raft.NetworkTransport }
 
+// checkRaftResponseID rejects evidence from an empty or different voter identity.
 func checkRaftResponseID(id raft.ServerID, header raft.RPCHeader) error {
 	if id == "" || string(header.ID) != string(id) {
 		return fmt.Errorf("raft response identity mismatch: requested=%q received=%q", id, header.ID)
@@ -19,6 +20,7 @@ func checkRaftResponseID(id raft.ServerID, header raft.RPCHeader) error {
 	return nil
 }
 
+// checked preserves transport errors and evicts pooled streams after a voter mismatch.
 func (t *identityRaftTransport) checked(id raft.ServerID, header raft.RPCHeader, err error) error {
 	if err != nil {
 		return err
@@ -31,14 +33,19 @@ func (t *identityRaftTransport) checked(id raft.ServerID, header raft.RPCHeader,
 	return err
 }
 
+// AppendEntries wraps append completion so evidence is checked against the requested voter.
 func (t *identityRaftTransport) AppendEntries(id raft.ServerID, addr raft.ServerAddress, req *raft.AppendEntriesRequest, res *raft.AppendEntriesResponse) error {
 	err := t.NetworkTransport.AppendEntries(id, addr, req, res)
 	return t.checked(id, res.RPCHeader, err)
 }
+
+// RequestVote validates the responding voter before exposing its vote.
 func (t *identityRaftTransport) RequestVote(id raft.ServerID, addr raft.ServerAddress, req *raft.RequestVoteRequest, res *raft.RequestVoteResponse) error {
 	err := t.NetworkTransport.RequestVote(id, addr, req, res)
 	return t.checked(id, res.RPCHeader, err)
 }
+
+// RequestPreVote validates the responding voter before exposing its pre-vote.
 func (t *identityRaftTransport) RequestPreVote(id raft.ServerID, addr raft.ServerAddress, req *raft.RequestPreVoteRequest, res *raft.RequestPreVoteResponse) error {
 	err := t.NetworkTransport.RequestPreVote(id, addr, req, res)
 	return t.checked(id, res.RPCHeader, err)
@@ -48,6 +55,7 @@ func (t *identityRaftTransport) RequestPreVote(id raft.ServerID, addr raft.Serve
 // Raft 1.7.3 sends no RPCHeader in those responses. A snapshot contains an already
 // committed prefix; subsequent appends/votes still require the expected voter.
 
+// AppendEntriesPipeline wraps a pipeline so both futures and completion notifications validate voter identity.
 func (t *identityRaftTransport) AppendEntriesPipeline(id raft.ServerID, addr raft.ServerAddress) (raft.AppendPipeline, error) {
 	inner, err := t.NetworkTransport.AppendEntriesPipeline(id, addr)
 	if err != nil {
@@ -70,6 +78,7 @@ type identityRaftPipeline struct {
 	futures                   map[raft.AppendFuture]*identityRaftFuture
 }
 
+// wrap shares one checked future between submission and completion, regardless of arrival order.
 func (p *identityRaftPipeline) wrap(f raft.AppendFuture) *identityRaftFuture {
 	// Each underlying future arrives exactly twice: once from AppendEntries
 	// and once from Consumer, in either order. Share its sync.Once because
@@ -87,6 +96,8 @@ func (p *identityRaftPipeline) wrap(f raft.AppendFuture) *identityRaftFuture {
 	p.futures[f] = checked
 	return checked
 }
+
+// AppendEntries wraps append completion so evidence is checked against the requested voter.
 func (p *identityRaftPipeline) AppendEntries(req *raft.AppendEntriesRequest, res *raft.AppendEntriesResponse) (raft.AppendFuture, error) {
 	f, err := p.inner.AppendEntries(req, res)
 	if err != nil {
@@ -94,11 +105,17 @@ func (p *identityRaftPipeline) AppendEntries(req *raft.AppendEntriesRequest, res
 	}
 	return p.wrap(f), nil
 }
+
+// Consumer returns the stream of identity-checked append completions.
 func (p *identityRaftPipeline) Consumer() <-chan raft.AppendFuture { return p.completed }
+
+// Close stops the pipeline and joins its relay exactly once.
 func (p *identityRaftPipeline) Close() error {
 	p.closeOnce.Do(func() { close(p.stop); p.closeErr = p.inner.Close(); <-p.exited })
 	return p.closeErr
 }
+
+// relay validates completed futures before forwarding them, while allowing shutdown to interrupt delivery.
 func (p *identityRaftPipeline) relay() {
 	defer close(p.exited)
 	for {
@@ -128,6 +145,7 @@ type identityRaftFuture struct {
 	response raft.AppendEntriesResponse
 }
 
+// Error resolves the underlying future once and masks untrusted responses on failure.
 func (f *identityRaftFuture) Error() error {
 	f.once.Do(func() {
 		f.err = f.AppendFuture.Error()
@@ -146,6 +164,8 @@ func (f *identityRaftFuture) Error() error {
 	})
 	return f.err
 }
+
+// Response returns the validated response or a failed response that cannot count as replication evidence.
 func (f *identityRaftFuture) Response() *raft.AppendEntriesResponse {
 	_ = f.Error()
 	return &f.response

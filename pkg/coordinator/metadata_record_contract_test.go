@@ -34,6 +34,7 @@ func TestApplyOffsetUpdateFromFSMInitializesAndFencesReplayState(t *testing.T) {
 	require.ErrorContains(t, c.ApplyOffsetUpdateFromFSM("blank", "payments", []OffsetItem{{Partition: 1, Offset: 6}}), "offset regression")
 }
 
+// TestMaterializeCommittedTransactionOffsetsIsAtomic keeps transaction offsets invisible until all topic snapshots succeed.
 func TestMaterializeCommittedTransactionOffsetsIsAtomic(t *testing.T) {
 	c := NewCoordinator(context.Background(), config.DefaultConfig(), &DummyPublisher{})
 	t.Cleanup(c.Stop)

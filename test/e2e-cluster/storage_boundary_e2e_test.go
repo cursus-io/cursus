@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestAcknowledgedWritesSurviveStorageErrors verifies acknowledged history survives injected append or sync failure and broker restart.
 func TestAcknowledgedWritesSurviveStorageErrors(t *testing.T) {
 	if os.Getenv("RUN_E2E_RECOVERY_BOUNDARIES") != "1" {
 		t.Skip("set RUN_E2E_RECOVERY_BOUNDARIES=1 for deterministic recovery faults")

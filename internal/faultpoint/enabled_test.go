@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestPauseRequiresGateAndExplicitRelease checks runtime gating, one-shot activation, and explicit release.
 func TestPauseRequiresGateAndExplicitRelease(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CURSUS_E2E_FAULT_ROOT", root)

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// armDiskFault arms one storage operation fault in an isolated temporary sentinel directory.
 func armDiskFault(t *testing.T, point, key string) string {
 	t.Helper()
 	root := t.TempDir()
@@ -24,6 +25,7 @@ func armDiskFault(t *testing.T, point, key string) string {
 	return path
 }
 
+// TestStorageOperationFailurePreservesAcknowledgedPrefix checks append and sync failures preserve the previously acknowledged prefix after reopen.
 func TestStorageOperationFailurePreservesAcknowledgedPrefix(t *testing.T) {
 	writers := map[string]func(*DiskHandler, types.Message) error{
 		"direct": func(d *DiskHandler, message types.Message) error { return d.WriteDirect("orders", 0, message) },
@@ -76,6 +78,7 @@ func TestStorageOperationFailurePreservesAcknowledgedPrefix(t *testing.T) {
 	}
 }
 
+// TestCompactionRenameFailureRecoversPublishedLog checks failed compaction publication leaves a recoverable acknowledged log.
 func TestCompactionRenameFailureRecoversPublishedLog(t *testing.T) {
 	cfg := compactionTestConfig(t)
 	d, err := NewDiskHandler(cfg, "orders", 0)

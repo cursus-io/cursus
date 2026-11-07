@@ -29,6 +29,7 @@ func (e raftCommitExecutor) Commit(task partitionReplicationTask) (partitionComm
 	return e.commit.Commit(task)
 }
 
+// TestUncertainPartitionCommitRetriesRaftWithoutRewritingLog retries the metadata commit while verifying unchanged partition log bytes.
 func TestUncertainPartitionCommitRetriesRaftWithoutRewritingLog(t *testing.T) {
 	h, manager, base := newDistributedAckTestHandler(t, 2)
 	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -71,6 +72,7 @@ func TestUncertainPartitionCommitRetriesRaftWithoutRewritingLog(t *testing.T) {
 	}
 }
 
+// Commit records each retry and simulates lost replies until explicitly released.
 func (e *uncertainCommitExecutor) Commit(task partitionReplicationTask) (partitionCommitResult, error) {
 	select {
 	case e.attempts <- task:
@@ -84,6 +86,7 @@ func (e *uncertainCommitExecutor) Commit(task partitionReplicationTask) (partiti
 	}
 }
 
+// TestUncertainPartitionCommitPreservesOwnershipAndHistory checks unresolved commits retain history and keep ownership fenced.
 func TestUncertainPartitionCommitPreservesOwnershipAndHistory(t *testing.T) {
 	for _, outcome := range []string{"delayed-commit", "fenced", "shutdown", "unresolved"} {
 		t.Run(outcome, func(t *testing.T) {

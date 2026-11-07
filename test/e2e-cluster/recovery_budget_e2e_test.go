@@ -39,6 +39,7 @@ func TestRecoveryBudgetMixedLoad(t *testing.T) {
 	runRecoveryBudgetMixedLoad(t, ctx, prefix, output, false)
 }
 
+// TestRecoveryBudgetInterruptedMixedLoad measures recovery work and foreground progress across an interrupted isolated-cluster recovery.
 func TestRecoveryBudgetInterruptedMixedLoad(t *testing.T) {
 	if os.Getenv("RUN_E2E_RECOVERY_BOUNDARIES") != "1" {
 		t.Skip("set RUN_E2E_RECOVERY_BOUNDARIES=1 for deterministic recovery faults")
@@ -53,6 +54,7 @@ func TestRecoveryBudgetInterruptedMixedLoad(t *testing.T) {
 	runRecoveryBudgetMixedLoad(t, ctx, ackFaultProject+"-", output, true)
 }
 
+// runRecoveryBudgetMixedLoad runs concurrent produce, consume, and offset commits while checking recovered data and recording work counters.
 func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, output string, interrupt bool) {
 	t.Helper()
 	addrs := ctx.GetBrokerAddrs()
@@ -316,10 +318,12 @@ func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, o
 	}
 }
 
+// recoveryBudgetPayload derives deterministic payload identity from the topic and offset.
 func recoveryBudgetPayload(topic string, offset uint64) string {
 	return fmt.Sprintf("%s-%05d-", topic, offset) + strings.Repeat("x", 8192)
 }
 
+// recoveryBudgetResources collects broker resource and logical recovery-work measurements.
 func recoveryBudgetResources(t *testing.T, prefix string, nodes int) map[string]string {
 	t.Helper()
 	resources := map[string]string{}

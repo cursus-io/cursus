@@ -49,6 +49,7 @@ type ErrorResponse struct {
 
 var errorRegistry = buildErrorRegistry()
 
+// buildErrorRegistry defines stable protocol error categories and retryability, including injected boundary failures.
 func buildErrorRegistry() map[string]ErrorClassification {
 	registry := make(map[string]ErrorClassification)
 	register := func(class ErrorClass, retryable bool, codes ...string) {

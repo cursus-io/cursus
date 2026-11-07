@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestTransactionDecisionsSurviveCoordinatorBoundaries checks durable transaction decisions across prepare, marker, and decision crash boundaries.
 func TestTransactionDecisionsSurviveCoordinatorBoundaries(t *testing.T) {
 	if os.Getenv("RUN_E2E_RECOVERY_BOUNDARIES") != "1" {
 		t.Skip("set RUN_E2E_RECOVERY_BOUNDARIES=1 for deterministic recovery faults")
