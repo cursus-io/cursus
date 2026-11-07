@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
@@ -66,6 +67,7 @@ func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, o
 		require.NoError(t, admin.PublishIdempotentToPartition(name, "seed", 0, 1, 0, "seed", "all", true))
 	}
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "recovery budget fixture")
+	var backlogPayloadBytes int64
 	for i, name := range names {
 		leader := 1
 		if i >= 2 {
@@ -94,6 +96,7 @@ func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, o
 			messages := make([]types.Message, min(128, count-start))
 			for j := range messages {
 				messages[j] = types.Message{ProducerID: "seed", SeqNum: uint64(start + j + 2), Payload: recoveryBudgetPayload(name, uint64(start+j+1))}
+				backlogPayloadBytes += int64(len(messages[j].Payload))
 			}
 			payload, err := util.EncodeBatchMessages(name, 0, "all", true, messages)
 			require.NoError(t, err)
@@ -262,13 +265,26 @@ func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, o
 		for node := 1; node <= 2; node++ {
 			ackFaultDocker(t, "exec", ackFaultContainer(node), "rm", "-f", "/run/cursus-e2e-faults/recovery-source/a-unresponsive", "/run/cursus-e2e-faults/recovery-source/b-slow")
 		}
+		// The fixture uses default quotas: its >32 MiB backlog alone needs
+		// over 64 seconds at 512 KiB/s. The generic 60-second metadata wait
+		// cannot cover that transfer plus an in-flight stall/backoff. Allow
+		// twice payload bytes for wire/proof overhead and one shared control
+		// allowance; keep the 50-second foreground assertions unchanged.
+		rate := config.DefaultRecoveryConfig().SourceBytesPerSecond
+		healTimeout := 2*clusterReadyTimeout + time.Duration((2*backlogPayloadBytes+rate-1)/rate)*time.Second
+		healDeadline := time.Now().Add(healTimeout)
+		journal.record("post_heal_budget", map[string]any{"payload_bytes": backlogPayloadBytes, "wire_allowance_bytes": 2 * backlogPayloadBytes, "source_bytes_per_second": rate, "timeout_ms": healTimeout.Milliseconds()})
 		for _, name := range names {
-			waitAckFaultState(t, name, []int{1, 2, 3}, "", 3)
+			remaining := time.Until(healDeadline)
+			require.Positive(t, remaining, "shared post-heal recovery deadline exhausted")
+			waitAckFaultStateWithin(t, name, []int{1, 2, 3}, "", 3, remaining)
 		}
 		captureAckFaultMetrics(t, journal, "interrupted-recovery-before-readback")
 		for i, name := range names {
 			state := waitAckFaultState(t, name, []int{1, 2, 3}, "", 3)
-			records := readRecoveryHistory(t, name, 3, coordinatorNode(t, state.Leader), state.LeaderEpoch, state.CommittedHWM)
+			// Raw verification is also charged to source quotas. Reuse the
+			// byte-sized allowance, not the small-fixture 30-second reader.
+			records := readRecoveryHistoryFrom(t, name, 3, 1, coordinatorNode(t, state.Leader), state.LeaderEpoch, state.CommittedHWM, healTimeout)
 			require.Len(t, records, []int{2, 129, 4097, 3}[i])
 			for offset, record := range records {
 				require.Equal(t, uint64(offset), record.Offset)
@@ -285,7 +301,7 @@ func runRecoveryBudgetMixedLoad(t *testing.T, ctx *ClusterTestContext, prefix, o
 		liveState := waitAckFaultState(t, live, []int{1, 2}, "", 2)
 		require.Equal(t, seq, liveState.CommittedHWM)
 		for node := 1; node <= 2; node++ {
-			records := readRecoveryHistory(t, live, node, coordinatorNode(t, liveState.Leader), liveState.LeaderEpoch, liveState.CommittedHWM)
+			records := readRecoveryHistoryFrom(t, live, node, 3-node, coordinatorNode(t, liveState.Leader), liveState.LeaderEpoch, liveState.CommittedHWM, 30*time.Second)
 			require.Len(t, records, int(seq))
 			for offset, record := range records {
 				require.Equal(t, uint64(offset), record.Offset)

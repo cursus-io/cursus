@@ -74,9 +74,21 @@ Use dedicated containers/volumes and retain evidence in the external JSONL journ
 
 ## Implementation status
 
-The four scenarios are implemented. **The interrupted mixed-load regression is
-failing; this suite is not evidence of Kafka-equivalent reliability.** No assertion
-was removed, skipped or converted into an expected failure to obtain a green run.
+The four scenarios are implemented. The interrupted mixed-load regression now
+passes after the uncertain-commit correction and byte-sized recovery/readback
+deadlines described in [uncertain-partition-commit.md](uncertain-partition-commit.md).
+This suite is not evidence of Kafka-equivalent reliability. The foreground
+zero-error/progress requirements and complete history checks remain mandatory.
+The final sweep also exposed a separate Raft peer-identity failure after address
+reuse. Its evidence, Kafka comparison and transport correction are recorded in
+[raft-peer-response-identity.md](raft-peer-response-identity.md).
+
+The combined local sweep passed all six required top-level scenarios (the two
+original acknowledged-write tests plus these four follow-ups) and all eight
+transaction/storage subtests, with no failures or skips. The native Windows
+driver exercised isolated Linux Docker brokers. Linux race-detector runs were
+separate package checks: controller 359.510 seconds and Raft replication 22.830
+seconds; final changed-package static analysis reported zero issues.
 
 | Check | Local result on 2026-11-07 |
 | --- | --- |
@@ -84,16 +96,17 @@ was removed, skipped or converted into an expected failure to obtain a green run
 | Transaction coordinator crashes | All six commit/abort × prepare/markers/final-decision cases passed. Two output topics, idempotent decision retry, opposite-decision rejection, input offset 1 versus 0, and committed-only SDK reads through survivors and the restarted node. |
 | Leader storage errors | ENOSPC before append and EIO before fsync passed. Both rejected the failed write and immediate retry; after leader replacement and retained-volume restart the history oracle verified all 9 records on three replicas and the public consumer. |
 | Storage operation/reopen tests | Direct write, synchronous batch and queued synchronous append × ENOSPC/EIO passed with the Linux race detector. An EIO at index rename after compacted-log replacement also passed two successive reopen/repair checks. |
-| Interrupted recovery with foreground traffic | Fails the unchanged zero-error/progress requirements. Large receiver crash and source change are observed, small recovery progresses, but consumer offset commits can remain unavailable. See the finding below. |
+| Interrupted recovery with foreground traffic | Passed in 288.54 seconds with both corrections. All 123 produce, consume and offset commits succeeded during the unchanged 50-second window; small ISR recovery took 15,687 ms. Full post-heal readback verified every recovery topic, both foreground replicas and the final committed consumer offset. |
 
 Normal-build disk, partition-commit and transaction regressions passed with the
 Linux race detector, as did tagged faultpoint/storage/recovery-counter tests.
 The changed-package static check reported zero issues. Workflow YAML parsed.
 Hosted CI has not run: changes and commits remain local. The new CI job requires
 explicit passes for all four scenarios and all eight transaction/storage
-subtests, so the outstanding mixed-load failure will block it.
+subtests. The full controller package also passes with the Linux race detector
+after the uncertain-commit correction.
 
-## Outstanding finding: consumer metadata during interrupted recovery
+## Original failure evidence and correction
 
 The fixture seeds 4,097 large-topic records (4,096 uniquely identified payloads
 of more than 8 KiB plus a seed), alongside slow, stalled and small topics.
@@ -103,7 +116,7 @@ broker 1, and restarts broker 3. Healthy-topic produce, consume and offset commi
 run in a 50-second window. The test counts **successful** offset commits separately
 from attempts and checks complete record identities after healing source stalls.
 
-Repeated runs exposed availability and bounded-recovery failures:
+Before the correction, repeated runs exposed availability and bounded-recovery failures:
 
 - One run consumed 147 records, with 11 failed offset commits; small-replica ISR
   recovery was observed at 11,682 ms.
@@ -112,7 +125,7 @@ Repeated runs exposed availability and bounded-recovery failures:
   4,304 ms through 50,221 ms; small-replica ISR recovery was observed at 15,783 ms.
   Broker logs showed `__consumer_offsets-2` committed HWM 14 ahead of the current
   leader's local LEO 13. These are fixture observations, not production SLOs.
-- The final run consumed 127 records, with 110 successful and 17 failed offset
+- The last pre-fix run consumed 127 records, with 110 successful and 17 failed offset
   commits (`coordinator_not_available`, `replication_unavailable` and
   `insufficient_in_sync_replicas`). Produce and consume had no errors. Small ISR
   recovery completed at 17,791 ms. The current leader's internal offset log had
@@ -128,14 +141,20 @@ not total recovery cost. JSONL also retains its container start time and `/proc`
 I/O; replacement-process totals must not be subtracted from the old process.
 Sender/receiver transfer counters must not be summed as a one-way network total.
 
-This does **not** prove that an acknowledged offset was lost. The offset response
-ambiguity, the committed-HWM/local-tail mismatch and eventual convergence need
-to be resolved together. A suspect path is replication-task error completion
-reconciling against a local HWM while a Raft commit outcome is still uncertain;
-this is a hypothesis, not an established root cause or an implemented fix.
-A follow-up fix needs a deterministic uncertain-commit regression before changing
-tail rollback or coordinator admission. Preserve fencing and committed history;
-do not solve the availability symptom by accepting writes on an unrecovered log.
+These observations alone did **not** prove that an acknowledged offset was lost.
+A subsequent deterministic regression reproduced unsafe tail rollback after a
+lost Raft commit reply: replication-task error completion used a stale local HWM
+and discarded the retained append. The correction preserves ownership and bytes
+while retrying the same fenced metadata commit, with conservative reconciliation
+on unresolved outcomes. It does not admit writes on an unrecovered log.
+
+After this correction, foreground traffic passed while the large transfer still
+exceeded the old test deadlines: more than 32 MiB cannot finish within a 30-second
+reader timeout at 512 KiB/s. The post-heal and readback checks now use a recorded,
+byte-sized allowance, without changing production quotas or foreground checks.
+The final passing run and its transfer/read/write/hash/decode measurements are
+recorded in [uncertain-partition-commit.md](uncertain-partition-commit.md). Earlier
+failed runs remain evidence, not retroactively successful tests.
 
 ## Running and evidence
 
@@ -158,4 +177,7 @@ successful commits, errors, small-recovery timing and process resources.
 Post-window cluster metadata and internal offsets are captured even when
 foreground assertions fail; the test then attempts post-heal integrity checks.
 Failure remains a failure throughout evidence collection. Broker logs are
-captured before the dedicated containers and volumes are removed.
+captured for complete process lifetimes before the dedicated containers and
+volumes are removed. Already-failed scenarios also dump Go stacks with SIGQUIT
+before teardown; this diagnostic signal occurs after the failure and cannot be
+counted as a scenario's injected crash or successful outcome.

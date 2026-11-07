@@ -150,8 +150,13 @@ func ackFaultState(node int, topic string) (ackFaultPartition, error) {
 // with the required ISR size and no unresolved replica recovery.
 func waitAckFaultState(t *testing.T, topic string, nodes []int, excluded string, expectedISR int) ackFaultPartition {
 	t.Helper()
+	return waitAckFaultStateWithin(t, topic, nodes, excluded, expectedISR, 2*clusterReadyTimeout)
+}
+
+func waitAckFaultStateWithin(t *testing.T, topic string, nodes []int, excluded string, expectedISR int, timeout time.Duration) ackFaultPartition {
+	t.Helper()
 	var result ackFaultPartition
-	require.NoError(t, eventually(t, "agreed partition leadership and ISR", 2*clusterReadyTimeout, func() (bool, string, error) {
+	require.NoError(t, eventually(t, "agreed partition leadership and ISR", timeout, func() (bool, string, error) {
 		var first ackFaultPartition
 		for index, node := range nodes {
 			state, err := ackFaultState(node, topic)

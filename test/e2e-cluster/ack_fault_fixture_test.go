@@ -123,6 +123,13 @@ func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTest
 	require.NoError(t, err)
 	config, err := filepath.Abs("../cluster/config.yaml")
 	require.NoError(t, err)
+	if hooks {
+		// Keep rejected recovery generations and continuations in fault evidence.
+		data, err := os.ReadFile(config)
+		require.NoError(t, err)
+		config = filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(config, []byte(strings.ReplaceAll(string(data), `log_level: "info"`, `log_level: "debug"`)), 0o600))
+	}
 	data, err := os.ReadFile(composeFile)
 	require.NoError(t, err)
 	text := strings.ReplaceAll(string(data), "context: ../..", "context: "+filepath.ToSlash(root))
@@ -151,6 +158,39 @@ func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTest
 	require.NoError(t, os.WriteFile(compose, []byte(text), 0o600))
 	ctx := givenClusterRestart(t, ackFaultProject, compose).WithTopic(topic).WithPartitions(1).WithIdempotent(true).WithAcks("all")
 	t.Cleanup(ctx.Cleanup)
+	logDir := os.Getenv("CURSUS_ACK_FAULT_RESULTS")
+	if logDir == "" {
+		logDir = t.TempDir()
+	}
+	require.NoError(t, os.MkdirAll(logDir, 0o750))
+	t.Cleanup(func() {
+		// Preserve complete process lifetimes before topic/container cleanup.
+		// The generic failure tail can omit the recovery error under debug load.
+		for node := 1; node <= 3; node++ {
+			if t.Failed() {
+				// The scenario is already failed. Capture Go stacks before the
+				// dedicated containers are destroyed, including blocked replay.
+				dumpCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = exec.CommandContext(dumpCtx, "docker", "kill", "--signal=QUIT", ackFaultContainer(node)).Run()
+				_ = exec.CommandContext(dumpCtx, "docker", "wait", ackFaultContainer(node)).Run()
+				cancel()
+			}
+			path := filepath.Join(logDir, fmt.Sprintf("%s-broker-%d.log", strings.ReplaceAll(t.Name(), "/", "_"), node))
+			file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Logf("broker log artifact: %v", err)
+				continue
+			}
+			logCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			cmd := exec.CommandContext(logCtx, "docker", "logs", ackFaultContainer(node))
+			cmd.Stdout, cmd.Stderr = file, file
+			if err := cmd.Run(); err != nil {
+				t.Logf("broker log capture: %v", err)
+			}
+			cancel()
+			_ = file.Close()
+		}
+	})
 	ctx.WhenCluster().CreateTopic().WaitForTopicMetadata()
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "ack fault fixture")
 	return ctx

@@ -63,8 +63,8 @@ or a production latency SLO. Full retained scans, bootstrap and cold/warm scalin
 remain separate measurements; RPC counts alone cannot establish efficiency.
 
 Transaction, storage and interrupted mixed-load follow-ups are documented in
-[fault-recovery-followups.md](fault-recovery-followups.md), including a currently
-failing consumer-metadata availability regression. Their different visibility
+[fault-recovery-followups.md](fault-recovery-followups.md), including the
+uncertain-commit regression and its correction. Their different visibility
 and deletion contracts must not be inferred from this oracle. Randomized
 schedules, broad SDK retry coverage and power faults remain separate work.
 
