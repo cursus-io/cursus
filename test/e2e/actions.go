@@ -7,10 +7,20 @@ import (
 
 // Actions represents test actions (When phase)
 type Actions struct {
-	ctx *TestContext
+	ctx           *TestContext
+	brokerStopped bool
 }
 
 func (a *Actions) StartBroker() *Actions {
+	if a.brokerStopped {
+		a.ctx.t.Log("Starting broker container...")
+		cmd := RunCompose("-f", composeFile, "start", "broker")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			a.ctx.t.Fatalf("Failed to start broker container: %v\nOutput: %s", err, string(output))
+		}
+		a.brokerStopped = false
+	}
+
 	a.ctx.t.Log("Waiting for broker to be ready...")
 	if err := CheckBrokerHealth(StandAloneHealthCheckAddr); err != nil {
 		a.ctx.t.Fatalf("Broker health check failed: %v", err)
@@ -21,8 +31,16 @@ func (a *Actions) StartBroker() *Actions {
 }
 
 func (a *Actions) StopBroker() *Actions {
-	a.ctx.t.Log("Stopping broker...")
-	time.Sleep(2 * time.Second)
+	a.ctx.t.Log("Stopping broker container...")
+	cmd := RunCompose("-f", composeFile, "stop", "broker")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		a.ctx.t.Fatalf("Failed to stop broker container: %v\nOutput: %s", err, string(output))
+	}
+	if a.ctx.client != nil {
+		a.ctx.client.Close()
+		a.ctx.client = nil
+	}
+	a.brokerStopped = true
 	return a
 }
 
@@ -231,10 +249,14 @@ func (a *Actions) FetchOffset(partition int) *Actions {
 	return a
 }
 
-func (a *Actions) SimulateNetworkFailure() *Actions {
-	a.ctx.t.Log("Simulating network failure...")
-	time.Sleep(100 * time.Millisecond)
-	a.ctx.t.Log("Network failure simulated")
+// DisconnectClient closes the current client connection. The next action
+// creates a new connection while retaining producer identity and sequences.
+func (a *Actions) DisconnectClient() *Actions {
+	a.ctx.t.Log("Disconnecting broker client...")
+	if a.ctx.client != nil {
+		a.ctx.client.Close()
+		a.ctx.client = nil
+	}
 	return a
 }
 

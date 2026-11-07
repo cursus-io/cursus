@@ -4,43 +4,32 @@ import (
 	"testing"
 )
 
-// TestPublisherConfigOptions verifies publisher configuration options work correctly
-func TestPublisherConfigOptions(t *testing.T) {
-	ctx := GivenStandalone(t)
-	defer ctx.Cleanup()
-
-	ctx.WithTopic("publisher-test").
-		WithPartitions(2).
-		WithNumMessages(5).
-		When().
-		StartBroker().
-		CreateTopic().
-		PublishMessages().
-		Then().
-		Expect(BrokerIsHealthy(StandAloneHealthCheckAddr)).
-		And(MessagesPublished(5))
-}
-
-// TestPublisherRetryLogic verifies publisher retry mechanism
-func TestPublisherRetryLogic(t *testing.T) {
+func TestIdempotentPublishSurvivesBrokerRestart(t *testing.T) {
 	ctx := GivenStandalone(t)
 	defer ctx.Cleanup()
 
 	ctx.WithTopic("retry-test").
 		WithPartitions(1).
 		WithNumMessages(5).
+		WithAcks("all").
+		WithIdempotent(true).
 		When().
-		StartBroker().
-		StopBroker().
 		StartBroker().
 		CreateTopic().
 		PublishMessages().
+		StopBroker().
+		StartBroker().
+		RetryPublishMessages().
+		JoinGroup().
+		SyncGroup().
+		ConsumeMessages().
 		Then().
-		Expect(PublisherRetriedSuccessfully())
+		Expect(PublisherRetriedSuccessfully()).
+		And(MessagesConsumed(5)).
+		And(NoDuplicateMessages())
 }
 
-// TestExactlyOnceSemantics verifies exactly-once delivery with retries
-func TestExactlyOnceSemantics(t *testing.T) {
+func TestIdempotentRetryAfterClientReconnect(t *testing.T) {
 	ctx := GivenStandalone(t)
 	defer ctx.Cleanup()
 
@@ -53,35 +42,13 @@ func TestExactlyOnceSemantics(t *testing.T) {
 		StartBroker().
 		CreateTopic().
 		PublishMessages().
+		DisconnectClient().
 		RetryPublishMessages().
 		JoinGroup().
 		SyncGroup().
 		ConsumeMessages().
 		Then().
-		Expect(MessagesConsumed(10))
-}
-
-// TestIdempotentProducer verifies idempotent producer behavior
-func TestIdempotentProducer(t *testing.T) {
-	ctx := GivenStandalone(t)
-	defer ctx.Cleanup()
-
-	ctx.WithTopic("idempotent-test").
-		WithPartitions(1).
-		WithNumMessages(5).
-		WithAcks("all").
-		WithIdempotent(true).
-		When().
-		StartBroker().
-		CreateTopic().
-		PublishMessages().
-		SimulateNetworkFailure().
-		RetryPublishMessages().
-		JoinGroup().
-		SyncGroup().
-		ConsumeMessages().
-		Then().
-		Expect(MessagesConsumed(5)).
+		Expect(MessagesConsumed(10)).
 		And(NoDuplicateMessages())
 }
 
@@ -114,65 +81,6 @@ func TestPublisherAcks(t *testing.T) {
 	}
 }
 
-// TestExactlyOnceWithFailures tests exactly-once semantics with various failure scenarios
-func TestExactlyOnceWithFailures(t *testing.T) {
-	testCases := []struct {
-		name         string
-		acks         string
-		failures     []string
-		expectDupes  bool
-		expectLoss   bool
-		isIdempotent bool
-	}{
-		{"acks=all_network_failure", "all", []string{"network"}, false, false, true},
-		{"acks=all_broker_failure", "all", []string{"broker"}, false, false, true},
-		{"acks=0_no_guarantee", "0", []string{"network"}, true, true, false},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := GivenStandalone(t).
-				WithTopic("exactly-once-" + tc.name).
-				WithPartitions(3).
-				WithNumMessages(50).
-				WithAcks(tc.acks).
-				WithIdempotent(tc.isIdempotent)
-			defer ctx.Cleanup()
-
-			actions := ctx.When().
-				StartBroker().
-				CreateTopic().
-				PublishMessages()
-
-			for _, failure := range tc.failures {
-				switch failure {
-				case "network":
-					actions.SimulateNetworkFailure()
-				case "broker":
-					actions.StopBroker().StartBroker()
-				}
-			}
-
-			consequences := actions.RetryPublishMessages().
-				JoinGroup().
-				SyncGroup().
-				ConsumeMessages().
-				Then()
-
-			if tc.expectLoss {
-				consequences.Expect(MessageLossAllowed()).
-					And(PublisherRetriedSuccessfully())
-			} else if tc.expectDupes {
-				consequences.Expect(DuplicatesAllowed()).
-					And(PublisherRetriedSuccessfully())
-			} else {
-				consequences.Expect(NoDuplicateMessages()).
-					And(MessagesConsumed(50))
-			}
-		})
-	}
-}
-
 // TestIdempotencyUnderStress tests idempotency with high concurrency
 func TestIdempotencyUnderStress(t *testing.T) {
 	ctx := GivenStandalone(t).
@@ -188,7 +96,7 @@ func TestIdempotencyUnderStress(t *testing.T) {
 		StartBroker().
 		CreateTopic().
 		PublishMessages().
-		SimulateNetworkFailure().
+		DisconnectClient().
 		RetryPublishMessages().
 		JoinGroup().
 		SyncGroup().

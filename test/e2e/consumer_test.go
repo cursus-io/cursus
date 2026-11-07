@@ -25,26 +25,6 @@ func TestConsumerGroupJoin(t *testing.T) {
 		Expect(MessagesConsumed(10))
 }
 
-// TestWithDefaultConsumerGroup verifies default consumer group behavior
-func TestWithDefaultConsumerGroup(t *testing.T) {
-	ctx := GivenStandalone(t)
-	defer ctx.Cleanup()
-
-	ctx.WithTopic("default-group-test").
-		WithPartitions(1).
-		WithNumMessages(10)
-
-	ctx.When().
-		StartBroker().
-		CreateTopic().
-		PublishMessages().
-		JoinGroup().
-		SyncGroup().
-		ConsumeMessages().
-		Then().
-		Expect(MessagesConsumed(10))
-}
-
 // TestWithCustomConsumerGroup verifies custom consumer group behavior
 func TestWithCustomConsumerGroup(t *testing.T) {
 	ctx := GivenStandalone(t)
