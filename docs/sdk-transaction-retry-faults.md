@@ -41,7 +41,24 @@ may consume another request and recovery work; it must not append duplicate
 transaction data or apply offsets twice. Existing byte/work metrics remain
 necessary for recovery, and these SDK tests establish no throughput SLO.
 
-The focused native SDK suite passed in 0.780 seconds, and the updated broker
-boundary driver compiled. These observations are distinct from execution of
-the real-broker matrix and do not claim that its six cases have already run on
-this change.
+The focused native SDK suite passed in 0.780 seconds. The hosted real-broker
+matrix then passed all six cases on `1cdbe31` in 144.36 seconds, including fixture
+startup and cleanup:
+
+| Decision | Prepare crash | Marker crash | Final-decision crash |
+| --- | ---: | ---: | ---: |
+| Commit | 24.39 s | 13.23 s | 17.10 s |
+| Abort | 17.02 s | 13.27 s | 8.00 s |
+
+Each case reused the same SDK producer identity after the unknown completion,
+checked the committed/aborted output view and input offset, rejected the opposite
+decision, and verified survivors and the restarted coordinator.
+
+The existing remote-history replacement regression also exposed a test-ordering
+race: RELEASE acknowledges retirement before the source owner finishes closing
+its export. A subsequent replacement probe could therefore hit the existing
+partition-admission conflict instead of testing certificate invalidation. The
+test now waits for the owner's cleanup boundary between these separate checks.
+Fifty native repetitions reproduced the original failure; fifty repetitions
+passed after the synchronization change in 81.073 seconds. Production admission
+and retry behavior are unchanged.
