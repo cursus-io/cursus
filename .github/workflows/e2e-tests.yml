@@ -187,6 +187,35 @@ jobs:
           RUN_E2E_BENCHMARK: "1"
         run: |
           go test -v -timeout 30m ./test/e2e-benchmark/...
+
+  cluster-core-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
+
+      - name: Run cluster durability and consistency E2E tests serially
+        run: >-
+          go test -v -timeout 50m ./test/e2e-cluster/...
+          -run '^Test(ISRWithAllAcks|LeaderFailover|ClusterWideDeduplication)$'
+          -count=1
+
+      - name: Show cluster logs on failure
+        if: failure()
+        working-directory: test/e2e-cluster
+        run: docker compose -f docker-compose.yml logs --no-color
+
+      - name: Clean cluster environment
+        if: always()
+        working-directory: test/e2e-cluster
+        run: docker compose -f docker-compose.yml down -v --remove-orphans
+
   topic-storage-fault-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
