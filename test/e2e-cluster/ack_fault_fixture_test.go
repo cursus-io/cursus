@@ -118,10 +118,22 @@ func newAckFaultCluster(t *testing.T, topic string) *ClusterTestContext {
 // newAckFaultClusterMode starts an isolated three-broker fixture with optional explicitly gated fault hooks.
 func newAckFaultClusterMode(t *testing.T, topic string, hooks bool) *ClusterTestContext {
 	t.Helper()
+	return newAckFaultClusterSource(t, topic, hooks, "")
+}
+
+// newAckFaultClusterSource optionally builds the initial brokers from an archived
+// source tree, keeping configuration and the public test client on the candidate.
+func newAckFaultClusterSource(t *testing.T, topic string, hooks bool, source string) *ClusterTestContext {
+	t.Helper()
 	require.Empty(t, os.Getenv("CURSUS_CLEANUP_PORT_OFFSET"), "cleanup fixture overrides cannot be combined")
 	t.Setenv("CURSUS_E2E_PORT_SHIFT", strconv.Itoa(ackFaultPortShift))
 	root, err := filepath.Abs("../..")
 	require.NoError(t, err)
+	if source != "" {
+		require.True(t, filepath.IsAbs(source), "archived source must be an absolute path")
+		require.DirExists(t, source)
+		root = source
+	}
 	config, err := filepath.Abs("../cluster/config.yaml")
 	require.NoError(t, err)
 	if hooks {

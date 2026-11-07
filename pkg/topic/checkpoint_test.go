@@ -516,7 +516,10 @@ func TestCheckpointCrashRestart(t *testing.T) {
 						wantSequence = 2
 					}
 				}
-				require.Equal(t, wantHWM, p.GetHWM())
+				savedHWM, saved, _ := loadHWMCheckpoint(p.hwmCheckpointPath)
+				require.True(t, saved)
+				require.Equal(t, wantHWM, savedHWM, "publication must leave precisely the old or new complete image")
+				require.Equal(t, uint64(2), p.GetHWM(), "standalone visibility recovers from the durable log even when its checkpoint lags")
 				loaded, ok := p.lookupProducerState("p")
 				require.True(t, ok)
 				require.Equal(t, wantSequence, loaded.Seq, "publication must leave precisely the old or new complete image")

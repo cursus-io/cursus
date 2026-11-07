@@ -156,7 +156,7 @@ jobs:
           persist-credentials: false
       - name: Build isolated ext4 guest recovery harness
         run: docker build -f test/power-loss/Dockerfile -t cursus-power-loss .
-      - name: Cut guest power and recover every journal rewrite phase
+      - name: Cut guest power after acknowledged writes and every journal rewrite phase
         run: |
           mkdir -p power-loss-results
           docker run --rm -v "$PWD/power-loss-results:/results" cursus-power-loss
@@ -643,3 +643,61 @@ jobs:
           name: cooperative-broker-go
           path: cooperative-go.log
           if-no-files-found: ignore
+
+  full-cluster-backup-restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
+      - name: Reserve fault fixture ports across member replacement
+        run: |
+          existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}42001-42003"
+      - name: Prepare the fixed upgrade source and candidate image
+        run: |
+          set -euo pipefail
+          baseline=c7384a51299a2519900966d3ed786b9cbe0e3f4c
+          git fetch --no-tags --depth=1 origin "$baseline"
+          source_dir=$(mktemp -d "$RUNNER_TEMP/cursus-upgrade-source.XXXXXX")
+          git archive "$baseline" | tar -xf - -C "$source_dir"
+          printf '%s\n' "$baseline" > "$source_dir/.upgrade-source-revision"
+          revision=$(git rev-parse HEAD)
+          candidate="cursus-backup-upgrade-candidate:$revision"
+          docker build --label "org.opencontainers.image.revision=$revision" \
+            -f test/e2e-cluster/Dockerfile.ack-faults -t "$candidate" .
+          echo "CURSUS_BACKUP_UPGRADE_SOURCE=$source_dir" >> "$GITHUB_ENV"
+          echo "CURSUS_BACKUP_UPGRADE_IMAGE=$candidate" >> "$GITHUB_ENV"
+          echo "CURSUS_BACKUP_UPGRADE_REVISION=$revision" >> "$GITHUB_ENV"
+      - name: Restore and upgrade complete backups into fresh member volumes
+        env:
+          RUN_E2E_ACK_FAULTS: "1"
+          RUN_E2E_ACK_UPGRADE: "1"
+          CURSUS_ACK_FAULT_RESULTS: ${{ github.workspace }}/backup-restore-results
+        run: |
+          set -o pipefail
+          mkdir -p backup-restore-results
+          go test -json -race -count=1 -timeout 20m ./test/e2e-cluster \
+            -run '^TestAcknowledgedCluster(BackupRestore|CoordinatedUpgrade)$' | tee backup-restore-results/tests.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          events = [json.loads(line) for line in Path("backup-restore-results/tests.jsonl").read_text().splitlines()]
+          for name in ("TestAcknowledgedClusterBackupRestore", "TestAcknowledgedClusterCoordinatedUpgrade"):
+              if not any(e.get("Test") == name and e.get("Action") == "pass" for e in events):
+                  raise SystemExit(f"Required recovery scenario did not pass: {name}")
+          PY
+      - name: Upload backup inventories and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-cluster-backup-restore
+          path: backup-restore-results
+          if-no-files-found: error

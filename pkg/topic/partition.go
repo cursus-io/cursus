@@ -275,6 +275,13 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 				p.HWM = durableTail
 			}
 		}
+		if !p.distributed {
+			// A standalone append has no separate replication commit decision.
+			// Its async checkpoint can lag acknowledged, synced records after
+			// a crash. Recover visibility from the validated log instead; the
+			// transaction index below still gates unresolved transactions.
+			p.HWM = durableTail
+		}
 		handler.SetOnSync(func(uint64) { p.NotifyNewMessage() })
 	}
 
