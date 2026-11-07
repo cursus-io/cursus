@@ -116,6 +116,18 @@ readiness/metrics snapshots before cleanup, with a separate timestamp for each
 repetition. This preserves the advancing commit boundary and per-process recovery
 work instead of relying only on the generic final log tail.
 
+The next repeated run reached the final drain assertion but failed there once;
+the other two repetitions passed. All three brokers were ready and the current
+coordinator's six committed offsets matched the respective log ends
+(`240,240,240,239,240,240`). The oracle's AdminClient used a partial config with
+zero retries, so every query started and stopped at broker 1 even though broker 2
+was the coordinator. It now uses the SDK defaults and deliberately starts from
+a non-coordinator. A two-broker Wire regression demonstrates the old routing
+error and successful bounded retry; the final drain checks retain their original
+deadline and ACK requirements and now log offsets, ACK counts and query errors.
+This explains that final-drain failure, not the earlier moving-tail readiness
+timeout. Production routing and consumer behavior are unchanged.
+
 ## Running
 
 Run only one ACK fixture at a time; all its tests own the same dedicated Compose
