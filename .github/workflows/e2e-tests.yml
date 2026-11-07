@@ -661,22 +661,38 @@ jobs:
         run: |
           existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
           sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}42001-42003"
-      - name: Restore one full backup generation into fresh member volumes
+      - name: Prepare the fixed upgrade source and candidate image
+        run: |
+          set -euo pipefail
+          baseline=c7384a51299a2519900966d3ed786b9cbe0e3f4c
+          git fetch --no-tags --depth=1 origin "$baseline"
+          source_dir=$(mktemp -d "$RUNNER_TEMP/cursus-upgrade-source.XXXXXX")
+          git archive "$baseline" | tar -xf - -C "$source_dir"
+          printf '%s\n' "$baseline" > "$source_dir/.upgrade-source-revision"
+          revision=$(git rev-parse HEAD)
+          candidate="cursus-backup-upgrade-candidate:$revision"
+          docker build --label "org.opencontainers.image.revision=$revision" \
+            -f test/e2e-cluster/Dockerfile.ack-faults -t "$candidate" .
+          echo "CURSUS_BACKUP_UPGRADE_SOURCE=$source_dir" >> "$GITHUB_ENV"
+          echo "CURSUS_BACKUP_UPGRADE_IMAGE=$candidate" >> "$GITHUB_ENV"
+          echo "CURSUS_BACKUP_UPGRADE_REVISION=$revision" >> "$GITHUB_ENV"
+      - name: Restore and upgrade complete backups into fresh member volumes
         env:
           RUN_E2E_ACK_FAULTS: "1"
+          RUN_E2E_ACK_UPGRADE: "1"
           CURSUS_ACK_FAULT_RESULTS: ${{ github.workspace }}/backup-restore-results
         run: |
           set -o pipefail
           mkdir -p backup-restore-results
           go test -json -race -count=1 -timeout 20m ./test/e2e-cluster \
-            -run '^TestAcknowledgedClusterBackupRestore$' | tee backup-restore-results/tests.jsonl
+            -run '^TestAcknowledgedCluster(BackupRestore|CoordinatedUpgrade)$' | tee backup-restore-results/tests.jsonl
           python3 - <<'PY'
           import json
           from pathlib import Path
           events = [json.loads(line) for line in Path("backup-restore-results/tests.jsonl").read_text().splitlines()]
-          name = "TestAcknowledgedClusterBackupRestore"
-          if not any(e.get("Test") == name and e.get("Action") == "pass" for e in events):
-              raise SystemExit("Full-cluster restore did not pass")
+          for name in ("TestAcknowledgedClusterBackupRestore", "TestAcknowledgedClusterCoordinatedUpgrade"):
+              if not any(e.get("Test") == name and e.get("Action") == "pass" for e in events):
+                  raise SystemExit(f"Required recovery scenario did not pass: {name}")
           PY
       - name: Upload backup inventories and recovery evidence
         if: always()

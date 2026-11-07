@@ -17,6 +17,19 @@ separates binary rollout from feature activation. Cursus still requires a
 coordinated upgrade across incompatible persistent formats. A same-binary restore
 rehearsal cannot establish mixed-version compatibility or authorize a downgrade.
 
+The coordinated-upgrade check uses the fixed source revision
+`c7384a51299a2519900966d3ed786b9cbe0e3f4c` and the candidate checkout. Unlike
+Kafka's supported rolling transitions, this check stops all old writers before
+starting any candidate broker. It adopts explicit source/target provenance and
+post-upgrade validation while retaining Cursus's whole-cluster upgrade rule.
+The candidate must use a different recorded image from every source member.
+The regression requires complete file inventories before cloning, all 32 old
+records and consumer offset 13 after candidate startup, one new acknowledged
+record, and an unchanged original backup. Copied/hash bytes and recovery time
+are recorded as in same-binary restoration. Availability is deliberately lost
+during the stop/clone/start window; no mixed-version or in-place downgrade
+guarantee follows from this compatible revision pair.
+
 The regression boundaries are defined before implementation:
 
 - Write 32 identified records over the public broker protocol and acknowledge a
@@ -81,7 +94,12 @@ versioned and legacy standalone checkpoints. After the correction, the focused
 checkpoint/bootstrap/committed-read suite passed in 103.405 seconds and the
 native process-crash/backup suite passed in 37.385 seconds. The checkpoint crash
 test still checks the exact old-or-new file image separately from reconstructed
-standalone visibility. The hosted guest power-loss rerun remains required.
+standalone visibility. The hosted rerun at `cfded66` passed all seven guest
+boundaries. The acknowledged-prefix reboot verified all 32 records (8,768 payload
+bytes), committed offset 13, duplicate suppression and new end 33 in 1.514 seconds.
+Its full-cluster restore also passed: 157,699,848 copied bytes, matching source,
+backup and clone inventories, and 69.522 seconds for recovery, stable ISR and
+complete readback. These are separate measurements from the local runs below.
 
 On 2026-11-07 UTC, the native standalone process-crash and backup suite passed
 in 10.144 seconds. It preserved all 32 acknowledged records (8,768 payload bytes),
@@ -123,6 +141,24 @@ docker run --rm -v "$PWD/power-results:/results" cursus-power-rehearsal
 RUN_E2E_ACK_FAULTS=1 CURSUS_ACK_FAULT_RESULTS=/absolute/path/to/results \
   go test -v -count=1 -timeout 20m ./test/e2e-cluster \
   -run '^TestAcknowledgedClusterBackupRestore$'
+
+# Coordinated upgrade from an archived, fixed source revision.
+baseline=c7384a51299a2519900966d3ed786b9cbe0e3f4c
+git fetch --no-tags --depth=1 origin "$baseline"
+source_dir=$(mktemp -d)
+git archive "$baseline" | tar -xf - -C "$source_dir"
+printf '%s\n' "$baseline" > "$source_dir/.upgrade-source-revision"
+revision=$(git rev-parse HEAD)
+candidate="cursus-backup-upgrade-candidate:$revision"
+docker build --label "org.opencontainers.image.revision=$revision" \
+  -f test/e2e-cluster/Dockerfile.ack-faults -t "$candidate" .
+RUN_E2E_ACK_FAULTS=1 RUN_E2E_ACK_UPGRADE=1 \
+  CURSUS_BACKUP_UPGRADE_SOURCE="$source_dir" \
+  CURSUS_BACKUP_UPGRADE_IMAGE="$candidate" \
+  CURSUS_BACKUP_UPGRADE_REVISION="$revision" \
+  CURSUS_ACK_FAULT_RESULTS=/absolute/path/to/upgrade-results \
+  go test -v -count=1 -timeout 20m ./test/e2e-cluster \
+    -run '^TestAcknowledgedClusterCoordinatedUpgrade$'
 ```
 
 Run only one acknowledged-write fixture at a time. It owns a dedicated Compose

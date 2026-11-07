@@ -21,6 +21,29 @@ import (
 // TestAcknowledgedClusterBackupRestore rehearses one frozen full-cluster backup
 // generation on fresh writable volumes, preserving the originals until cleanup.
 func TestAcknowledgedClusterBackupRestore(t *testing.T) {
+	runAcknowledgedClusterBackupRestore(t, "", "")
+}
+
+// TestAcknowledgedClusterCoordinatedUpgrade seeds a pinned older revision and
+// restores its complete backup using a different, explicitly recorded candidate.
+func TestAcknowledgedClusterCoordinatedUpgrade(t *testing.T) {
+	if os.Getenv("RUN_E2E_ACK_UPGRADE") != "1" {
+		t.Skip("set RUN_E2E_ACK_UPGRADE=1 with archived source and candidate image")
+	}
+	source := os.Getenv("CURSUS_BACKUP_UPGRADE_SOURCE")
+	image := os.Getenv("CURSUS_BACKUP_UPGRADE_IMAGE")
+	require.NotEmpty(t, source)
+	require.NotEmpty(t, image)
+	revision, err := os.ReadFile(filepath.Join(source, ".upgrade-source-revision"))
+	require.NoError(t, err)
+	require.Equal(t, "c7384a51299a2519900966d3ed786b9cbe0e3f4c", strings.TrimSpace(string(revision)))
+	runAcknowledgedClusterBackupRestore(t, source, image)
+}
+
+// runAcknowledgedClusterBackupRestore shares the identity and immutable-backup
+// oracle between same-binary restoration and the coordinated revision change.
+func runAcknowledgedClusterBackupRestore(t *testing.T, source, candidate string) {
+	t.Helper()
 	if os.Getenv("RUN_E2E_ACK_FAULTS") != "1" {
 		t.Skip("set RUN_E2E_ACK_FAULTS=1 for isolated backup recovery")
 	}
@@ -38,7 +61,7 @@ func TestAcknowledgedClusterBackupRestore(t *testing.T) {
 		}
 	})
 	journal := newAckFaultJournal(t)
-	ctx := newAckFaultCluster(t, "ack-backup")
+	ctx := newAckFaultClusterSource(t, "ack-backup", false, source)
 	state := waitAckFaultState(t, ctx.GetTopic(), []int{1, 2, 3}, "", 3)
 	for sequence := uint64(1); sequence <= 32; sequence++ {
 		publishAckFaultEventually(t, journal, ctx.GetTopic(), coordinatorNode(t, state.Leader), ackFaultMessage("backup-producer", sequence))
@@ -56,6 +79,22 @@ func TestAcknowledgedClusterBackupRestore(t *testing.T) {
 	images := make(map[int]string)
 	for node := 1; node <= 3; node++ {
 		images[node] = ackFaultDocker(t, "inspect", "--format", "{{.Image}}", ackFaultContainer(node))
+	}
+	restoreImages := make(map[int]string)
+	candidateID := ""
+	if candidate != "" {
+		candidateID = ackFaultDocker(t, "image", "inspect", "--format", "{{.Id}}", candidate)
+		revision := os.Getenv("CURSUS_BACKUP_UPGRADE_REVISION")
+		require.Len(t, revision, 40, "record the candidate checkout revision")
+		require.Equal(t, revision, ackFaultDocker(t, "image", "inspect", "--format", `{{index .Config.Labels "org.opencontainers.image.revision"}}`, candidateID))
+		journal.record("upgrade_revisions", map[string]any{"source_commit": "c7384a51299a2519900966d3ed786b9cbe0e3f4c", "candidate_commit": revision, "candidate_image": candidateID})
+	}
+	for node := 1; node <= 3; node++ {
+		restoreImages[node] = images[node]
+		if candidateID != "" {
+			require.NotEqual(t, images[node], candidateID, "upgrade must replace the source image")
+			restoreImages[node] = candidateID
+		}
 	}
 	imageID := images[1] // Offline file helpers use one of the recorded images.
 	journal.record("backup_runtime", map[string]any{"images": images, "compose_sha256": fmt.Sprintf("%x", sha256.Sum256(configuration))})
@@ -100,7 +139,7 @@ func TestAcknowledgedClusterBackupRestore(t *testing.T) {
 		declarations[fmt.Sprintf("broker-%d-data", node)] = map[string]any{"external": true, "name": clone}
 		service, ok := services[fmt.Sprintf("broker-%d", node)].(map[string]any)
 		require.True(t, ok)
-		service["image"] = images[node]
+		service["image"] = restoreImages[node]
 		delete(service, "build")
 	}
 	restoreConfiguration, err := yaml.Marshal(document)
@@ -116,7 +155,7 @@ func TestAcknowledgedClusterBackupRestore(t *testing.T) {
 	require.NoError(t, ctx.WhenCluster().checkAllNodesHealth())
 	state = waitAckFaultState(t, ctx.GetTopic(), []int{1, 2, 3}, "", 3)
 	for node := 1; node <= 3; node++ {
-		require.Equal(t, images[node], ackFaultDocker(t, "inspect", "--format", "{{.Image}}", ackFaultContainer(node)))
+		require.Equal(t, restoreImages[node], ackFaultDocker(t, "inspect", "--format", "{{.Image}}", ackFaultContainer(node)))
 	}
 	response, err = ctx.GetClient().SendCommand("", "FETCH_OFFSET topic="+ctx.GetTopic()+" partition=0 group=backup-workers", 5*time.Second)
 	require.NoError(t, err)

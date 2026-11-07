@@ -252,6 +252,9 @@ The [storage recovery rehearsal](../storage-recovery-rehearsal.md) verifies
 acknowledged data and consumer offsets after guest power loss, standalone backup
 restore, authoritative-record corruption and derived-index damage. Its distributed
 case stops all three writers, compares source/copy digests, and restores one
-complete backup generation into fresh writable member volumes. These same-image
-checks exercise the restore procedure; cross-version compatibility still follows
-the support matrix above.
+complete backup generation into fresh writable member volumes. A separate
+coordinated-upgrade scenario writes with fixed revision `c7384a5`, stops every
+writer, and restores fresh clones with the recorded candidate image. Both paths
+verify records, consumer offsets, new writes and the immutable backup. This
+compatible revision pair does not extend the support matrix above or establish
+mixed-version operation or in-place downgrade support.
