@@ -3,6 +3,7 @@ package coordinator
 import (
 	"fmt"
 	"github.com/cursus-io/cursus/pkg/protocol"
+	"github.com/cursus-io/cursus/util"
 	"slices"
 	"time"
 )
@@ -28,8 +29,8 @@ func (c *Coordinator) ReconcileCooperative(groupName, member string, registratio
 		return CooperativeMembership{}, err
 	}
 	defer release()
-	if !leave && len(acks) == 0 && registration != 0 && session != 0 {
-		if result, handled, err := c.refreshCooperativeHeartbeat(groupName, member, registration, session, partitions); handled {
+	if !leave && registration != 0 && session != 0 {
+		if result, handled, err := c.refreshCooperativeHeartbeat(groupName, member, registration, session, partitions, len(acks) != 0); handled {
 			return result, err
 		}
 	}
@@ -174,10 +175,12 @@ func (c *Coordinator) expireCooperative(groupName string, timeout time.Duration)
 		return nil
 	}
 	var expired []CooperativeMember
+	var clocks []time.Time
 	now := time.Now()
 	for _, member := range group.Cooperative.Members {
 		if m := group.Members[member.ID]; m != nil && now.Sub(m.LastHeartbeat) > timeout {
 			expired = append(expired, member)
+			clocks = append(clocks, m.LastHeartbeat)
 		}
 	}
 	if len(expired) == 0 {
@@ -200,7 +203,14 @@ func (c *Coordinator) expireCooperative(groupName string, timeout time.Duration)
 	c.cooperativePending[groupName] = state
 	c.lifecyclePending[groupName] = true
 	c.mu.Unlock()
-	return c.persistAndApplyLifecycle(groupName, group, candidate, publishLifecycle)
+	for i, member := range expired {
+		util.Warn("Group '%s': cooperative expiration selected member=%s session=%d registration_epoch=%d last_heartbeat=%s age_ms=%d timeout_ms=%d",
+			groupName, member.ID, member.Session, state.RegistrationEpoch, clocks[i].UTC().Format(time.RFC3339Nano), now.Sub(clocks[i]).Milliseconds(), timeout.Milliseconds())
+	}
+	started := time.Now()
+	err = c.persistAndApplyLifecycle(groupName, group, candidate, publishLifecycle)
+	util.Info("Group '%s': cooperative expiration publication members=%d duration_ms=%d error=%v", groupName, len(expired), time.Since(started).Milliseconds(), err)
+	return err
 }
 
 // ValidateCooperativeRead permits legacy stateless reads only for eager groups.

@@ -104,7 +104,7 @@ generation with no pending truncate can reach ready without another cleanup
 scan. CI observed exactly that ready terminal state. Preserve the initial
 injected-read observation, the post-restart handler barrier, and all final
 registration/offset/full-ISR checks. The test accepts either the pending
-cleanup phase or this ready terminal state, and explicitly check topic revision 2,
+cleanup phase or this ready terminal state, and explicitly checks topic revision 2,
 lifecycle epoch 2, and replica offset 1 after convergence. Both Raft replay and
 snapshot restore must pass. A transient readiness string is not additional
 recovery work, and this test makes no Kafka-equivalence or I/O-efficiency claim.
@@ -114,4 +114,13 @@ once, including the explicit revision, epoch, replica offset, membership, and
 full-ISR assertions. The second local snapshot run failed with `member_not_found`
 during the initial member leave after transport delays, before the delayed-replay
 fault was armed. On commit `39ac3f9`, the complete hosted cleanup fault-recovery
-job passed both recovery modes. Local repetition is therefore not uniformly green.
+job passed both recovery modes. The final `47967ab`
+[cleanup job](https://github.com/cursus-io/cursus/actions/runs/42376965677/job/128416433069)
+also passed both modes. Local repetition is therefore not uniformly green.
+
+The failed local run's broker log records one member timing out at
+`2026-11-07T12:44:37Z`. The fixture's session limit is 30 seconds. Initial setup
+joins and commits, then restarts a follower and waits for health and stable ISR
+without sending another heartbeat before LEAVE. That missing keepalive path
+must be checked independently of delayed-replay correctness; a longer session
+timeout or joining a new member would conceal the setup defect.
