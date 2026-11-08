@@ -27,6 +27,10 @@ func TestConsumerHistoryRemoteProofRefreshAndReplacement(t *testing.T) {
 	require.Len(t, raw, 20)
 	bytes := probe.bytes
 	require.NoError(t, receiver.refreshConsumerHistorySources(context.Background(), plan))
+	// RELEASE acknowledges retirement before the owner finishes closing its
+	// export. Wait for that separate boundary so the next refresh exercises
+	// certificate replacement, not the still-owned partition admission fence.
+	transferWaitEmpty(t, source.bootstrapSource)
 	require.Equal(t, bytes, probe.bytes, "same-end refresh transfers no frames")
 	current, err := history.ConsumerMetadataIndexIdentity(0)
 	require.NoError(t, err)

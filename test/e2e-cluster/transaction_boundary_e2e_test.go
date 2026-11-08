@@ -36,35 +36,38 @@ func TestTransactionDecisionsSurviveCoordinatorBoundaries(t *testing.T) {
 				defer reader.Close()
 				// The same input record can be processed by independent groups.
 				require.NoError(t, client.PublishIdempotent(ctx.GetTopic(), id, 1, 0, id, "all", true))
-				producer, err := client.InitTransactionProducer(id)
+				producerConfig := sdk.NewDefaultConsumerConfig()
+				producerConfig.BrokerAddrs = ctx.GetBrokerAddrs()
+				sdkClient, err := sdk.NewConsumerClient(producerConfig)
 				require.NoError(t, err)
-				require.NoError(t, client.BeginTransaction(id, producer))
+				producer, err := sdkClient.NewTransactionalProducer(id)
+				require.NoError(t, err)
+				session := producer.Session()
+				require.NoError(t, producer.Begin())
 				for i, output := range outputs {
-					require.NoError(t, client.TransactionalPublish(id, output, 0, producer, uint64(i+1), output+"-payload"))
+					require.NoError(t, producer.Publish(output, 0, sdk.Message{SeqNum: uint64(i + 1), Payload: output + "-payload"}))
 				}
-				require.NoError(t, client.SendOffsetsToTransaction(id, ctx.GetTopic(), group, member, generation, producer, map[int]uint64{0: 1}))
+				require.NoError(t, producer.SendOffsets(ctx.GetTopic(), group, member, generation, map[int]uint64{0: 1}))
 				owner, err := client.FindTransactionCoordinator(id)
 				require.NoError(t, err)
 				node := coordinatorNode(t, owner)
 				path := armRecoveryBoundary(t, node, "transaction-"+boundary+"-"+decision, id)
-				type reply struct {
-					response []byte
-					sent     bool
-					err      error
+				complete := producer.Commit
+				if decision == "abort" {
+					complete = producer.Abort
 				}
-				done := make(chan reply, 1)
-				go func() {
-					data, sent, err := ackFaultRoundTrip(ctx.GetBrokerAddrs()[node-1], fmt.Sprintf("END_TXN transactional_id=%s producerId=%s epoch=%d result=%s", id, producer.ProducerID, producer.Epoch, decision))
-					done <- reply{data, sent, err}
-				}()
+				done := make(chan error, 1)
+				go func() { done <- complete() }()
 				waitRecoveryBoundary(t, node, path, journal)
 				captureAckFaultMetrics(t, journal, "before-coordinator-crash")
 				ackFaultDocker(t, "kill", "--signal=KILL", ackFaultContainer(node))
 				select {
-				case result := <-done:
-					require.True(t, result.sent)
-					require.Error(t, result.err, "END_TXN must not have received a successful reply")
-					journal.record("end_transaction_unknown", fmt.Sprint(result.err))
+				case err := <-done:
+					// The observed transaction-specific fault marker proves the
+					// SDK request reached this durable boundary before the crash.
+					require.Error(t, err, "END_TXN must not have received a successful reply")
+					require.Equal(t, session, producer.Session())
+					journal.record("end_transaction_unknown", fmt.Sprint(err))
 				case <-time.After(20 * time.Second):
 					t.Fatal("END_TXN transport did not finish")
 				}
@@ -80,15 +83,19 @@ func TestTransactionDecisionsSurviveCoordinatorBoundaries(t *testing.T) {
 					return err == nil && status.State == want, fmt.Sprintf("%+v %v", status, err), nil
 				}))
 				require.NoError(t, eventually(t, "same decision retry completes after coordinator recovery", 60*time.Second, func() (bool, string, error) {
-					err := recovered.EndTransaction(id, producer, decision)
+					err := complete()
 					journal.record("end_transaction_retry", fmt.Sprint(err))
 					return err == nil, fmt.Sprint(err), nil
 				}))
-				opposite := "abort"
+				require.Equal(t, session, producer.Session(), "same-decision retry must retain the original epoch")
+				reverseErr := sdkClient.EndTransaction(id, session.ProducerID, session.Epoch, decision != "commit")
+				var brokerErr *sdk.BrokerError
+				require.ErrorAs(t, reverseErr, &brokerErr, "the broker must reject reversing a durable decision")
+				wantCode := "transaction_already_committed"
 				if decision == "abort" {
-					opposite = "commit"
+					wantCode = "transaction_aborted"
 				}
-				require.Error(t, recovered.EndTransaction(id, producer, opposite), "a durable decision cannot be reversed")
+				require.Equal(t, wantCode, brokerErr.Code)
 				verify := func(addrs []string) {
 					admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, RequestTimeoutMS: 3000, MaxRetries: 5, RetryBackoffMS: 100})
 					require.NoError(t, err)
