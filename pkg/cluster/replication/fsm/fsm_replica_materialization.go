@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
 // ReplicaMaterializationIssue describes a configured local replica whose
@@ -108,8 +110,20 @@ func (f *BrokerFSM) ReconcileReplicaMaterializations(brokerID string) error {
 				} else {
 					issue.LocalLEO = partition.NextOffset()
 					issue.LocalHWM = partition.GetHWM()
+					if pending, ok := partition.PendingPartitionCommitState(); ok &&
+						uncertainCommitResolvedByMetadata(pending, current) &&
+						issue.LocalLEO >= current.CommittedHWM {
+						if err := partition.ReconcilePendingPartitionCommit(pending, current.CommittedHWM); err != nil {
+							issueErr = fmt.Errorf("reconcile resolved partition commit to committed HWM %d: %w", current.CommittedHWM, err)
+						} else {
+							partition.FlushDisk()
+							issue.LocalLEO = partition.NextOffset()
+							issue.LocalHWM = partition.GetHWM()
+						}
+					}
 					recoveryErr := partition.RecoveryError()
 					switch {
+					case issueErr != nil:
 					case recoveryErr != nil:
 						issueErr = fmt.Errorf("local partition recovery pending: %w", recoveryErr)
 					case issue.LocalHWM > current.CommittedHWM:
@@ -134,6 +148,17 @@ func (f *BrokerFSM) ReconcileReplicaMaterializations(brokerID string) error {
 	f.replicaMaterialization = pending
 	f.mu.Unlock()
 	return reconcileErr
+}
+
+func uncertainCommitResolvedByMetadata(pending topic.PendingPartitionCommit, current PartitionMetadata) bool {
+	if current.LifecycleEpoch != pending.LifecycleEpoch || current.PartitionCount != pending.PartitionCount {
+		return false
+	}
+	if current.CommittedHWM >= pending.TargetHWM {
+		return true
+	}
+	return current.Leader != pending.Leader ||
+		current.LeaderEpoch != pending.LeaderEpoch
 }
 
 // ReplicaMaterializationReadinessError recalculates and reports node-local

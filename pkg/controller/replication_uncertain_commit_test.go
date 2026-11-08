@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/ackpolicy"
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
@@ -88,7 +89,7 @@ func (e *uncertainCommitExecutor) Commit(task partitionReplicationTask) (partiti
 
 // TestUncertainPartitionCommitPreservesOwnershipAndHistory checks unresolved commits retain history and keep ownership fenced.
 func TestUncertainPartitionCommitPreservesOwnershipAndHistory(t *testing.T) {
-	for _, outcome := range []string{"delayed-commit", "fenced", "shutdown", "unresolved"} {
+	for _, outcome := range []string{"delayed-commit", "delayed-recovery", "delayed-recovery-replaced", "delayed-recovery-replaced-fenced", "fenced", "metadata-deleted", "shutdown"} {
 		t.Run(outcome, func(t *testing.T) {
 			_, manager, base := newDistributedAckTestHandler(t, 2)
 			require.NoError(t, manager.CreateTopic("orders", 1, false, false))
@@ -99,6 +100,7 @@ func TestUncertainPartitionCommitPreservesOwnershipAndHistory(t *testing.T) {
 			executor := &uncertainCommitExecutor{barrierReplicationExecutor: base, attempts: make(chan partitionReplicationTask, 64), resolve: make(chan struct{})}
 			close(base.barrier)
 			queue := newPartitionReplicationCoordinator(1, executor)
+			queue.uncertainCommitTimeout = 100 * time.Millisecond
 			t.Cleanup(queue.close)
 			reservation, err := queue.reserve(context.Background(), "orders", 0)
 			require.NoError(t, err)
@@ -122,12 +124,46 @@ func TestUncertainPartitionCommitPreservesOwnershipAndHistory(t *testing.T) {
 			}
 			require.Equal(t, uint64(1), p.NextOffset())
 			require.Zero(t, p.GetHWM())
+			var replacement error
 			switch outcome {
 			case "delayed-commit":
 				close(executor.resolve)
+			case "delayed-recovery":
+				require.Eventually(t, func() bool {
+					_, pending := p.PendingPartitionCommitState()
+					return pending
+				}, time.Second, 10*time.Millisecond)
+				select {
+				case <-released:
+					t.Fatal("timed-out uncertain commit released write ownership")
+				default:
+				}
+				close(executor.resolve)
+			case "delayed-recovery-replaced":
+				require.Eventually(t, func() bool {
+					_, pending := p.PendingPartitionCommitState()
+					return pending
+				}, time.Second, 10*time.Millisecond)
+				replacement = errors.New("new storage repair failure")
+				p.MarkReconciliationPending(replacement)
+				close(executor.resolve)
+			case "delayed-recovery-replaced-fenced":
+				require.Eventually(t, func() bool {
+					_, pending := p.PendingPartitionCommitState()
+					return pending
+				}, time.Second, 10*time.Millisecond)
+				replacement = errors.New("new storage repair failure")
+				p.MarkReconciliationPending(replacement)
+				base.mu.Lock()
+				base.snapshot.LeaderEpoch++
+				base.mu.Unlock()
 			case "fenced":
 				base.mu.Lock()
 				base.snapshot.LeaderEpoch++
+				base.mu.Unlock()
+			case "metadata-deleted":
+				base.mu.Lock()
+				base.snapshotErr = clusterController.ErrPartitionMetadataNotFound
 				base.mu.Unlock()
 			case "shutdown":
 				queue.close()
@@ -144,9 +180,10 @@ func TestUncertainPartitionCommitPreservesOwnershipAndHistory(t *testing.T) {
 			require.Equal(t, "original", retained[0].Payload)
 			require.Equal(t, "p1", retained[0].ProducerID)
 			require.Equal(t, uint64(1), retained[0].SeqNum)
-			if outcome == "delayed-commit" {
+			if outcome == "delayed-commit" || outcome == "delayed-recovery" {
 				require.NoError(t, err)
 				require.Equal(t, uint64(1), p.GetHWM())
+				require.NoError(t, p.ReconciliationError())
 				records, readErr := p.ReadCommitted(0, 1)
 				require.NoError(t, readErr)
 				require.Len(t, records, 1)
@@ -154,6 +191,9 @@ func TestUncertainPartitionCommitPreservesOwnershipAndHistory(t *testing.T) {
 			} else {
 				require.Error(t, err)
 				require.Error(t, p.ReconciliationError())
+				if replacement != nil {
+					require.ErrorIs(t, p.ReconciliationError(), replacement)
+				}
 				require.Error(t, p.EnqueueBatchLeaderWithMode([]types.Message{{Payload: "must not replace original"}}, true))
 			}
 			base.mu.Lock()

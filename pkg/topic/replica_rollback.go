@@ -58,13 +58,13 @@ func (p *Partition) ApplyReplicaRollbackChecked(ctx context.Context, offset, exp
 }
 
 func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool) (result error) {
-	return p.repairReplicaTail(ctx, offset, expectedLEO, prefix, hwm, beforeMutation, checked, canonicalReplicaRollback)
+	return p.repairReplicaTail(ctx, offset, expectedLEO, prefix, hwm, beforeMutation, checked, canonicalReplicaRollback, nil)
 }
 
 // repairReplicaTail shares physical repair while keeping the distinct authority
 // rules of canonical divergence rollback, speculative tail repair and Raft HWM
 // reconciliation. No maintenance lock or retained-log scan runs under p.mu.
-func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool, policy replicaRepairPolicy) (result error) {
+func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool, policy replicaRepairPolicy, expectedReconciliation error) (result error) {
 	if ctx == nil {
 		return fmt.Errorf("replica rollback requires context")
 	}
@@ -97,6 +97,9 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 		!p.closed && !p.snapshotRecovery && baseErr == nil
 	err := errors.Join(baseErr, p.rollbackErrorLocked())
 	marker := p.reconciliationRevision
+	if expectedReconciliation != nil && p.reconciliationErr != expectedReconciliation {
+		err = errors.Join(err, errors.New("partition reconciliation marker changed"))
+	}
 	p.recoveryMu.RUnlock()
 	if canRetry {
 		p.mu.Unlock()

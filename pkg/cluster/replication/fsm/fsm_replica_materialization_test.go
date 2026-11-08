@@ -114,6 +114,72 @@ func TestReplicaMaterializationReadinessRejectsLocalRecoveryPending(t *testing.T
 	require.Empty(t, state.ReplicaMaterializationIssues())
 }
 
+func TestReplicaMaterializationReconcilesOnlyProvenUncertainCommits(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		committedHWM      uint64
+		leader            string
+		leaderEpoch       int
+		pendingLifecycle  uint64
+		pendingPartitions int
+		wantReady         bool
+		wantLEO           uint64
+		wantHWM           uint64
+	}{
+		{name: "commit applied", committedHWM: 1, leader: "broker-1", leaderEpoch: 7, pendingPartitions: 1, wantReady: true, wantLEO: 1, wantHWM: 1},
+		{name: "leader epoch advanced", committedHWM: 0, leader: "broker-1", leaderEpoch: 8, pendingPartitions: 1, wantReady: true, wantLEO: 0, wantHWM: 0},
+		{name: "leader changed", committedHWM: 0, leader: "broker-2", leaderEpoch: 7, pendingPartitions: 1, wantReady: true, wantLEO: 0, wantHWM: 0},
+		{name: "same fence remains uncertain", committedHWM: 0, leader: "broker-1", leaderEpoch: 7, pendingPartitions: 1, wantLEO: 1, wantHWM: 0},
+		{name: "partition count mismatch remains uncertain", committedHWM: 1, leader: "broker-1", leaderEpoch: 7, pendingPartitions: 2, wantLEO: 1, wantHWM: 0},
+		{name: "lifecycle mismatch remains uncertain", committedHWM: 1, leader: "broker-1", leaderEpoch: 7, pendingLifecycle: 2, pendingPartitions: 1, wantLEO: 1, wantHWM: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.LogDir = t.TempDir()
+			diskManager := disk.NewDiskManager(cfg)
+			t.Cleanup(diskManager.CloseAllHandlers)
+			topicManager := topic.NewTopicManager(cfg, diskManager, nil)
+			require.NoError(t, topicManager.CreateTopic("orders", 1, false, false))
+			localTopic := topicManager.GetTopic("orders")
+			partition, err := localTopic.GetPartition(0)
+			require.NoError(t, err)
+			require.NoError(t, partition.ReplicaAppendWithMode([]types.Message{{Offset: 0, Payload: "uncertain"}}, true))
+
+			definition := localTopic.Definition()
+			pendingLifecycle := test.pendingLifecycle
+			if pendingLifecycle == 0 {
+				pendingLifecycle = definition.LifecycleEpoch
+			}
+			partition.MarkReconciliationPending(&topic.UncertainPartitionCommit{
+				Cause: errors.New("reply lost"), Leader: "broker-1", LeaderEpoch: 7,
+				LifecycleEpoch: pendingLifecycle, PartitionCount: test.pendingPartitions, TargetHWM: 1,
+			})
+
+			state := NewBrokerFSM(topicManager, nil)
+			state.mu.Lock()
+			state.topicState["orders"] = &definition
+			state.partitionMetadata["orders-0"] = &PartitionMetadata{
+				Leader: test.leader, LeaderEpoch: test.leaderEpoch, LifecycleEpoch: definition.LifecycleEpoch,
+				CommittedHWM: test.committedHWM, CommittedHWMKnown: true, PartitionCount: 1,
+				Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"},
+			}
+			state.mu.Unlock()
+
+			err = state.ReplicaMaterializationReadinessError("broker-1")
+			if test.wantReady {
+				require.NoError(t, err)
+				require.NoError(t, partition.ReconciliationError())
+			} else {
+				require.ErrorContains(t, err, "local partition recovery pending")
+				_, pending := partition.PendingPartitionCommitState()
+				require.True(t, pending)
+			}
+			require.Equal(t, test.wantLEO, partition.NextOffset())
+			require.Equal(t, test.wantHWM, partition.GetHWM())
+		})
+	}
+}
+
 func TestReplicaMaterializationReadinessIgnoresUnassignedPartition(t *testing.T) {
 	state := NewBrokerFSM(nil, nil)
 	state.mu.Lock()

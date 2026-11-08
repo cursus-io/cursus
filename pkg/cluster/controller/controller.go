@@ -23,6 +23,7 @@ import (
 )
 
 var ErrPartitionLeaderFenced = errors.New("partition leader fenced")
+var ErrPartitionMetadataNotFound = errors.New("partition metadata not found")
 
 // LeaderChecker provides leadership status queries.
 type LeaderChecker interface {
@@ -322,7 +323,7 @@ func (cc *ClusterController) GetPartitionReplicationSnapshot(topic string, parti
 	partitionKey := topic + "-" + strconv.Itoa(partition)
 	meta := fsmRef.GetPartitionMetadata(partitionKey)
 	if meta == nil {
-		return PartitionReplicationSnapshot{}, fmt.Errorf("partition metadata not found: %s", partitionKey)
+		return PartitionReplicationSnapshot{}, fmt.Errorf("%w: %s", ErrPartitionMetadataNotFound, partitionKey)
 	}
 	if meta.Leader != cc.brokerID {
 		return PartitionReplicationSnapshot{}, fmt.Errorf("%w: current=%s local=%s epoch=%d", ErrPartitionLeaderFenced, meta.Leader, cc.brokerID, meta.LeaderEpoch)

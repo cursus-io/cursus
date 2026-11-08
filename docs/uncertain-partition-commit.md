@@ -2,7 +2,7 @@
 
 ## Design and regression contract
 
-Kafka's accepted [KIP-101](https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=177052956)
+Kafka's accepted [KIP-101](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/67634337/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation)
 requires leader-history evidence instead of treating a stale local watermark as
 permission to truncate. Kafka 4.0.0's [ReplicaFetcherThread](https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/ReplicaFetcherThread.scala)
 appends fetched records before advancing its watermark and truncates using the
@@ -13,24 +13,39 @@ Implemented correction: once ISR replication has succeeded and a commit has been
 attempted, retain the exact append and partition ownership while retrying that
 same idempotent commit. Do not re-append, re-replicate, or roll back to a stale
 local HWM on an uncertain commit reply. Recheck the leader/lifecycle fence before
-retrying. On shutdown, fence change or unresolved bounded wait, preserve the
-tail and mark reconciliation pending before releasing ownership. Never turn an
-uncertain reply into a successful acknowledgement without commit evidence.
+retrying. After the existing five-second FSM allowance, mark reconciliation
+pending but keep the partition lane and append ownership while retrying only the
+same commit once per second. On shutdown or partition-fence change, preserve the
+tail before releasing ownership. Never turn an uncertain reply into a successful
+acknowledgement without commit evidence.
 
-This trades temporary partition availability for retained history. Retries send
-metadata commands, not data batches; they add no retained-log rewrite or
-partition-record decoding, hashing or transfer. Raft metadata transport still
-adds work. Repair after a changed fence still belongs to existing
-verified recovery. The retry window is the existing five-second FSM allowance;
-an in-flight commit RPC retains its own timeout. If the outcome is still unknown,
-later local HWM application alone does not clear the reconciliation fence. This
-is a conservative fallback, not a new automatic repair mechanism for arbitrary
-outages. No wire or storage format changes are needed.
+This trades availability of only the affected partition lane for retained
+history. Retries send metadata commands, not data batches: recovery transfers
+zero record bytes and performs no append, decode or hash work. The initial retry
+cadence remains 25 ms for five seconds and then falls to one metadata command per
+second until Raft recovers, shutdown begins or the partition fence changes. A
+confirmed commit advances the local HWM without rewriting retained log bytes.
+After a leader/leader-epoch change in the same lifecycle and partition-count
+space, authoritative Raft metadata may instead truncate only the uncommitted
+local tail. Missing committed bytes still use the existing replica catch-up path.
+
+Cursus differs from Kafka because data is push-replicated before a separate,
+fenced Raft PARTITION_COMMIT. It adopts Kafka's epoch proof rule for deciding
+whether a retained tail may be truncated, but does not add Kafka's pull fetcher
+or epoch file format. Lifecycle or partition-count changes and arbitrary storage
+or reconciliation errors remain fail-closed. Tail repair revalidates the exact
+typed marker under the partition repair locks, so a newer recovery failure can
+never be cleared by an older metadata observation. Missing partition metadata
+is a terminal lifecycle fence rather than an indefinitely retryable outage. No
+wire or storage format changes are needed.
 
 Before implementation, regressions must demonstrate: an uncertain reply followed
 by delayed commit retains the original offset/payload, holds write ownership,
-replicates data once and eventually commits; shutdown and fence change retain
-bytes and block new writes; normal accepted commits and permanent replication
+replicates data once and eventually commits even after the five-second allowance;
+shutdown and fence change retain bytes and block new writes; a matching
+authoritative HWM or a same-lifecycle leader epoch change clears only the typed
+uncertain-commit marker; lifecycle/partition-count mismatches and arbitrary
+recovery errors remain fenced. Normal accepted commits and permanent replication
 rejections keep their existing contracts. Then rerun interrupted mixed-load
 recovery with its original zero-error/progress checks and full post-heal identity
 checks, recording per-process transfer/read/write/hash/decode work. Large-replica

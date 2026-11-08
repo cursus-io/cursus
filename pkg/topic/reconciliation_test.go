@@ -59,3 +59,21 @@ func TestValidateReconciliationRecordPreservesStorageFailure(t *testing.T) {
 	require.ErrorContains(t, p.RecoveryError(), "corrupt transaction index")
 	storage.AssertExpectations(t)
 }
+
+func TestReconcilePendingPartitionCommitPreservesReplacementMarker(t *testing.T) {
+	storage := new(MockStorageHandler)
+	storage.On("GetLatestOffset").Return(uint64(1)).Once()
+	p := NewPartition(0, "events", storage, nil, config.DefaultConfig())
+	p.MarkReconciliationPending(&UncertainPartitionCommit{
+		Cause: errors.New("reply lost"), Leader: "broker-1", LeaderEpoch: 7,
+		LifecycleEpoch: InitialLifecycleEpoch, PartitionCount: 1, TargetHWM: 1,
+	})
+	pending, ok := p.PendingPartitionCommitState()
+	require.True(t, ok)
+
+	replacement := errors.New("new storage repair failure")
+	p.MarkReconciliationPending(replacement)
+	require.ErrorContains(t, p.ReconcilePendingPartitionCommit(pending, 1), "marker changed")
+	require.ErrorIs(t, p.ReconciliationError(), replacement)
+	storage.AssertExpectations(t)
+}

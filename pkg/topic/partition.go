@@ -316,20 +316,82 @@ func (p *Partition) RecoveryError() error {
 	return errors.Join(p.recoveryErr, p.txnRecoveryErr, p.producerRecoveryErr, p.reconciliationErr, p.bootstrapErrorLocked(), p.rollbackErrorLocked())
 }
 
+// UncertainPartitionCommit identifies an append whose Raft PARTITION_COMMIT
+// reply was lost. The original replication fence is retained so a later
+// metadata scan can distinguish an applied commit from a safely fenced one.
+type UncertainPartitionCommit struct {
+	Cause          error
+	Leader         string
+	LeaderEpoch    int
+	LifecycleEpoch uint64
+	PartitionCount int
+	TargetHWM      uint64
+}
+
+func (e *UncertainPartitionCommit) Error() string {
+	if e == nil {
+		return "uncertain partition commit"
+	}
+	return fmt.Sprintf(
+		"partition commit outcome unresolved: leader=%s leader_epoch=%d lifecycle_epoch=%d partition_count=%d target_hwm=%d: %v",
+		e.Leader, e.LeaderEpoch, e.LifecycleEpoch, e.PartitionCount, e.TargetHWM, e.Cause,
+	)
+}
+
+func (e *UncertainPartitionCommit) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// PendingPartitionCommit identifies the exact reconciliation marker observed by
+// a metadata scan. Its private marker prevents a later repair from clearing a
+// different recovery failure installed after the scan.
+type PendingPartitionCommit struct {
+	UncertainPartitionCommit
+	marker error
+}
+
+// PendingPartitionCommitState returns the uncertain commit currently owning
+// the reconciliation fence together with its exact marker identity.
+func (p *Partition) PendingPartitionCommitState() (PendingPartitionCommit, bool) {
+	p.recoveryMu.RLock()
+	defer p.recoveryMu.RUnlock()
+	var pending *UncertainPartitionCommit
+	if !errors.As(p.reconciliationErr, &pending) || pending == nil {
+		return PendingPartitionCommit{}, false
+	}
+	return PendingPartitionCommit{UncertainPartitionCommit: *pending, marker: p.reconciliationErr}, true
+}
+
 // MarkReconciliationPending fences leader appends after a failed tail repair.
 func (p *Partition) MarkReconciliationPending(err error) {
 	if err == nil {
 		return
 	}
+	_ = p.markReconciliationPending(err)
+}
+
+func (p *Partition) markReconciliationPending(err error) error {
 	p.recoveryMu.Lock()
-	p.reconciliationErr = fmt.Errorf("committed HWM reconciliation pending: %w", err)
+	marker := fmt.Errorf("committed HWM reconciliation pending: %w", err)
+	p.reconciliationErr = marker
 	if p.reconciliationRevision == math.MaxUint64 {
 		p.recoveryErr = errors.Join(p.recoveryErr, errors.New("reconciliation revision exhausted"))
 		p.recoveryMu.Unlock()
-		return
+		return marker
 	}
 	p.reconciliationRevision++
 	p.recoveryMu.Unlock()
+	return marker
+}
+
+// MarkUncertainPartitionCommit installs a typed fence and returns its exact
+// identity for a later commit-completion repair.
+func (p *Partition) MarkUncertainPartitionCommit(commit UncertainPartitionCommit) PendingPartitionCommit {
+	marker := p.markReconciliationPending(&commit)
+	return PendingPartitionCommit{UncertainPartitionCommit: commit, marker: marker}
 }
 
 // ReconciliationError reports whether leader appends are waiting for tail repair.
@@ -1687,7 +1749,16 @@ func (p *Partition) ReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm 
 // ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.
 // Any local tail beyond that watermark was never committed and must not survive leader promotion.
 func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
-	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile)
+	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile, nil)
+}
+
+// ReconcilePendingPartitionCommit applies an authoritative HWM only while the
+// typed marker validated by the caller still owns the reconciliation fence.
+func (p *Partition) ReconcilePendingPartitionCommit(pending PendingPartitionCommit, hwm uint64) error {
+	if pending.marker == nil {
+		return fmt.Errorf("uncertain partition commit marker is unavailable")
+	}
+	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile, pending.marker)
 }
 
 // TruncateReplicaTail removes only records above a repair boundary. It does not
@@ -1698,7 +1769,7 @@ func (p *Partition) TruncateReplicaTail(offset uint64) error {
 
 // TruncateReplicaTailContext cancels queued repair before it changes storage.
 func (p *Partition) TruncateReplicaTailContext(ctx context.Context, offset uint64) error {
-	return p.repairReplicaTail(ctx, offset, 0, nil, 0, nil, false, speculativeReplicaTail)
+	return p.repairReplicaTail(ctx, offset, 0, nil, 0, nil, false, speculativeReplicaTail, nil)
 }
 
 // ApplyReplicaRollback moves a recovering follower to a leader-proven
