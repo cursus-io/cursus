@@ -158,13 +158,15 @@ func (d *DiskHandler) LineageCandidatesContext(ctx context.Context, tail uint64)
 		return nil, fmt.Errorf("lineage tail %d outside retained range [%d,%d]", tail, index.start, index.tail.EndOffset)
 	}
 	ends := lineageCandidateEnds(index.start, tail)
-	proofs := make([]LineagePrefix, 0, len(ends))
-	for _, end := range ends {
-		proof, err := d.lineagePrefix(ctx, end)
+	proofs := make([]LineagePrefix, len(ends))
+	// Build from the smallest endpoint so later proofs can reuse certified
+	// cursors. Keep the original descending order on the wire.
+	for i := len(ends) - 1; i >= 0; i-- {
+		proof, err := d.lineagePrefix(ctx, ends[i])
 		if err != nil {
 			return nil, err
 		}
-		proofs = append(proofs, proof)
+		proofs[i] = proof
 	}
 	if err := d.checkLineageGeneration(ctx); err != nil {
 		return nil, err
