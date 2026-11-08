@@ -450,7 +450,7 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 					// fence proves that the old local watermark is authoritative.
 					util.Error("partition commit outcome unresolved; tail preserved topic=%s partition=%d ack_mode=%s commit_hwm=%d error=%v", task.topic, task.partition, task.ackMode, task.commitHWM, err)
 					if task.partitionRef != nil {
-						task.partitionRef.MarkReconciliationPending(err)
+						task.partitionRef.MarkReconciliationPending(retainPartitionCommitOutcome(task, err))
 					}
 					completeReplicationTaskPreservingTail(task, err)
 					return
