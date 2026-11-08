@@ -2,10 +2,14 @@ package e2e_cluster
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/test/e2e"
 )
 
@@ -23,7 +27,7 @@ type topicMetadata struct {
 	Partitions []partitionMetadata `json:"partitions"`
 }
 
-func ExpectReplicatedMessages(expectedPartitions, expectedReplicas, minISR int, expectedRecords uint64) e2e.Expectation {
+func ExpectReplicatedMessages(expectedPartitions, expectedReplicas, expectedISR, minISR int, expectedRecords uint64) e2e.Expectation {
 	return func(ctx *e2e.TestContext) error {
 		if ctx.GetAcks() != "all" {
 			return fmt.Errorf("replication contract requires acks=all, got %q", ctx.GetAcks())
@@ -31,36 +35,107 @@ func ExpectReplicatedMessages(expectedPartitions, expectedReplicas, minISR int, 
 		if ctx.GetPublishedCount() != ctx.GetNumMessages() {
 			return fmt.Errorf("published %d messages, want %d", ctx.GetPublishedCount(), ctx.GetNumMessages())
 		}
-		topic := ctx.GetTopic()
-		client := ctx.GetClient()
-		return eventually(ctx.GetT(), fmt.Sprintf("replicated committed state for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
-			resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
-			if err != nil {
-				return false, "DESCRIBE failed", err
-			}
-			var meta topicMetadata
-			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
-				return false, resp, err
-			}
-			if err := validateTopicMetadata(meta, topic, expectedPartitions, expectedReplicas, minISR, expectedRecords); err != nil {
-				return false, err.Error(), nil
-			}
-			return true, fmt.Sprintf("partitions=%d replicas=%d min_isr=%d leo=hwm=%d", expectedPartitions, expectedReplicas, minISR, expectedRecords), nil
-		})
+		return ExpectTopicReplication(expectedPartitions, expectedReplicas, expectedISR, minISR, expectedRecords)(ctx)
 	}
 }
 
-func validateTopicMetadata(meta topicMetadata, expectedTopic string, expectedPartitions, expectedReplicas, minISR int, expectedRecords uint64) error {
+func ExpectTopicReplication(expectedPartitions, expectedReplicas, expectedISR, minISR int, expectedRecords uint64) e2e.Expectation {
+	return func(ctx *e2e.TestContext) error {
+		if err := validateISRContract(expectedReplicas, expectedISR, minISR, false); err != nil {
+			return err
+		}
+		return expectTopicMetadata(ctx, expectedPartitions, expectedReplicas, expectedISR, expectedRecords)
+	}
+}
+
+func ExpectISRBelowMinISR(expectedPartitions, expectedReplicas, expectedISR, minISR int, expectedRecords uint64) e2e.Expectation {
+	return func(ctx *e2e.TestContext) error {
+		if err := validateISRContract(expectedReplicas, expectedISR, minISR, true); err != nil {
+			return err
+		}
+		return expectTopicMetadata(ctx, expectedPartitions, expectedReplicas, expectedISR, expectedRecords)
+	}
+}
+
+func PublishRejectedBelowMinISR(minISR int) e2e.Expectation {
+	return func(ctx *e2e.TestContext) error {
+		if ctx.GetPublishedCount() != 0 {
+			return fmt.Errorf("published %d messages below minISR %d, want 0", ctx.GetPublishedCount(), minISR)
+		}
+		err := ctx.GetLastError()
+		if err == nil {
+			return fmt.Errorf("publish below minISR %d succeeded", minISR)
+		}
+		if err := validateMinISRRejection(err, minISR); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func validateMinISRRejection(err error, minISR int) error {
+	var brokerErr *wire.BrokerError
+	if errors.As(err, &brokerErr) {
+		if brokerErr.Code != "insufficient_in_sync_replicas" {
+			return fmt.Errorf("publish failed with broker code %q, want insufficient_in_sync_replicas", brokerErr.Code)
+		}
+		wantRequired := strconv.Itoa(minISR)
+		if brokerErr.Fields["required"] != wantRequired {
+			return fmt.Errorf("insufficient_in_sync_replicas required=%q, want %s", brokerErr.Fields["required"], wantRequired)
+		}
+		return nil
+	}
+
+	message := err.Error()
+	legacyControllerError := strings.Contains(message, "insufficient_in_sync_replicas") &&
+		strings.Contains(message, fmt.Sprintf("required=%d", minISR))
+	legacyReplicationError := strings.Contains(message, "insufficient") &&
+		strings.Contains(message, fmt.Sprintf("minISR %d", minISR))
+	if !legacyControllerError && !legacyReplicationError {
+		return fmt.Errorf("publish failed with %q, want insufficient_in_sync_replicas required=%d", message, minISR)
+	}
+	return nil
+}
+
+func expectTopicMetadata(ctx *e2e.TestContext, expectedPartitions, expectedReplicas, expectedISR int, expectedRecords uint64) error {
+	topic := ctx.GetTopic()
+	client := ctx.GetClient()
+	return eventually(ctx.GetT(), fmt.Sprintf("replicated committed state for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
+		resp, err := client.SendCommand("", fmt.Sprintf("DESCRIBE topic=%s", topic), 5*time.Second)
+		if err != nil {
+			return false, "DESCRIBE failed", err
+		}
+		var meta topicMetadata
+		if err := json.Unmarshal([]byte(resp), &meta); err != nil {
+			return false, resp, err
+		}
+		if err := validateTopicMetadata(meta, topic, expectedPartitions, expectedReplicas, expectedISR, expectedRecords); err != nil {
+			return false, err.Error(), nil
+		}
+		return true, fmt.Sprintf("partitions=%d replicas=%d isr=%d leo=hwm=%d", expectedPartitions, expectedReplicas, expectedISR, expectedRecords), nil
+	})
+}
+
+func validateISRContract(expectedReplicas, expectedISR, minISR int, expectBelowMinISR bool) error {
+	if expectedReplicas <= 0 || expectedISR < 0 || minISR <= 0 || expectedISR > expectedReplicas || minISR > expectedReplicas {
+		return fmt.Errorf("invalid replication expectation: replicas=%d isr=%d min_isr=%d", expectedReplicas, expectedISR, minISR)
+	}
+	if expectBelowMinISR && expectedISR >= minISR {
+		return fmt.Errorf("invalid below-minISR expectation: isr=%d min_isr=%d", expectedISR, minISR)
+	}
+	if !expectBelowMinISR && expectedISR < minISR {
+		return fmt.Errorf("unsafe replication expectation: isr=%d min_isr=%d", expectedISR, minISR)
+	}
+	return nil
+}
+
+func validateTopicMetadata(meta topicMetadata, expectedTopic string, expectedPartitions, expectedReplicas, expectedISR int, expectedRecords uint64) error {
 	if meta.Topic != expectedTopic {
 		return fmt.Errorf("topic=%q, want %q", meta.Topic, expectedTopic)
 	}
 	if len(meta.Partitions) != expectedPartitions {
 		return fmt.Errorf("partitions=%d, want %d", len(meta.Partitions), expectedPartitions)
 	}
-	if expectedReplicas < minISR {
-		return fmt.Errorf("invalid expectation: replicas=%d min_isr=%d", expectedReplicas, minISR)
-	}
-
 	seenPartitions := make(map[int]struct{}, expectedPartitions)
 	for _, partition := range meta.Partitions {
 		if _, exists := seenPartitions[partition.ID]; exists {
@@ -70,7 +145,7 @@ func validateTopicMetadata(meta topicMetadata, expectedTopic string, expectedPar
 		if partition.Leader == "" {
 			return fmt.Errorf("partition %d has no leader", partition.ID)
 		}
-		if err := validateReplicaMembership(partition, expectedReplicas, minISR); err != nil {
+		if err := validateReplicaMembership(partition, expectedReplicas, expectedISR); err != nil {
 			return err
 		}
 		if partition.LEO != expectedRecords || partition.HWM != expectedRecords {
@@ -86,12 +161,12 @@ func validateTopicMetadata(meta topicMetadata, expectedTopic string, expectedPar
 	return nil
 }
 
-func validateReplicaMembership(partition partitionMetadata, expectedReplicas, minISR int) error {
+func validateReplicaMembership(partition partitionMetadata, expectedReplicas, expectedISR int) error {
 	if len(partition.Replicas) != expectedReplicas {
 		return fmt.Errorf("partition %d replicas=%v, want %d replicas", partition.ID, partition.Replicas, expectedReplicas)
 	}
-	if len(partition.ISR) < minISR {
-		return fmt.Errorf("partition %d isr=%v, want at least %d in-sync replicas", partition.ID, partition.ISR, minISR)
+	if len(partition.ISR) != expectedISR {
+		return fmt.Errorf("partition %d isr=%v, want exactly %d in-sync replicas", partition.ID, partition.ISR, expectedISR)
 	}
 
 	replicas := make(map[string]struct{}, len(partition.Replicas))

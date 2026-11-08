@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -1279,10 +1280,26 @@ func TestHandleBatchMessage_InvalidData(t *testing.T) {
 	assert.Contains(t, resp, "ERROR")
 }
 
-func TestBatchEncodingRejectsInvalidAcks(t *testing.T) {
+func TestHandleBatchMessageRejectsInvalidAcksAtWireBoundary(t *testing.T) {
+	ch, _ := newTestHandler(t)
 	msgs := []types.Message{{Payload: "m1", ProducerID: "p1", SeqNum: 1}}
-	_, err := util.EncodeBatchMessages("batch-acks-topic", 0, "5", false, msgs)
-	require.ErrorContains(t, err, `invalid acknowledgements "5"`)
+	data, err := util.EncodeBatchMessages("batch-acks-topic", 0, "1", false, msgs)
+	require.NoError(t, err)
+
+	const batchHeaderSize = 8 // magic, version, flags
+	require.GreaterOrEqual(t, len(data), batchHeaderSize+4)
+	topicLength := int(binary.BigEndian.Uint32(data[batchHeaderSize : batchHeaderSize+4]))
+	acksLengthOffset := batchHeaderSize + 4 + topicLength + 4 // topic field, partition
+	require.GreaterOrEqual(t, len(data), acksLengthOffset+4)
+	acksLength := int(binary.BigEndian.Uint32(data[acksLengthOffset : acksLengthOffset+4]))
+	require.Equal(t, 1, acksLength)
+	acksOffset := acksLengthOffset + 4
+	require.GreaterOrEqual(t, len(data), acksOffset+acksLength)
+	data[acksOffset] = '5'
+
+	resp, err := ch.HandleBatchMessage(data, nil)
+	require.NoError(t, err)
+	require.Equal(t, `ERROR: batch_decode_failed reason="decode Wire v2 batch: invalid acknowledgements \"5\""`, resp)
 }
 
 func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {

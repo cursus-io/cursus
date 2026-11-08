@@ -43,7 +43,7 @@ func TestChaosLeaderFailoverRetryAndOffsetDurability(t *testing.T) {
 	actions.RetryPublishMessages().
 		RecoverFollower(leaderNode)
 	actions.Then().
-		Expect(ExpectReplicatedMessages(1, 3, 1, 100)).
+		Expect(ExpectReplicatedMessages(1, 3, 3, 2, 100)).
 		And(ExpectOffsetMatched(0, 50)).
 		And(ExpectPartitionWatermarks(0, 100, 100)).
 		And(e2e.PublisherRetriedSuccessfully())

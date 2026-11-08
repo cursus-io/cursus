@@ -32,6 +32,7 @@ type ClusterTestContext struct {
 	*e2e.TestContext
 	clusterSize       int
 	minInSyncReplicas int
+	idempotent        bool
 }
 
 func brokerPort(nodeIndex int) int {
@@ -210,6 +211,7 @@ func (c *ClusterTestContext) WithAcks(acks string) *ClusterTestContext {
 
 func (c *ClusterTestContext) WithIdempotent(enabled bool) *ClusterTestContext {
 	c.TestContext.WithIdempotent(enabled)
+	c.idempotent = enabled
 	return c
 }
 

@@ -90,12 +90,14 @@ jobs:
       - name: Run cluster harness contract tests
         run: >-
           go test -race ./test/e2e-cluster/...
-          -run '^(TestLeaderNodeFromDescribeUsesLeaderField|TestLeaderNodeFromDescribeRejectsUnknownLeader|TestValidateNodeHealthURLRestrictsLoopbackEndpoint|TestValidateTopicMetadata.*|TestListClusterReady|TestEventuallyReturnsWhenConditionBecomesReady|TestEventuallyIncludesLastError)$'
+          -run '^Test(LeaderNodeFromDescribe(UsesLeaderField|RejectsUnknownLeader)|ValidateNodeHealthURLRestrictsLoopbackEndpoint|TopicMetadataConverged(RequiresEveryBroker|ReportsProbeFailure)|MetadataResponseMatchesExactTopic|ValidateTopicMetadata.*|ValidateTopicMinISRResponseRequiresConfiguredAndEffectivePolicy|ValidateISRContractRejectsWrongSideOfMinISR|PublishRejectedBelowMinISRRequiresQuorumFailure|ListClusterReady|Cleanup(ExplicitOffsetMatchesComposeAndClients|MetricReaderUsesIsolatedPort)|HistoryAdmissionRetryPreservesLifecycleBlockers|ObserveRecoveryFenceWaitsForEveryBroker|BrokerEvictedFromISR(RequiresTargetAbsentWithRemainingReplicas|RejectsTargetStillPresent|RejectsAdditionalReplicaLoss)|ParseLocalClusterStatus(RejectsNonLocalResponse)?|ParseLocalTopicDefinition|ComposeCommandArgsIncludesSnapshotOverlay|TopicMissingResultHandlesWireV2Error|Eventually(ReturnsWhenConditionBecomesReady|IncludesLastError|StableResetsWindowAfterRegression))$'
           -count=1
       - name: Run fault-injection contract tests
         env:
           CURSUS_E2E_FAULTS: "1"
-        run: go test -race -tags=e2e_faults ./internal/e2efaults ./cmd/broker
+        run: |
+          go test -race -tags=e2e_faults ./internal/e2efaults
+          go test -race -tags=e2e_faults ./cmd/broker -run '^TestFaultStorageProviderRequiresExplicitRuntimeGate$'
 
   build:
     runs-on: ubuntu-latest

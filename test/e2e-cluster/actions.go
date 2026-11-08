@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,8 +122,41 @@ func (a *ClusterActions) checkAllNodesHealth() error {
 }
 
 func (a *ClusterActions) CreateTopic() *ClusterActions {
-	a.actions.CreateTopic()
+	topic := a.ctx.GetTopic()
+	a.ctx.GetT().Logf("Creating replicated topic %q with %d partitions and minISR %d", topic, a.ctx.GetPartitions(), a.ctx.minInSyncReplicas)
+	response, err := a.actions.SendCommand(fmt.Sprintf(
+		"CREATE topic=%s partitions=%d replication_factor=%d min_in_sync_replicas=%d idempotent=%t",
+		topic,
+		a.ctx.GetPartitions(),
+		a.ctx.clusterSize,
+		a.ctx.minInSyncReplicas,
+		a.ctx.idempotent,
+	))
+	if err != nil {
+		a.ctx.GetT().Fatalf("Failed to create replicated topic %s: %v", topic, err)
+	}
+	if err := validateTopicMinISRResponse(response, a.ctx.minInSyncReplicas); err != nil {
+		a.ctx.GetT().Fatalf("Topic %s minISR policy was not applied: %v; response: %s", topic, err, response)
+	}
 	return a
+}
+
+func validateTopicMinISRResponse(response string, minISR int) error {
+	fields := make(map[string]string)
+	for _, field := range strings.Fields(response) {
+		key, value, ok := strings.Cut(field, "=")
+		if ok {
+			fields[key] = value
+		}
+	}
+	want := strconv.Itoa(minISR)
+	if fields["min_in_sync_replicas"] != want {
+		return fmt.Errorf("configured minISR=%q, want %s", fields["min_in_sync_replicas"], want)
+	}
+	if fields["effective_min_in_sync_replicas"] != want {
+		return fmt.Errorf("effective minISR=%q, want %s", fields["effective_min_in_sync_replicas"], want)
+	}
+	return nil
 }
 
 func (a *ClusterActions) PublishMessages() *ClusterActions {
@@ -355,7 +389,7 @@ func metadataResponseMatchesTopic(response, topic string) bool {
 	return false
 }
 
-func (a *ClusterActions) WaitForTopicReplication(expectedReplicas, minISR int) *ClusterActions {
+func (a *ClusterActions) WaitForTopicReplication(expectedReplicas, expectedISR int) *ClusterActions {
 	topic := a.ctx.GetTopic()
 	addrs := a.ctx.GetBrokerAddrs()
 	if err := eventually(a.ctx.GetT(), fmt.Sprintf("replication metadata consensus for %s", topic), clusterReadyTimeout, func() (bool, string, error) {
@@ -372,7 +406,10 @@ func (a *ClusterActions) WaitForTopicReplication(expectedReplicas, minISR int) *
 			if err := json.Unmarshal([]byte(resp), &meta); err != nil {
 				return false, fmt.Sprintf("%s: %s", addr, resp), err
 			}
-			if err := validateTopicMetadata(meta, topic, a.ctx.GetPartitions(), expectedReplicas, minISR, 0); err != nil {
+			if err := validateISRContract(expectedReplicas, expectedISR, a.ctx.minInSyncReplicas, false); err != nil {
+				return false, fmt.Sprintf("%s: %v", addr, err), nil
+			}
+			if err := validateTopicMetadata(meta, topic, a.ctx.GetPartitions(), expectedReplicas, expectedISR, 0); err != nil {
 				return false, fmt.Sprintf("%s: %v", addr, err), nil
 			}
 

@@ -87,6 +87,7 @@ func TestTransactionalProducerAgainstBroker(t *testing.T) {
 		t.Fatalf("unexpected committed transaction: %+v", committed)
 	}
 
+	visibilityGeneration, visibilityMember = integrationJoinGroup(t, client, topic, visibilityGroup)
 	messages := integrationConsumePartition(t, client, addrs, topic, visibilityGroup, visibilityMember, visibilityGeneration)
 	if len(messages) != 1 || messages[0].Payload != "sdk-transaction-record" {
 		t.Fatalf("unexpected committed records: %+v", messages)
