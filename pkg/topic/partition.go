@@ -363,7 +363,7 @@ func (p *Partition) MarkReconciliationPending(err error) {
 	if err == nil {
 		return
 	}
-	p.markReconciliationPending(err)
+	_ = p.markReconciliationPending(err)
 }
 
 func (p *Partition) markReconciliationPending(err error) error {
