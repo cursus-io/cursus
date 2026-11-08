@@ -154,6 +154,34 @@ With the corrected oracle, three consecutive runs passed in 115.99, 57.35 and
 run, and none redelivered within an unchanged grant. The third run observed one
 133-byte replay during a member handoff, within the existing one-batch bound.
 
+The repaired implementation passed a 12-round preflight in 1,426.51 test seconds
+(1,322.062 campaign seconds), verifying 396 records from 450 attempts. A fresh
+24-hour attempt then ran from 2026-11-07 19:57:07 to 22:34:54 UTC and failed after
+9,462.83 test seconds. The first 76 rounds completed full verification: 2,627
+records from 3,147 attempts, with history digest
+`20f22d659e1b501fbbf4b2cfd24f517d6f4f43f8ce5307f526fdfea3448cd505`.
+
+Round 77 healed its isolation/quorum-loss fault, received another ACK and
+observed all three replicas in ISR at committed end 2,637. Subsequent public
+connections and Docker diagnostics timed out. Docker Desktop's own API log
+records `HEAD /_ping` calls taking over ten minutes, completing together at
+22:34:29 UTC; some broker messages also reached the Docker log stream roughly
+ten minutes late. Container deletion began only during the test's cleanup.
+This establishes a Docker/host execution stall during the failure, but does
+not establish its trigger or prove final record preservation: round 77 did not
+complete readback. The retained kernel log has no OOM-kill report, and the
+examined Windows event window has no sleep/restart event. Neither absence rules
+out resource pressure or a virtualization fault. This attempt is failed, not a
+24-hour pass, and its duration cannot be added to a replacement campaign.
+
+The local replacement runner bounds each evidence command and separately
+samples host memory, WSL memory/CPU/I/O counters and container resource usage.
+Pressure stall counters are captured when the host kernel provides them.
+Failed captures retain their timestamps, elapsed time and timeout status;
+successful capture cursors advance independently. These changes improve
+diagnosis when Docker is unresponsive. They do not repair a demonstrated
+broker defect or relax the campaign's recovery deadline and history oracle.
+
 ## Running
 
 Run only one ACK fixture at a time; all its tests own the same dedicated Compose
