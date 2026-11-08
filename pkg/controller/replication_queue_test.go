@@ -725,31 +725,82 @@ func TestAllAcknowledgementRechecksISRBeforeCommit(t *testing.T) {
 	require.Equal(t, uint64(1), executor.committed())
 }
 
-func TestAllAcknowledgementWaitsForMinimumISRAfterMembershipChange(t *testing.T) {
+func TestAllAcknowledgementRejectsBelowMinimumISRWithoutBlockingLane(t *testing.T) {
 	executor := newBarrierReplicationExecutor()
 	close(executor.barrier)
 	executor.snapshot.ISR = []string{"broker-1"}
 	coordinator := newPartitionReplicationCoordinator(1, executor)
 	t.Cleanup(coordinator.close)
-	reservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	firstReservation, err := coordinator.reserve(context.Background(), "orders", 0)
 	require.NoError(t, err)
-	task := replicationTaskForMode(executor, ackpolicy.All)
-	reservation.submit(task)
+	first := replicationTaskForMode(executor, ackpolicy.All)
+	firstReservation.submit(first)
 
-	require.Never(t, func() bool {
-		executor.mu.Lock()
-		defer executor.mu.Unlock()
-		return executor.replicateCalls != 0
-	}, 50*time.Millisecond, 5*time.Millisecond)
+	firstErr := <-first.result
+	var isrErr *retryableReplicationStateError
+	require.ErrorAs(t, firstErr, &isrErr)
+	require.Equal(t, "insufficient_in_sync_replicas", isrErr.ReplicationErrorCode())
+	require.Equal(t, 1, isrErr.currentISR)
+	require.Equal(t, 2, isrErr.requiredISR)
+	require.Zero(t, executor.replicateCalls)
+
 	executor.mu.Lock()
 	executor.snapshot.ISR = []string{"broker-1", "broker-3"}
 	executor.mu.Unlock()
 
-	require.NoError(t, <-task.result)
+	secondReservation, err := coordinator.reserve(context.Background(), "orders", 0)
+	require.NoError(t, err)
+	second := replicationTaskForMode(executor, ackpolicy.All)
+	second.snapshot.ISR = []string{"broker-1", "broker-3"}
+	secondReservation.submit(second)
+	require.NoError(t, <-second.result)
 	executor.mu.Lock()
 	require.Equal(t, 1, executor.replicateCalls)
 	require.Equal(t, []string{"broker-1", "broker-3"}, executor.replicateSnapshots[0].ISR)
 	executor.mu.Unlock()
+}
+
+func TestAllAcknowledgementReturnsTypedMinISRFailureAfterAppendAndReleasesLane(t *testing.T) {
+	handler, manager, executor := newDistributedAckTestHandler(t, 2)
+	require.NoError(t, manager.CreateTopic("orders", 1, false, false))
+	installPartitionMetadata(t, handler, "orders", []string{"broker-1", "broker-2"})
+	partition, err := manager.GetTopic("orders").GetPartition(0)
+	require.NoError(t, err)
+
+	executor.replicateErr = context.DeadlineExceeded
+	executor.replicateFailures = 1
+	response := make(chan string, 1)
+	go func() {
+		response <- handler.HandleCommand(
+			"PUBLISH topic=orders partition=0 acks=all producerId=p1 message=rejected",
+			NewClientContext("", 0),
+		)
+	}()
+
+	<-executor.started
+	executor.mu.Lock()
+	executor.snapshot.ISR = []string{"broker-1"}
+	executor.mu.Unlock()
+	close(executor.barrier)
+
+	rejected := <-response
+	require.Contains(t, rejected, "ERROR: insufficient_in_sync_replicas")
+	require.Contains(t, rejected, "current=1")
+	require.Contains(t, rejected, "required=2")
+	require.Zero(t, executor.committed())
+	require.Zero(t, partition.GetHWM())
+	require.Zero(t, partition.NextOffset(), "failed acks=all append retained an uncommitted tail")
+
+	executor.mu.Lock()
+	executor.snapshot.ISR = []string{"broker-1", "broker-2"}
+	executor.mu.Unlock()
+	accepted := handler.HandleCommand(
+		"PUBLISH topic=orders partition=0 acks=all producerId=p1 message=accepted",
+		NewClientContext("", 0),
+	)
+	require.Contains(t, accepted, `"status":"OK"`)
+	require.Equal(t, uint64(1), partition.GetHWM())
+	require.Equal(t, uint64(1), partition.NextOffset())
 }
 
 func TestAllAcknowledgementReturnsPermanentFollowerFailureWithoutBlockingLane(t *testing.T) {

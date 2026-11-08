@@ -35,8 +35,10 @@ type partitionReplicationTask struct {
 }
 
 type retryableReplicationStateError struct {
-	message string
-	class   string
+	message     string
+	class       string
+	currentISR  int
+	requiredISR int
 }
 
 func (e *retryableReplicationStateError) Error() string { return e.message }
@@ -44,6 +46,17 @@ func (e *retryableReplicationStateError) Error() string { return e.message }
 func (e *retryableReplicationStateError) Retryable() bool { return true }
 
 func (e *retryableReplicationStateError) ReplicationErrorClass() string { return e.class }
+
+func (e *retryableReplicationStateError) ReplicationErrorCode() string {
+	if e.belowMinimumISR() {
+		return "insufficient_in_sync_replicas"
+	}
+	return "replication_unavailable"
+}
+
+func (e *retryableReplicationStateError) belowMinimumISR() bool {
+	return e != nil && e.requiredISR > 0 && e.currentISR < e.requiredISR
+}
 
 type partitionReplicationExecutor interface {
 	Snapshot(topic string, partition int) (clusterController.PartitionReplicationSnapshot, error)
@@ -145,7 +158,12 @@ func (e clusterPartitionReplicationExecutor) RecoverReplicaDivergence(task parti
 		return replicaRecoveryResult{resolved: true}, fmt.Errorf("replica offset conflict quarantined; retry after catch-up: %w", cause)
 	}
 	if task.ackMode == ackpolicy.All && len(current.ISR) < task.requiredISR {
-		return replicaRecoveryResult{resolved: true}, fmt.Errorf("insufficient in-sync replicas after replica quarantine: got %d, want minISR %d", len(current.ISR), task.requiredISR)
+		return replicaRecoveryResult{resolved: true}, &retryableReplicationStateError{
+			message:     fmt.Sprintf("insufficient in-sync replicas after replica quarantine: got %d, want minISR %d", len(current.ISR), task.requiredISR),
+			class:       "insufficient_isr",
+			currentISR:  len(current.ISR),
+			requiredISR: task.requiredISR,
+		}
 	}
 	return replicaRecoveryResult{}, nil
 }
@@ -435,8 +453,10 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 				err = fmt.Errorf("%w before commit: current=%s/%d/%d requested=%s/%d/%d", clusterController.ErrPartitionLeaderFenced, current.Leader, current.LeaderEpoch, current.LifecycleEpoch, task.snapshot.Leader, task.snapshot.LeaderEpoch, task.snapshot.LifecycleEpoch)
 			} else if task.ackMode == ackpolicy.All && !sameBrokerSet(current.ISR, snapshot.ISR) {
 				err = &retryableReplicationStateError{
-					message: fmt.Sprintf("ISR changed during replication: current=%v replicated=%v", current.ISR, snapshot.ISR),
-					class:   "insufficient_isr",
+					message:     fmt.Sprintf("ISR changed during replication: current=%v replicated=%v", current.ISR, snapshot.ISR),
+					class:       "insufficient_isr",
+					currentISR:  len(current.ISR),
+					requiredISR: task.requiredISR,
 				}
 			}
 		}
@@ -529,6 +549,12 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			} else {
 				completeReplicationTask(task, err)
 			}
+			return
+		}
+		var isrStateErr *retryableReplicationStateError
+		if task.ackMode == ackpolicy.All && errors.As(err, &isrStateErr) && isrStateErr.belowMinimumISR() {
+			util.Error("partition replication rejected below minISR topic=%s partition=%d current_isr=%d required_isr=%d", task.topic, task.partition, isrStateErr.currentISR, isrStateErr.requiredISR)
+			completeReplicationTask(task, err)
 			return
 		}
 		retryTransactionStateLag := false
@@ -628,8 +654,10 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 	if task.ackMode == ackpolicy.All {
 		if len(current.ISR) < task.requiredISR {
 			return clusterController.PartitionReplicationSnapshot{}, &retryableReplicationStateError{
-				message: fmt.Sprintf("insufficient in-sync replicas: got %d, want minISR %d", len(current.ISR), task.requiredISR),
-				class:   "insufficient_isr",
+				message:     fmt.Sprintf("insufficient in-sync replicas: got %d, want minISR %d", len(current.ISR), task.requiredISR),
+				class:       "insufficient_isr",
+				currentISR:  len(current.ISR),
+				requiredISR: task.requiredISR,
 			}
 		}
 		return current, nil
