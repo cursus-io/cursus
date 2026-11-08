@@ -104,3 +104,19 @@ func TestMetadataResponseMatchesExactTopic(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateTopicMinISRResponseRequiresConfiguredAndEffectivePolicy(t *testing.T) {
+	valid := "OK topic=orders min_in_sync_replicas=3 effective_min_in_sync_replicas=3"
+	if err := validateTopicMinISRResponse(valid, 3); err != nil {
+		t.Fatalf("validateTopicMinISRResponse() error = %v", err)
+	}
+
+	for _, response := range []string{
+		"OK topic=orders min_in_sync_replicas=default effective_min_in_sync_replicas=3",
+		"OK topic=orders min_in_sync_replicas=3 effective_min_in_sync_replicas=2",
+	} {
+		if err := validateTopicMinISRResponse(response, 3); err == nil {
+			t.Fatalf("validateTopicMinISRResponse(%q) error = nil, want policy mismatch", response)
+		}
+	}
+}

@@ -186,7 +186,11 @@ func TestGoSDKEventStoreTCPRoundTrip(t *testing.T) {
 	defer ctx.Cleanup()
 
 	store := sdk.NewEventStore(defaultBrokerAddrs[0], ctx.topic, "sdk-e2e-producer")
-	defer func() { _ = store.Close() }()
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close event store: %v", err)
+		}
+	})
 
 	if err := store.CreateTopic(ctx.partitions); err != nil {
 		t.Fatalf("sdk create topic: %v", err)
@@ -260,6 +264,16 @@ func TestGoSDKEventStoreTCPRoundTrip(t *testing.T) {
 	}
 	if len(withSnapshot.Events) != 1 || withSnapshot.Events[0].Version != 3 || withSnapshot.Events[0].Type != "OrderShipped" {
 		t.Fatalf("sdk stream after snapshot = %+v", withSnapshot.Events)
+	}
+	if withSnapshot.Events[0].Payload != `{"carrier":"fast"}` {
+		t.Fatalf("sdk event payload after snapshot = %q", withSnapshot.Events[0].Payload)
+	}
+	finalVersion, err := store.StreamVersion(key)
+	if err != nil {
+		t.Fatalf("sdk final stream version: %v", err)
+	}
+	if finalVersion != 3 {
+		t.Fatalf("sdk final stream version = %d, want 3", finalVersion)
 	}
 }
 

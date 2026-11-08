@@ -63,7 +63,10 @@ func TestTransactionalProducerAgainstBroker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("describe open transaction: %v", err)
 	}
-	if open.State != "open" || open.Messages != 1 || open.Offsets != 1 {
+	// Exactly-once mode appends the unresolved record to its topic partition
+	// immediately. The coordinator therefore tracks the partition participant,
+	// not a second in-memory copy of the message payload.
+	if open.Mode != "exactly_once" || open.State != "open" || open.Messages != 0 || open.Participants != 1 || open.Offsets != 1 {
 		t.Fatalf("unexpected open transaction: %+v", open)
 	}
 	if messages := integrationConsumePartition(t, client, addrs, topic, visibilityGroup, visibilityMember, visibilityGeneration); len(messages) != 0 {
@@ -84,6 +87,7 @@ func TestTransactionalProducerAgainstBroker(t *testing.T) {
 		t.Fatalf("unexpected committed transaction: %+v", committed)
 	}
 
+	visibilityGeneration, visibilityMember = integrationJoinGroup(t, client, topic, visibilityGroup)
 	messages := integrationConsumePartition(t, client, addrs, topic, visibilityGroup, visibilityMember, visibilityGeneration)
 	if len(messages) != 1 || messages[0].Payload != "sdk-transaction-record" {
 		t.Fatalf("unexpected committed records: %+v", messages)

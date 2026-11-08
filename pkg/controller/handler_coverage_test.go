@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -80,23 +81,22 @@ func newTestHandlerWithCoordinator(t *testing.T) (*CommandHandler, *topic.TopicM
 }
 
 func TestBackoffDelay(t *testing.T) {
-	t.Run("basic delay increases", func(t *testing.T) {
+	t.Run("exponential delays stay within jitter bounds", func(t *testing.T) {
 		d0 := backoffDelay(0, 100*time.Millisecond)
 		d1 := backoffDelay(1, 100*time.Millisecond)
-		assert.Greater(t, d1, time.Duration(0))
-		assert.Greater(t, d0, time.Duration(0))
+		assert.GreaterOrEqual(t, d0, 75*time.Millisecond)
+		assert.Less(t, d0, 125*time.Millisecond)
+		assert.GreaterOrEqual(t, d1, 150*time.Millisecond)
+		assert.Less(t, d1, 250*time.Millisecond)
+		assert.Greater(t, d1, d0)
 	})
 
-	t.Run("caps at 5 seconds", func(t *testing.T) {
-		d := backoffDelay(50, 100*time.Millisecond)
-		assert.LessOrEqual(t, d, 7*time.Second)
-	})
-
-	t.Run("attempt capped at 30", func(t *testing.T) {
-		d30 := backoffDelay(30, 100*time.Millisecond)
-		d100 := backoffDelay(100, 100*time.Millisecond)
-		assert.LessOrEqual(t, d30, 7*time.Second)
-		assert.LessOrEqual(t, d100, 7*time.Second)
+	t.Run("large attempts use the capped delay before jitter", func(t *testing.T) {
+		for _, attempt := range []int{30, 50, 100} {
+			delay := backoffDelay(attempt, 100*time.Millisecond)
+			assert.GreaterOrEqual(t, delay, 3750*time.Millisecond, "attempt=%d", attempt)
+			assert.Less(t, delay, 6250*time.Millisecond, "attempt=%d", attempt)
+		}
 	})
 }
 
@@ -1280,21 +1280,26 @@ func TestHandleBatchMessage_InvalidData(t *testing.T) {
 	assert.Contains(t, resp, "ERROR")
 }
 
-func TestHandleBatchMessage_InvalidAcks(t *testing.T) {
-	ch, tm := newTestHandler(t)
-	_ = tm.CreateTopic("batch-acks-topic", 1, false, false)
-
+func TestHandleBatchMessageRejectsInvalidAcksAtWireBoundary(t *testing.T) {
+	ch, _ := newTestHandler(t)
 	msgs := []types.Message{{Payload: "m1", ProducerID: "p1", SeqNum: 1}}
-	data, err := encodeBatchWithCustomAcks("batch-acks-topic", 0, "5", false, msgs)
-	if err != nil {
-		t.Skip("cannot construct custom acks batch")
-	}
-	resp, _ := ch.HandleBatchMessage(data, nil)
-	assert.Contains(t, resp, "ERROR")
-}
+	data, err := util.EncodeBatchMessages("batch-acks-topic", 0, "1", false, msgs)
+	require.NoError(t, err)
 
-func encodeBatchWithCustomAcks(topicName string, partition int, acks string, isIdempotent bool, msgs []types.Message) ([]byte, error) {
-	return util.EncodeBatchMessages(topicName, partition, acks, isIdempotent, msgs)
+	const batchHeaderSize = 8 // magic, version, flags
+	require.GreaterOrEqual(t, len(data), batchHeaderSize+4)
+	topicLength := int(binary.BigEndian.Uint32(data[batchHeaderSize : batchHeaderSize+4]))
+	acksLengthOffset := batchHeaderSize + 4 + topicLength + 4 // topic field, partition
+	require.GreaterOrEqual(t, len(data), acksLengthOffset+4)
+	acksLength := int(binary.BigEndian.Uint32(data[acksLengthOffset : acksLengthOffset+4]))
+	require.Equal(t, 1, acksLength)
+	acksOffset := acksLengthOffset + 4
+	require.GreaterOrEqual(t, len(data), acksOffset+acksLength)
+	data[acksOffset] = '5'
+
+	resp, err := ch.HandleBatchMessage(data, nil)
+	require.NoError(t, err)
+	require.Equal(t, `ERROR: batch_decode_failed reason="decode Wire v2 batch: invalid acknowledgements \"5\""`, resp)
 }
 
 func TestHandleCommitAndFetchOffset_AllowsWildcardGroupTopic(t *testing.T) {

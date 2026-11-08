@@ -73,6 +73,32 @@ jobs:
           files: ./coverage.out,./cooperative-runtime-coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  supplemental-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.2'
+          cache: true
+      - name: Run benchmark helper tests
+        run: go test -race ./test/consumer/bench ./test/publisher/bench
+      - name: Run benchmark harness contract tests
+        run: go test -race -short ./test/e2e-benchmark/...
+      - name: Run cluster harness contract tests
+        run: >-
+          go test -race ./test/e2e-cluster/...
+          -run '^Test(LeaderNodeFromDescribe(UsesLeaderField|RejectsUnknownLeader)|ValidateNodeHealthURLRestrictsLoopbackEndpoint|TopicMetadataConverged(RequiresEveryBroker|ReportsProbeFailure)|MetadataResponseMatchesExactTopic|ValidateTopicMetadata.*|ValidateTopicMinISRResponseRequiresConfiguredAndEffectivePolicy|ValidateISRContractRejectsWrongSideOfMinISR|PublishRejectedBelowMinISRRequiresQuorumFailure|ListClusterReady|Cleanup(ExplicitOffsetMatchesComposeAndClients|MetricReaderUsesIsolatedPort)|HistoryAdmissionRetryPreservesLifecycleBlockers|ObserveRecoveryFenceWaitsForEveryBroker|BrokerEvictedFromISR(RequiresTargetAbsentWithRemainingReplicas|RejectsTargetStillPresent|RejectsAdditionalReplicaLoss)|ParseLocalClusterStatus(RejectsNonLocalResponse)?|ParseLocalTopicDefinition|ComposeCommandArgsIncludesSnapshotOverlay|TopicMissingResultHandlesWireV2Error|Eventually(ReturnsWhenConditionBecomesReady|IncludesLastError|StableResetsWindowAfterRegression))$'
+          -count=1
+      - name: Run fault-injection contract tests
+        env:
+          CURSUS_E2E_FAULTS: "1"
+        run: |
+          go test -race -tags=e2e_faults ./internal/e2efaults
+          go test -race -tags=e2e_faults ./cmd/broker -run '^TestFaultStorageProviderRequiresExplicitRuntimeGate$'
+
   build:
     runs-on: ubuntu-latest
     steps:
