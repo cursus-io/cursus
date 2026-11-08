@@ -208,17 +208,18 @@ func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTas
 }
 
 type partitionReplicationCoordinator struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	reserveCtx     context.Context
-	cancelReserves context.CancelFunc
-	capacity       int
-	executor       partitionReplicationExecutor
-	mu             sync.Mutex
-	closed         bool
-	lanes          map[string]*partitionReplicationLane
-	submissions    sync.WaitGroup
-	workers        sync.WaitGroup
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	reserveCtx             context.Context
+	cancelReserves         context.CancelFunc
+	capacity               int
+	executor               partitionReplicationExecutor
+	uncertainCommitTimeout time.Duration
+	mu                     sync.Mutex
+	closed                 bool
+	lanes                  map[string]*partitionReplicationLane
+	submissions            sync.WaitGroup
+	workers                sync.WaitGroup
 }
 
 type partitionReplicationLane struct {
@@ -239,13 +240,14 @@ func newPartitionReplicationCoordinator(capacity int, executor partitionReplicat
 	ctx, cancel := context.WithCancel(context.Background())
 	reserveCtx, cancelReserves := context.WithCancel(context.Background())
 	return &partitionReplicationCoordinator{
-		ctx:            ctx,
-		cancel:         cancel,
-		reserveCtx:     reserveCtx,
-		cancelReserves: cancelReserves,
-		capacity:       capacity,
-		executor:       executor,
-		lanes:          make(map[string]*partitionReplicationLane),
+		ctx:                    ctx,
+		cancel:                 cancel,
+		reserveCtx:             reserveCtx,
+		cancelReserves:         cancelReserves,
+		capacity:               capacity,
+		executor:               executor,
+		uncertainCommitTimeout: DefaultFSMApplyTimeout,
+		lanes:                  make(map[string]*partitionReplicationLane),
 	}
 }
 
@@ -461,16 +463,18 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			}
 		}
 		commitResult := partitionCommitResult{}
+		uncertainCommitPending := false
+		uncertainCommitState := topic.PendingPartitionCommit{}
 		if err == nil {
 			commitResult, err = l.owner.executor.Commit(task)
 			if err != nil && !commitResult.accepted {
-				commitResult, err = l.resolveUncertainCommit(task, err)
+				commitResult, uncertainCommitState, uncertainCommitPending, err = l.resolveUncertainCommit(task, err)
 				if err != nil && !commitResult.accepted {
-					// The command may still apply. Neither a timeout nor a new
-					// fence proves that the old local watermark is authoritative.
+					// The command may still apply. Preserve the tail until the
+					// materialization scan observes an authoritative boundary.
 					util.Error("partition commit outcome unresolved; tail preserved topic=%s partition=%d ack_mode=%s commit_hwm=%d error=%v", task.topic, task.partition, task.ackMode, task.commitHWM, err)
-					if task.partitionRef != nil {
-						task.partitionRef.MarkReconciliationPending(err)
+					if !uncertainCommitPending {
+						markUncertainPartitionCommit(task, err)
 					}
 					completeReplicationTaskPreservingTail(task, err)
 					return
@@ -486,7 +490,9 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			}
 		}
 		if err == nil {
-			if acknowledgedRecoveryPending {
+			if uncertainCommitPending {
+				completeReplicationTaskAtPendingHWM(task, uncertainCommitState, nil, task.commitHWM)
+			} else if acknowledgedRecoveryPending {
 				completeReplicationTaskAtHWM(task, nil, task.commitHWM)
 			} else {
 				completeReplicationTask(task, nil)
@@ -497,7 +503,11 @@ func (l *partitionReplicationLane) process(task partitionReplicationTask) {
 			return
 		}
 		if commitResult.accepted {
-			completeReplicationTaskAtHWM(task, err, commitResult.hwm)
+			if uncertainCommitPending {
+				completeReplicationTaskAtPendingHWM(task, uncertainCommitState, err, commitResult.hwm)
+			} else {
+				completeReplicationTaskAtHWM(task, err, commitResult.hwm)
+			}
 			return
 		}
 		if l.owner.ctx.Err() != nil {
@@ -668,20 +678,29 @@ func (l *partitionReplicationLane) replicationSnapshot(task partitionReplication
 // Retry only the same metadata commit while retaining append ownership. Retrying
 // the whole replication lane could reuse or reconcile an uncertain tail. An
 // accepted result is handled by the existing authoritative-HWM completion path.
-func (l *partitionReplicationLane) resolveUncertainCommit(task partitionReplicationTask, cause error) (partitionCommitResult, error) {
-	deadline := time.NewTimer(DefaultFSMApplyTimeout)
+func (l *partitionReplicationLane) resolveUncertainCommit(task partitionReplicationTask, cause error) (partitionCommitResult, topic.PendingPartitionCommit, bool, error) {
+	timeout := l.owner.uncertainCommitTimeout
+	if timeout <= 0 {
+		timeout = DefaultFSMApplyTimeout
+	}
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
+	pending := false
+	pendingState := topic.PendingPartitionCommit{}
 	for {
 		if isReplicationFenceError(cause) {
-			return partitionCommitResult{}, cause
+			return partitionCommitResult{}, pendingState, pending, cause
 		}
 		select {
 		case <-l.owner.ctx.Done():
-			return partitionCommitResult{}, errors.Join(errReplicationQueueClosed, cause)
+			return partitionCommitResult{}, pendingState, pending, errors.Join(errReplicationQueueClosed, cause)
 		case <-deadline.C:
-			return partitionCommitResult{}, fmt.Errorf("partition commit outcome unresolved: %w", cause)
+			pendingState = markUncertainPartitionCommit(task, cause)
+			pending = true
+			tick.Reset(time.Second)
+			continue
 		case <-tick.C:
 		}
 		current, err := l.owner.executor.Snapshot(task.topic, task.partition)
@@ -690,14 +709,28 @@ func (l *partitionReplicationLane) resolveUncertainCommit(task partitionReplicat
 			continue
 		}
 		if !sameReplicationFence(current, task.snapshot) {
-			return partitionCommitResult{}, fmt.Errorf("%w while resolving uncertain commit", clusterController.ErrPartitionLeaderFenced)
+			return partitionCommitResult{}, pendingState, pending, fmt.Errorf("%w while resolving uncertain commit", clusterController.ErrPartitionLeaderFenced)
 		}
 		result, err := l.owner.executor.Commit(task)
 		if err == nil || result.accepted {
-			return result, err
+			return result, pendingState, pending, err
 		}
 		cause = err
 	}
+}
+
+func markUncertainPartitionCommit(task partitionReplicationTask, cause error) topic.PendingPartitionCommit {
+	if task.partitionRef == nil {
+		return topic.PendingPartitionCommit{}
+	}
+	return task.partitionRef.MarkUncertainPartitionCommit(topic.UncertainPartitionCommit{
+		Cause:          cause,
+		Leader:         task.snapshot.Leader,
+		LeaderEpoch:    task.snapshot.LeaderEpoch,
+		LifecycleEpoch: task.snapshot.LifecycleEpoch,
+		PartitionCount: task.snapshot.PartitionCount,
+		TargetHWM:      task.commitHWM,
+	})
 }
 
 func sameReplicationFence(left, right clusterController.PartitionReplicationSnapshot) bool {
@@ -724,11 +757,15 @@ func sameBrokerSet(left, right []string) bool {
 }
 
 func completeReplicationTask(task partitionReplicationTask, err error) {
-	completeReplicationTaskWithHWM(task, err, 0, false)
+	completeReplicationTaskWithHWM(task, err, 0, false, nil)
 }
 
 func completeReplicationTaskAtHWM(task partitionReplicationTask, err error, authoritativeHWM uint64) {
-	completeReplicationTaskWithHWM(task, err, authoritativeHWM, true)
+	completeReplicationTaskWithHWM(task, err, authoritativeHWM, true, nil)
+}
+
+func completeReplicationTaskAtPendingHWM(task partitionReplicationTask, pending topic.PendingPartitionCommit, err error, authoritativeHWM uint64) {
+	completeReplicationTaskWithHWM(task, err, authoritativeHWM, true, &pending)
 }
 
 // completeReplicationTaskPreservingTail releases ownership without rolling an
@@ -751,7 +788,7 @@ func completeReplicationTaskPreservingTail(task partitionReplicationTask, err er
 	}
 }
 
-func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, authoritativeHWM uint64, hasAuthoritativeHWM bool) {
+func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, authoritativeHWM uint64, hasAuthoritativeHWM bool, pending *topic.PendingPartitionCommit) {
 	if task.releaseMutation != nil {
 		task.releaseMutation()
 	}
@@ -760,8 +797,16 @@ func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, au
 		if hasAuthoritativeHWM {
 			committedHWM = authoritativeHWM
 		}
-		if reconcileErr := task.partitionRef.ReconcileCommittedHWM(committedHWM); reconcileErr != nil {
-			task.partitionRef.MarkReconciliationPending(reconcileErr)
+		var reconcileErr error
+		if pending != nil {
+			reconcileErr = task.partitionRef.ReconcilePendingPartitionCommit(*pending, committedHWM)
+		} else {
+			reconcileErr = task.partitionRef.ReconcileCommittedHWM(committedHWM)
+		}
+		if reconcileErr != nil {
+			if pending == nil {
+				task.partitionRef.MarkReconciliationPending(reconcileErr)
+			}
 			err = errors.Join(err, fmt.Errorf("reconcile failed replication to committed HWM %d: %w", committedHWM, reconcileErr))
 		} else {
 			task.partitionRef.FlushDisk()
@@ -780,7 +825,8 @@ func completeReplicationTaskWithHWM(task partitionReplicationTask, err error, au
 }
 
 func isReplicationFenceError(err error) bool {
-	return errors.Is(err, clusterController.ErrPartitionLeaderFenced)
+	return errors.Is(err, clusterController.ErrPartitionLeaderFenced) ||
+		errors.Is(err, clusterController.ErrPartitionMetadataNotFound)
 }
 
 type classifiedReplicationError interface {

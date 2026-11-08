@@ -25,6 +25,7 @@ import (
 type barrierReplicationExecutor struct {
 	mu                 sync.Mutex
 	snapshot           clusterController.PartitionReplicationSnapshot
+	snapshotErr        error
 	started            chan struct{}
 	barrier            chan struct{}
 	replicateErr       error
@@ -83,7 +84,7 @@ func (replicaTransactionStateLagTestError) ReplicaBrokerID() string { return "br
 func (e *barrierReplicationExecutor) Snapshot(string, int) (clusterController.PartitionReplicationSnapshot, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.snapshot, nil
+	return e.snapshot, e.snapshotErr
 }
 
 func (e *barrierReplicationExecutor) ReplicateISR(ctx context.Context, _ partitionReplicationTask, snapshot clusterController.PartitionReplicationSnapshot) error {
