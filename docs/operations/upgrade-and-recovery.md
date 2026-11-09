@@ -31,6 +31,12 @@ For an instance-bound truncate, save the CREATE response's `instance_id` and
 after a timeout or lost connection. `replayed=true` acknowledges the retained
 historical result; it does not mean today's topic is still empty. Never replace
 the revision with a newly fetched value to resolve an unknown outcome.
+The broker bounds ordinary Raft command admission at 5 seconds and the
+synchronous `TOPIC_TRUNCATE`/`TOPIC_DELETE` storage lifecycle path at 60 seconds.
+Set the operator client's command timeout above the lifecycle bound. A client
+timeout or lost response is still an unknown outcome: inspect the saved
+instance/revision receipt, lifecycle epoch and partition offsets before replaying
+the exact request.
 `cleanup_pending=true` means intent committed but the responding broker has not
 finished local materialization. Inspect every broker's readiness and topic/replica
 materialization before resuming traffic; a missing flag is not a cluster-wide

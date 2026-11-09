@@ -129,6 +129,65 @@ func TestRunPrintsBrowseMessagesBatch(t *testing.T) {
 	}
 }
 
+func TestRunPrintsStructuredBrokerErrorReason(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		server, err := wire.ServerHandshake(conn, []wire.Compression{wire.CompressionNone})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		frame, err := server.ReadFrame()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		payload, err := wire.EncodeError(wire.ErrorPayload{
+			Code: "truncate_topic_failed", Class: wire.ErrorClassInternal,
+			Fields: map[string]string{"reason": "context deadline exceeded"},
+		})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- server.WriteFrame(wire.Frame{
+			Kind: wire.KindResponse, Command: frame.Command, Status: wire.StatusError,
+			RequestID: frame.RequestID, Payload: payload,
+		})
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"--broker", listener.Addr().String(), "--timeout", "2s",
+		"TRUNCATE_INSTANCE", "topic=orders", "expected_revision=1", "expected_instance=LXNYUKG434X2677GUOLUYXPR7C",
+	}, func(string) string { return "" }, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run exit=%d stderr=%s", code, stderr.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, "reason=\"context deadline exceeded\"") {
+		t.Fatalf("stderr=%q", got)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not complete")
+	}
+}
+
 func TestRunRejectsIncompleteAuthenticationFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--broker", "127.0.0.1:9000", "--principal", "operator", "LIST"}, func(string) string { return "" }, &stdout, &stderr)

@@ -50,6 +50,12 @@ type RaftStatus struct {
 const (
 	recoveredPartitionReplayNoProgressTimeout = 2 * time.Minute
 	recoveredPartitionReplayPollInterval      = 500 * time.Millisecond
+	defaultRaftApplyTimeout                   = 5 * time.Second
+	// Topic deletion and truncation synchronously close derived state and
+	// materialize storage in the FSM. Keep their admission bounded, but do not
+	// force that filesystem work through the latency budget for ordinary data
+	// and consumer commands.
+	topicLifecycleRaftApplyTimeout = 60 * time.Second
 )
 
 type raftStatsReader interface {
@@ -613,7 +619,7 @@ func (rm *RaftReplicationManager) GetConfiguration() raft.ConfigurationFuture {
 
 func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error {
 	fullCmd := []byte(fmt.Sprintf("%s:%s", prefix, string(data)))
-	future := rm.raft.Apply(fullCmd, 5*time.Second)
+	future := rm.raft.Apply(fullCmd, raftApplyTimeoutForCommand(prefix))
 	if err := future.Error(); err != nil {
 		return err
 	}
@@ -621,6 +627,15 @@ func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error
 		return err
 	}
 	return nil
+}
+
+func raftApplyTimeoutForCommand(prefix string) time.Duration {
+	switch prefix {
+	case "TOPIC_DELETE", "TOPIC_TRUNCATE":
+		return topicLifecycleRaftApplyTimeout
+	default:
+		return defaultRaftApplyTimeout
+	}
 }
 
 func (rm *RaftReplicationManager) AddVoter(id string, addr string) error {
