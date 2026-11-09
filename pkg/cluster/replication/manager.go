@@ -619,8 +619,18 @@ func (rm *RaftReplicationManager) GetConfiguration() raft.ConfigurationFuture {
 
 func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error {
 	fullCmd := []byte(fmt.Sprintf("%s:%s", prefix, string(data)))
-	future := rm.raft.Apply(fullCmd, raftApplyTimeoutForCommand(prefix))
-	if err := future.Error(); err != nil {
+	timeout := raftApplyTimeoutForCommand(prefix)
+	future := rm.raft.Apply(fullCmd, timeout)
+	var err error
+	if isTopicLifecycleCommand(prefix) {
+		err = waitForApplyFuture(future, timeout)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("raft apply outcome unknown after %s: %w", timeout, err)
+		}
+	} else {
+		err = future.Error()
+	}
+	if err != nil {
 		return err
 	}
 	if err, ok := future.Response().(error); ok {
@@ -630,11 +640,32 @@ func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error
 }
 
 func raftApplyTimeoutForCommand(prefix string) time.Duration {
-	switch prefix {
-	case "TOPIC_DELETE", "TOPIC_TRUNCATE":
+	if isTopicLifecycleCommand(prefix) {
 		return topicLifecycleRaftApplyTimeout
-	default:
-		return defaultRaftApplyTimeout
+	}
+	return defaultRaftApplyTimeout
+}
+
+func isTopicLifecycleCommand(prefix string) bool {
+	return prefix == "TOPIC_DELETE" || prefix == "TOPIC_TRUNCATE"
+}
+
+func waitForApplyFuture(future raft.ApplyFuture, timeout time.Duration) error {
+	if timeout <= 0 {
+		return context.DeadlineExceeded
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- future.Error()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-timer.C:
+		return context.DeadlineExceeded
 	}
 }
 

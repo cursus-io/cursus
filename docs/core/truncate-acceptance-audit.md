@@ -156,10 +156,12 @@ completion contract without changing its existing compatibility guarantees:
 local storage synchronously inside the Raft FSM.
 
 The implemented boundary therefore gives only those two commands a 60-second
-Raft admission limit and preserves the 5-second limit for publish, commit,
-partition, consumer and other commands. This favors availability over an
-unbounded FSM wait without turning a slow local disk into a false five-second
-failure. A timeout remains an unknown result, not evidence of rejection; an
+Raft enqueue limit plus a separate 60-second FSM-completion limit, with a
+bounded 120-second worst case. It preserves the 5-second admission limit and
+existing completion behavior for publish, commit, partition, consumer and other
+commands. This favors availability over an unbounded FSM wait without turning a
+slow local disk into a false five-second failure. A timeout remains an
+unknown result, not evidence of rejection; an
 operator must inspect the retained instance/revision receipt and offsets before
 an exact retry. Regressions cover timeout selection, unchanged ordinary-command
 limits, structured CLI reasons, and crash recovery that observes revision,

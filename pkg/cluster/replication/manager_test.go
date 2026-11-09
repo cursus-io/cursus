@@ -630,6 +630,26 @@ func TestRaftReplicationManager_ApplyCommandUsesLifecycleTimeout(t *testing.T) {
 	}
 }
 
+func TestWaitForApplyFutureTimesOut(t *testing.T) {
+	fut := new(MockApplyFuture)
+	release := make(chan struct{})
+	completed := make(chan struct{})
+	fut.On("Error").Run(func(mock.Arguments) {
+		<-release
+		close(completed)
+	}).Return(nil).Once()
+
+	err := waitForApplyFuture(fut, 10*time.Millisecond)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	close(release)
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("apply future waiter did not finish after release")
+	}
+	fut.AssertExpectations(t)
+}
+
 func TestRaftReplicationManager_ApplyCommandReturnsFSMError(t *testing.T) {
 	mr := new(MockRaft)
 	rm := &RaftReplicationManager{raft: mr}
