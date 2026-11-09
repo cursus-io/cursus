@@ -235,6 +235,16 @@ func ValidateReplicaRecoveryMode(batch ReplicaCatchupBatch) error {
 // Acquire controller lifecycle/write gates first, then this fence, then partition
 // reconciliation locks. Existing controller writes can await Raft while gated.
 func (f *BrokerFSM) WithReplicaRecoveryFence(batch ReplicaCatchupBatch, apply func() error) error {
+	return f.withReplicaRecoveryFence(nil, batch, apply)
+}
+
+// WithReplicaRequestRecoveryFence additionally admits append-only ISR catch-up
+// when the original local request still describes the current replica authority.
+func (f *BrokerFSM) WithReplicaRequestRecoveryFence(request ReplicaCatchupRequest, batch ReplicaCatchupBatch, apply func() error) error {
+	return f.withReplicaRecoveryFence(&request, batch, apply)
+}
+
+func (f *BrokerFSM) withReplicaRecoveryFence(request *ReplicaCatchupRequest, batch ReplicaCatchupBatch, apply func() error) error {
 	if err := ValidateReplicaRecoveryMode(batch); err != nil {
 		return err
 	}
@@ -247,8 +257,13 @@ func (f *BrokerFSM) WithReplicaRecoveryFence(batch ReplicaCatchupBatch, apply fu
 	source := f.brokers[batch.SourceBroker]
 	receiver := f.brokers[batch.BrokerID]
 	valid := meta != nil && meta.CommittedHWMKnown && meta.Leader == batch.Leader && meta.LeaderEpoch == batch.LeaderEpoch && meta.LifecycleEpoch == batch.LifecycleEpoch && meta.CommittedHWM >= batch.CommittedHWM && containsString(meta.Replicas, batch.BrokerID) && containsString(meta.Replicas, batch.SourceBroker) && containsString(meta.ISR, batch.SourceBroker) && source != nil && source.Status == "active" && receiver != nil && receiver.Status == "active"
-	if valid {
-		valid = !containsString(meta.ISR, batch.BrokerID)
+	inISR := valid && containsString(meta.ISR, batch.BrokerID)
+	if inISR {
+		// A restarted follower can retain ISR membership while missing a
+		// committed suffix. Permit its ordinary append-only catch-up; replacing
+		// or truncating history still requires leaving ISR first.
+		valid = request != nil && request.localAuthority != nil &&
+			batch.RecoveryProtocol == 0 && batch.TruncateTo == nil && !batch.Compacted
 	}
 	if valid && batch.RecoveryProtocol == IndexedRecoveryProtocolVersion {
 		valid = !containsString(meta.ISR, batch.BrokerID) && source.RecoveryProtocol >= IndexedRecoveryProtocolVersion && receiver.RecoveryProtocol >= IndexedRecoveryProtocolVersion
@@ -257,6 +272,11 @@ func (f *BrokerFSM) WithReplicaRecoveryFence(batch ReplicaCatchupBatch, apply fu
 		valid = source.RecoveryProtocol >= BootstrapRecoveryProtocolVersion && receiver.RecoveryProtocol >= BootstrapRecoveryProtocolVersion
 	}
 	f.mu.RUnlock()
+	if valid && inISR {
+		current, exists := f.replicaRequestState(batch.BrokerID, batch.Topic, batch.Partition)
+		valid = exists && containsString(request.localAuthority.meta.ISR, batch.BrokerID) &&
+			request.localAuthority.same(current, false)
+	}
 	if !valid {
 		return fmt.Errorf("replica recovery fence changed")
 	}

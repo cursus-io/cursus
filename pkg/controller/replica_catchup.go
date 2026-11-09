@@ -103,7 +103,11 @@ func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, reques
 		if ch.Cluster.RaftManager.GetFSM() == nil {
 			return fmt.Errorf("replica catch-up metadata is unavailable")
 		}
-		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(ctx, request, batch, witness) })
+		apply := func() error { return ch.applyReplicaCatchup(ctx, request, batch, witness) }
+		if request != nil {
+			return ch.Cluster.RaftManager.GetFSM().WithReplicaRequestRecoveryFence(*request, batch, apply)
+		}
+		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, apply)
 	}
 	return ch.applyReplicaCatchup(ctx, request, batch, witness)
 }
