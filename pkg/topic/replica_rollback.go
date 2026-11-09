@@ -224,6 +224,12 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 		return err
 	}
 	uncertain = true
+	// Disk truncation has committed the local repair. Finish rebuilding state
+	// and durable checkpoints under the existing fences even if the requesting
+	// recovery turn is canceled. Returning halfway would permanently fence a
+	// healthy replica. Preserve context values for recovery accounting; real
+	// storage failures and partition closure still fail closed below.
+	ctx = context.WithoutCancel(ctx)
 	p.mu.Lock()
 	p.LEO.Store(offset)
 	p.appendTimeSeeded = false
