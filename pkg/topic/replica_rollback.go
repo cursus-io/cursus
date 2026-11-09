@@ -291,9 +291,6 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	if p.closed {
 		return fmt.Errorf("partition closed during replica rollback")
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	publish := func() {
 		if policy == committedReplicaReconcile {
 			p.HWM = offset

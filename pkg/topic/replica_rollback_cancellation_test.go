@@ -19,6 +19,7 @@ type cancelRollbackStorage struct {
 	contextValue                              any
 }
 
+// TruncateToIfGenerationContext injects cancellation only after disk success.
 func (s *cancelRollbackStorage) TruncateToIfGenerationContext(ctx context.Context, offset uint64, generation disk.ContentGeneration) error {
 	s.truncations++
 	if err := s.DiskHandler.TruncateToIfGenerationContext(ctx, offset, generation); err != nil {
@@ -30,6 +31,7 @@ func (s *cancelRollbackStorage) TruncateToIfGenerationContext(ctx context.Contex
 	return nil
 }
 
+// ScanRetainedRange measures retained work and can cancel after reconstruction.
 func (s *cancelRollbackStorage) ScanRetainedRange(ctx context.Context, start, end uint64, visit func(types.Message) error) error {
 	s.scans++
 	s.contextValue = ctx.Value(rollbackContextKey{})
@@ -44,6 +46,8 @@ func (s *cancelRollbackStorage) ScanRetainedRange(ctx context.Context, start, en
 	return err
 }
 
+// TestReplicaRollbackCompletesAfterAdmittedCancellation checks that cancellation
+// cannot interrupt an admitted repair or leave inconsistent state on restart.
 func TestReplicaRollbackCompletesAfterAdmittedCancellation(t *testing.T) {
 	for _, policy := range []string{"canonical", "speculative"} {
 		for _, phase := range []string{"truncate", "scan", "checkpoint"} {
