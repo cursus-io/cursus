@@ -139,6 +139,37 @@ fresh records/membership survive replay and account for bytes and repeated work,
 not just request counts. Existing durable-phase and cluster tests supply the
 broker checks without introducing new cleanup implementation.
 
+### Bounded lifecycle admission follow-up
+
+The 2026-11-09 timeout follow-up rechecked the Kafka 4.1
+[DeleteRecords protocol](https://kafka.apache.org/41/design/protocol/#The_Messages_DeleteRecords),
+the accepted
+[KIP-107](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/67636826/KIP-107+Add+deleteRecordsBefore+API+in+AdminClient),
+and version-pinned Kafka 4.1.1
+[ReplicaManager](https://github.com/apache/kafka/blob/4.1.1/core/src/main/scala/kafka/server/ReplicaManager.scala).
+Kafka gives record deletion an explicit request timeout and delayed-operation
+path, while whole-topic deletion can return before every broker observes the
+change and removes logs asynchronously. Cursus should adopt the separate,
+bounded management-operation budget, but cannot copy Kafka's asynchronous
+completion contract without changing its existing compatibility guarantees:
+`TOPIC_TRUNCATE` and `TOPIC_DELETE` currently close derived state and materialize
+local storage synchronously inside the Raft FSM.
+
+The implemented boundary therefore gives only those two commands a 60-second
+Raft enqueue limit plus a separate 60-second FSM-completion limit, with a
+bounded 120-second worst case. It preserves the 5-second admission limit and
+existing completion behavior for publish, commit, partition, consumer and other
+commands. This favors availability over an unbounded FSM wait without turning a
+slow local disk into a false five-second failure. A timeout remains an
+unknown result, not evidence of rejection; an
+operator must inspect the retained instance/revision receipt and offsets before
+an exact retry. Regressions cover timeout selection, unchanged ordinary-command
+limits, structured CLI reasons, and crash recovery that observes revision,
+lifecycle epoch, instance identity and zero offsets before receipt replay. The
+replay test also verifies that no second storage/dependency cleanup removes new
+records or groups, so recovery work and bytes are not multiplied by a blind
+retry.
+
 ## Current cleanup and deployment boundaries
 
 - #296 allows a valid oversized first record through an explicit exclusive

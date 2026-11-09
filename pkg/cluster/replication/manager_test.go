@@ -591,6 +591,65 @@ func TestRaftReplicationManager_ApplyCommand(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestRaftApplyTimeoutForCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    time.Duration
+	}{
+		{name: "publish", command: "MESSAGE", want: defaultRaftApplyTimeout},
+		{name: "commit", command: "PARTITION_COMMIT", want: defaultRaftApplyTimeout},
+		{name: "partition", command: "PARTITION", want: defaultRaftApplyTimeout},
+		{name: "consumer group", command: "GROUP_SYNC", want: defaultRaftApplyTimeout},
+		{name: "consumer offset", command: "OFFSET_SYNC", want: defaultRaftApplyTimeout},
+		{name: "topic create", command: "TOPIC", want: defaultRaftApplyTimeout},
+		{name: "topic truncate", command: "TOPIC_TRUNCATE", want: topicLifecycleRaftApplyTimeout},
+		{name: "topic delete", command: "TOPIC_DELETE", want: topicLifecycleRaftApplyTimeout},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, raftApplyTimeoutForCommand(test.command))
+		})
+	}
+}
+
+func TestRaftReplicationManager_ApplyCommandUsesLifecycleTimeout(t *testing.T) {
+	for _, command := range []string{"TOPIC_TRUNCATE", "TOPIC_DELETE"} {
+		t.Run(command, func(t *testing.T) {
+			mr := new(MockRaft)
+			rm := &RaftReplicationManager{raft: mr}
+			fut := new(MockApplyFuture)
+			fut.On("Error").Return(nil)
+			fut.On("Response").Return(nil)
+			mr.On("Apply", mock.Anything, topicLifecycleRaftApplyTimeout).Return(fut).Once()
+
+			require.NoError(t, rm.ApplyCommand(command, []byte(`{"topic":"orders"}`)))
+			mr.AssertExpectations(t)
+		})
+	}
+}
+
+func TestWaitForApplyFutureTimesOut(t *testing.T) {
+	fut := new(MockApplyFuture)
+	release := make(chan struct{})
+	completed := make(chan struct{})
+	fut.On("Error").Run(func(mock.Arguments) {
+		<-release
+		close(completed)
+	}).Return(nil).Once()
+
+	err := waitForApplyFuture(fut, 10*time.Millisecond)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	close(release)
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("apply future waiter did not finish after release")
+	}
+	fut.AssertExpectations(t)
+}
+
 func TestRaftReplicationManager_ApplyCommandReturnsFSMError(t *testing.T) {
 	mr := new(MockRaft)
 	rm := &RaftReplicationManager{raft: mr}

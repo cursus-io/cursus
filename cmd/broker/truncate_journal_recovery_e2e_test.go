@@ -97,6 +97,19 @@ func TestStandaloneBrokerTruncateJournalCrashRecovery(t *testing.T) {
 			port, health := reserveBrokerTestPorts(t)
 			second, output := startBrokerRestartChild(t, root, port, health)
 			waitForBrokerReady(t, health, output)
+			described := brokerCommand(t, port, "DESCRIBE topic=events")
+			var metadata struct {
+				Definition struct {
+					Revision       uint64 `json:"revision"`
+					LifecycleEpoch uint64 `json:"lifecycle_epoch"`
+					InstanceID     string `json:"instance_id"`
+				} `json:"definition"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(described), &metadata))
+			require.Equal(t, uint64(2), metadata.Definition.Revision)
+			require.Equal(t, uint64(2), metadata.Definition.LifecycleEpoch)
+			require.Equal(t, proof.Instance, metadata.Definition.InstanceID)
+			require.Contains(t, brokerCommand(t, port, "LIST_OFFSETS topic=events partition=0"), "earliest=0:latest=0:leo=0:hwm=0")
 			require.Contains(t, brokerCommand(t, port, command), "replayed=true")
 			require.Contains(t, brokerCommand(t, port, "END_TXN transactional_id=terminal producerId="+proof.Producer+" epoch="+proof.Epoch+" result=commit"), "state=committed")
 			require.Contains(t, brokerCommand(t, port, "LIST_OFFSETS topic=events partition=0"), "earliest=0:latest=0:leo=0:hwm=0")

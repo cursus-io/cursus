@@ -50,6 +50,12 @@ type RaftStatus struct {
 const (
 	recoveredPartitionReplayNoProgressTimeout = 2 * time.Minute
 	recoveredPartitionReplayPollInterval      = 500 * time.Millisecond
+	defaultRaftApplyTimeout                   = 5 * time.Second
+	// Topic deletion and truncation synchronously close derived state and
+	// materialize storage in the FSM. Keep their admission bounded, but do not
+	// force that filesystem work through the latency budget for ordinary data
+	// and consumer commands.
+	topicLifecycleRaftApplyTimeout = 60 * time.Second
 )
 
 type raftStatsReader interface {
@@ -613,14 +619,54 @@ func (rm *RaftReplicationManager) GetConfiguration() raft.ConfigurationFuture {
 
 func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error {
 	fullCmd := []byte(fmt.Sprintf("%s:%s", prefix, string(data)))
-	future := rm.raft.Apply(fullCmd, 5*time.Second)
-	if err := future.Error(); err != nil {
+	timeout := raftApplyTimeoutForCommand(prefix)
+	future := rm.raft.Apply(fullCmd, timeout)
+	var err error
+	if isTopicLifecycleCommand(prefix) {
+		err = waitForApplyFuture(future, timeout)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("raft apply outcome unknown after %s: %w", timeout, err)
+		}
+	} else {
+		err = future.Error()
+	}
+	if err != nil {
 		return err
 	}
 	if err, ok := future.Response().(error); ok {
 		return err
 	}
 	return nil
+}
+
+func raftApplyTimeoutForCommand(prefix string) time.Duration {
+	if isTopicLifecycleCommand(prefix) {
+		return topicLifecycleRaftApplyTimeout
+	}
+	return defaultRaftApplyTimeout
+}
+
+func isTopicLifecycleCommand(prefix string) bool {
+	return prefix == "TOPIC_DELETE" || prefix == "TOPIC_TRUNCATE"
+}
+
+func waitForApplyFuture(future raft.ApplyFuture, timeout time.Duration) error {
+	if timeout <= 0 {
+		return context.DeadlineExceeded
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- future.Error()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
 }
 
 func (rm *RaftReplicationManager) AddVoter(id string, addr string) error {

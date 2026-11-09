@@ -96,13 +96,20 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	if err := execute(client, command, stdout); err != nil {
 		var brokerErr *wire.BrokerError
 		if errors.As(err, &brokerErr) {
-			_, _ = fmt.Fprintf(stderr, "broker rejected command: %v\n", brokerErr)
+			_, _ = fmt.Fprintf(stderr, "broker rejected command: %s\n", formatBrokerError(brokerErr))
 		} else {
 			_, _ = fmt.Fprintf(stderr, "execute command: %v\n", err)
 		}
 		return 1
 	}
 	return 0
+}
+
+func formatBrokerError(err *wire.BrokerError) string {
+	if reason := strings.TrimSpace(err.Fields["reason"]); reason != "" {
+		return fmt.Sprintf("%v reason=%q", err, reason)
+	}
+	return err.Error()
 }
 
 func dialBroker(ctx context.Context, address, caPath, serverName, certPath, keyPath string) (net.Conn, error) {
