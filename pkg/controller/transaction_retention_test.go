@@ -29,7 +29,9 @@ func testTransactionRetentionRestart(t *testing.T, legacyEmpty bool) {
 	for _, firstDecision := range []string{"commit", "abort"} {
 		t.Run(firstDecision, func(t *testing.T) {
 			cfg := config.DefaultConfig()
-			cfg.LogDir, cfg.IndexSize, cfg.DiskFlushIntervalMS = t.TempDir(), 1024, 1
+			// Explicit acknowledgements retain durability without a 1ms sync
+			// loop starving recovery proof readers on bounded Docker hosts.
+			cfg.LogDir, cfg.IndexSize, cfg.DiskFlushIntervalMS = t.TempDir(), 1024, 100
 			var ch *CommandHandler
 			var tm *topic.TopicManager
 			var cd *coordinator.Coordinator
