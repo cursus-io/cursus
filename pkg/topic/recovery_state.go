@@ -22,6 +22,10 @@ func (p *Partition) scanRawRecoveryState() (*rawRecoveryState, error) {
 }
 
 func (p *Partition) scanRawRecoveryStateContext(ctx context.Context) (*rawRecoveryState, error) {
+	return p.scanRawRecoveryRangeContext(ctx, nil, true)
+}
+
+func (p *Partition) scanRawRecoveryRangeContext(ctx context.Context, end *uint64, resolve bool) (*rawRecoveryState, error) {
 	state := &rawRecoveryState{markers: make(map[transactionMarkerKey]transactionMarkerInfo), open: make(map[transactionMarkerKey]uint64), producers: make(map[string]producerStateCheckpointEntry)}
 	if p.dh == nil {
 		return state, nil
@@ -38,6 +42,12 @@ func (p *Partition) scanRawRecoveryStateContext(ctx context.Context) (*rawRecove
 		state.first = p.dh.GetFirstOffset()
 	}
 	state.end = p.dh.GetAbsoluteOffset()
+	if end != nil {
+		if *end < state.first || *end > state.end {
+			return nil, fmt.Errorf("recovery preparation boundary outside retained log")
+		}
+		state.end = *end
+	}
 	visit := func(msg types.Message) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -93,6 +103,13 @@ func (p *Partition) scanRawRecoveryStateContext(ctx context.Context) (*rawRecove
 			}
 		}
 	}
+	if resolve {
+		p.resolveRawRecoveryTransactions(state)
+	}
+	return state, nil
+}
+
+func (p *Partition) resolveRawRecoveryTransactions(state *rawRecoveryState) {
 	p.txnMarkerMu.RLock()
 	resolver := p.txnResolver
 	p.txnMarkerMu.RUnlock()
@@ -105,7 +122,6 @@ func (p *Partition) scanRawRecoveryStateContext(ctx context.Context) (*rawRecove
 			}
 		}
 	}
-	return state, nil
 }
 func (p *Partition) installTransactionState(state *rawRecoveryState) {
 	p.txnMarkerMu.Lock()

@@ -70,3 +70,55 @@ payload bytes, then reopens the partition and resumes replication. Payload
 bytes exclude framing and checkpoint I/O; the existing recovery-work metrics
 measure physical reads separately. This regression result is not a completed
 24-hour fault campaign.
+
+## Follow-up: prepare retained reconstruction outside broker-wide gates
+
+Before implementation, compare Kafka 4.1.0
+[Partition.truncateTo](https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/cluster/Partition.scala)
+and `ReplicaFetcherThread`: the truncate boundary is protected by a partition
+lock, and admitted disk work remains synchronous. Cursus cannot simply release
+its Raft fence halfway through mutation: concurrent metadata application may
+wait on the same partition and invert lock order.
+
+The implementation prepares the retained transaction/producer maps
+before taking the FSM gates, under the original disk generation and local tail.
+Validate the prefix proof there, then revalidate preparation ownership, tail,
+attempt and content generation under the existing mutation fence. A stale or
+canceled preparation makes no disk change. After successful truncation, install
+the prepared maps and checkpoints without a second retained-prefix scan; still
+finish admitted work despite cancellation. Confirm exactly one destructive
+generation transition, so a rewrite between truncation and publication cannot
+certify stale prepared state. Re-evaluate transaction decisions at installation.
+
+Adopt partition-local expensive preparation, while retaining Cursus Raft,
+lifecycle, committed-boundary and durable checkpoint rules. This removes the
+O(retained bytes) read from broker-wide exclusion. Segment truncation, map
+installation and checkpoint I/O still run inside the fence; this is not a claim
+that arbitrary disk stalls or all recovery latency have been eliminated.
+
+Regression contract defined before implementation: block real retained scanning
+and verify unrelated Raft application completes before releasing the scan;
+change leader/local generation during preparation and assert no truncation;
+cancel preparation and assert retryability; cancel after admitted truncation and
+assert completion; reject foreign/reused preparations; preserve transaction,
+producer, restart and checkpoint-failure checks. Count scans and bytes at
+1/16/64 MiB and compare unrelated commit delay with the earlier 500ms hold.
+
+The deterministic controller check now lets unrelated metadata application
+finish while the retained scan is paused; changing the leader during that scan
+rejects the old response before truncation. The 1/16/64 MiB retained-prefix
+checks each read exactly once: 64/1,024/4,096 records and
+1,048,576/16,777,216/67,108,864 payload bytes. Unrelated partition commits
+completed before scan release in 116/94/114 ms; the earlier implementation
+blocked them until release (528/544/627 ms with the injected 500 ms hold).
+These single-run timings came from a shared, CPU-limited Docker host and are not
+latency guarantees or a controlled throughput comparison. The ordering assertion
+and counted work are the regression contract; payload bytes exclude framing,
+lineage verification and checkpoint writes.
+
+Prepared canonical and speculative repairs retain restart, transaction, producer
+and post-truncate cancellation checks. Preparation cancellation is retryable;
+changed owner, tail, HWM, proof, consumed preparation and disk generation reject
+without truncation. Checkpoint failure and extra destructive work after truncate
+remain unavailable. The prior frozen 24-hour campaign continues separately and
+does not certify these new changes.

@@ -2,6 +2,7 @@ package topic
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/cursus-io/cursus/pkg/disk"
@@ -49,8 +50,11 @@ func (s *cancelRollbackStorage) ScanRetainedRange(ctx context.Context, start, en
 // TestReplicaRollbackCompletesAfterAdmittedCancellation checks that cancellation
 // cannot interrupt an admitted repair or leave inconsistent state on restart.
 func TestReplicaRollbackCompletesAfterAdmittedCancellation(t *testing.T) {
-	for _, policy := range []string{"canonical", "speculative"} {
+	for _, policy := range []string{"canonical", "speculative", "prepared_canonical", "prepared_speculative"} {
 		for _, phase := range []string{"truncate", "scan", "checkpoint"} {
+			if strings.HasPrefix(policy, "prepared_") && phase == "scan" {
+				continue // Preparation cancellation is pre-mutation and tested separately.
+			}
 			t.Run(policy+"/"+phase, func(t *testing.T) {
 				p, d, cfg := rollbackPartitionRecords(t, []types.Message{
 					{Payload: "retained", ProducerID: "producer", Epoch: 2, SeqNum: 1, TransactionalID: "txn", TransactionState: types.TransactionStateOpen},
@@ -58,7 +62,7 @@ func TestReplicaRollbackCompletesAfterAdmittedCancellation(t *testing.T) {
 					{Payload: "abort", TransactionalID: "txn", Epoch: 2, TransactionMarker: types.TransactionMarkerAbort, TransactionState: types.TransactionStateAborted},
 				})
 				wantHWM := uint64(1)
-				if policy == "speculative" {
+				if strings.HasSuffix(policy, "speculative") {
 					p.mu.Lock()
 					p.HWM = 0
 					p.mu.Unlock()
@@ -68,6 +72,16 @@ func TestReplicaRollbackCompletesAfterAdmittedCancellation(t *testing.T) {
 				defer cancel()
 				storage := &cancelRollbackStorage{DiskHandler: d, cancel: cancel, phase: phase}
 				p.dh = storage
+				var prepared *ReplicaRollbackPreparation
+				if strings.HasPrefix(policy, "prepared_") {
+					proofHWM := uint64(3)
+					if policy == "prepared_speculative" {
+						proofHWM = 0
+					}
+					var err error
+					prepared, err = p.PrepareReplicaRollbackContext(ctx, 1, 3, nil, proofHWM)
+					require.NoError(t, err)
+				}
 				if phase == "checkpoint" {
 					p.hwmCheckpointMu.Lock()
 					p.producerCheckpointMu.Lock()
@@ -76,7 +90,11 @@ func TestReplicaRollbackCompletesAfterAdmittedCancellation(t *testing.T) {
 					p.hwmCheckpointMu.Unlock()
 				}
 				var err error
-				if policy == "canonical" {
+				if policy == "prepared_canonical" {
+					err = p.ApplyPreparedReplicaRollbackChecked(ctx, prepared, 1, 3, nil, 3, nil)
+				} else if policy == "prepared_speculative" {
+					err = p.TruncatePreparedReplicaTailContext(ctx, prepared, 1)
+				} else if policy == "canonical" {
 					err = p.ApplyReplicaRollbackChecked(ctx, 1, 3, nil, 3, nil)
 				} else {
 					err = p.TruncateReplicaTailContext(ctx, 1)
