@@ -88,7 +88,7 @@ func (s *preparedMutationStorage) TruncateToIfGenerationContext(ctx context.Cont
 		return err
 	}
 	// An extra destructive write must not be certified by the prepared maps.
-	return s.DiskHandler.WriteDirect("orders", 0, types.Message{Offset: 0, Payload: "unexpected rewrite"})
+	return s.WriteDirect("orders", 0, types.Message{Offset: 0, Payload: "unexpected rewrite"})
 }
 
 func TestPreparedRollbackRejectsPostTruncateRewrite(t *testing.T) {

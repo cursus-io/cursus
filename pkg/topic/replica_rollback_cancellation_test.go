@@ -90,13 +90,14 @@ func TestReplicaRollbackCompletesAfterAdmittedCancellation(t *testing.T) {
 					p.hwmCheckpointMu.Unlock()
 				}
 				var err error
-				if policy == "prepared_canonical" {
+				switch policy {
+				case "prepared_canonical":
 					err = p.ApplyPreparedReplicaRollbackChecked(ctx, prepared, 1, 3, nil, 3, nil)
-				} else if policy == "prepared_speculative" {
+				case "prepared_speculative":
 					err = p.TruncatePreparedReplicaTailContext(ctx, prepared, 1)
-				} else if policy == "canonical" {
+				case "canonical":
 					err = p.ApplyReplicaRollbackChecked(ctx, 1, 3, nil, 3, nil)
-				} else {
+				default:
 					err = p.TruncateReplicaTailContext(ctx, 1)
 				}
 				require.NoError(t, err, "caller cancellation must not poison a successful disk repair")

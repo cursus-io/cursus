@@ -122,3 +122,10 @@ changed owner, tail, HWM, proof, consumed preparation and disk generation reject
 without truncation. Checkpoint failure and extra destructive work after truncate
 remain unavailable. The prior frozen 24-hour campaign continues separately and
 does not certify these new changes.
+
+The disk-backed transaction fixture also uses a 100ms background sync interval.
+Its previous 1ms interval reproduced a cleanup-test timeout on the unchanged
+baseline under a one-CPU Docker limit, with proof readers repeatedly waiting
+behind periodic sync. Changing only that fixture interval completed all four
+cleanup cases in 1.305 seconds on the same disk and CPU limit. Acknowledged
+writes still synchronize explicitly; production defaults are unchanged.
