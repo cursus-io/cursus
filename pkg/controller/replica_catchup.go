@@ -28,6 +28,12 @@ func (ch *CommandHandler) ApplyReplicaCatchupVerified(ctx context.Context, reque
 	if _, needed := replicationFSM.ReplicaPrefixRefinement(request, batch); needed {
 		return nil, fmt.Errorf("indexed rollback requires exact common-prefix refinement")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ch.quarantineReplicaCatchup(ctx, request, batch); err != nil {
+		return nil, err
+	}
 	var witness *topic.ReplicaCatchupWitness
 	err := ch.applyReplicaCatchupRequest(ctx, &request, batch, &witness)
 	return witness, err

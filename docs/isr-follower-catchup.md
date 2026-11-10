@@ -55,3 +55,46 @@ fix, each transfers one eight-byte payload in a 747-byte serialized batch, with
 no prefix replacement. The ISR and receiver-witness tests passed ten repetitions
 in Docker (21.245 seconds), and the full replication FSM package passed (19.746
 seconds). Compound execution is a separate gate before a fresh 24-hour run.
+
+## Follow-up: automatic quarantine for marked or divergent history
+
+Before implementation, compare Kafka 4.1.0
+[Partition.maybeShrinkIsr](https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/cluster/Partition.scala)
+and `ReplicaFetcherThread.processPartitionData`. Kafka treats stalled followers
+as candidates for ISR shrink and submits the membership decision outside its
+partition lock. Cursus must use its existing Raft `ISR_QUARANTINE` command and
+exact leader/lifecycle/HWM/membership fences, rather than copying Kafka's lag
+timer or permitting marked history through legacy append.
+
+Implemented behavior: a validated legacy response requiring a compacted range or
+truncation may request quarantine of its own follower. Require the original
+local request, unchanged authority and local content witness, active capable
+participants, and a non-leader receiver. Release all metadata/partition gates
+before submitting Raft. Never apply that old batch after the transition: retry
+with a fresh retained/indexed request. Failures and uncertain submission do not
+authorize mutation; only locally applied metadata enables subsequent recovery.
+
+Availability improves for idle compacted followers without waiting for a new
+client write. Quarantine can temporarily reduce ISR and reject writes below
+minISR, as the existing command requires. The bounded first response is discarded;
+the next transfer reuses a matching retained prefix and copies only its suffix.
+Do not claim zero duplicate bytes or a universal bootstrap-free repair.
+
+Regression contract: run actual catch-up scheduler passes over real marked disk
+storage with no client writes; assert automatic quarantine, fresh protocol,
+payload/HWM restoration and witness-based ISR reentry. Reject corrupt responses,
+stale leader/lifecycle/membership/local generation, missing local authority,
+unsupported capabilities and leader self-quarantine. Measure response bytes and
+retained payload work. Existing ordinary ISR catch-up must remain unchanged.
+
+The deterministic marked-log case completes in two scheduler passes with no new
+producer writes: one quarantining response and one retained-prefix suffix response.
+They serialize to 1,818 bytes total, including a 1,050-byte recovery response
+carrying one seven-byte payload. Both replicas re-admit the follower through its
+actual recovery witness. Stale authority, unsupported participants, failed
+submission and divergent-history handoff checks passed three repetitions.
+These are in-process scheduler/FSM tests over real disk, not a completed network
+fault campaign. Quarantine requires an obtainable, validated source response;
+a legacy request that fails before fetch (for example, a missing previous record)
+still needs its separate recovery path. The running 24-hour campaign uses the
+previous frozen revisions and does not certify this follow-up.
