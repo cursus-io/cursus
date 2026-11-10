@@ -168,6 +168,10 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 		}
 	}
 	if leo > r.CommittedHWM && r.RecoveryProtocol != BootstrapRecoveryProtocolVersion {
+		prepared, err := p.PrepareReplicaRollbackContext(ctx, r.CommittedHWM, leo, nil, 0)
+		if err != nil {
+			return empty, false, err
+		}
 		unlock, err = lockSourceContext(ctx, &f.transitionMu, &f.materializationMu)
 		if err != nil {
 			return empty, false, err
@@ -176,7 +180,7 @@ func (f *BrokerFSM) BuildReplicaCatchupRequestContext(ctx context.Context, broke
 			err = p.ValidateReplicaRequestWitness(ctx, r.LocalWitness, leo)
 		}
 		if err == nil {
-			err = p.TruncateReplicaTailContext(ctx, r.CommittedHWM)
+			err = p.TruncatePreparedReplicaTailContext(ctx, prepared, r.CommittedHWM)
 		}
 		if err == nil {
 			p.FlushDisk()

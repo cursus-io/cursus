@@ -99,6 +99,22 @@ func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, reques
 			return fmt.Errorf("local retained prefix changed before recovery")
 		}
 	}
+	if batch.TruncateTo != nil {
+		local := ch.TopicManager.GetTopic(batch.Topic)
+		if local == nil {
+			return fmt.Errorf("rollback preparation topic unavailable")
+		}
+		partition, err := local.GetPartition(batch.Partition)
+		if err != nil {
+			return err
+		}
+		// Always replace caller-supplied preparation. Metadata authority and the
+		// receiver witness are revalidated after this potentially long scan.
+		batch.LocalRollbackPreparation, err = partition.PrepareReplicaRollbackContext(ctx, *batch.TruncateTo, batch.StartOffset, batch.MatchedPrefix, batch.CommittedHWM)
+		if err != nil {
+			return err
+		}
+	}
 	if request != nil || batch.RecoveryProtocol != 0 || batch.TruncateTo != nil {
 		if ch.Cluster.RaftManager.GetFSM() == nil {
 			return fmt.Errorf("replica catch-up metadata is unavailable")
@@ -201,7 +217,7 @@ func (ch *CommandHandler) applyReplicaCatchup(ctx context.Context, request *repl
 				return err
 			}
 		}
-		err := partition.ApplyReplicaRollbackChecked(ctx, *batch.TruncateTo, batch.StartOffset, batch.MatchedPrefix, batch.CommittedHWM, beforeMutation)
+		err := partition.ApplyPreparedReplicaRollbackChecked(ctx, batch.LocalRollbackPreparation, *batch.TruncateTo, batch.StartOffset, batch.MatchedPrefix, batch.CommittedHWM, beforeMutation)
 		if generation != 0 {
 			// A checked pre-mutation rejection restores partition availability.
 			// Destructive/rebuild failures retain their own recovery error.
