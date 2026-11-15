@@ -221,7 +221,7 @@ func TestServiceDiscovery_NodeOperations(t *testing.T) {
 			broker := rm.mockFSM.GetBroker("node2")
 			require.NotNil(t, broker, "registration must commit before membership changes")
 			require.Equal(t, "new-process", broker.IncarnationID)
-			require.Equal(t, 2, broker.RecoveryProtocol)
+			require.Equal(t, fsm.RecoveryProtocolVersionCurrent, broker.RecoveryProtocol)
 		}).Return(nil).Once()
 		rm.On("ApplyCommand", "REGISTER", mock.Anything).Return(nil).Once()
 
