@@ -65,11 +65,11 @@ func TestEmptyISRRecoveryRequiresMatchingMinISRAndAppliesAtomically(t *testing.T
 		emptyISRLineageProof(f, "node-2", 0, digest),
 		emptyISRLineageProof(f, "node-1", 0, digest),
 	}
-	command, ready, err := f.BuildISREmptyRecoveryCommand(proofs[:1])
+	_, ready, err := f.BuildISREmptyRecoveryCommand(proofs[:1])
 	require.NoError(t, err)
 	require.False(t, ready)
 
-	command, ready, err = f.BuildISREmptyRecoveryCommand(proofs)
+	command, ready, err := f.BuildISREmptyRecoveryCommand(proofs)
 	require.NoError(t, err)
 	require.True(t, ready)
 	require.Equal(t, []string{"node-1", "node-2"}, []string{command.Proofs[0].BrokerID, command.Proofs[1].BrokerID})
