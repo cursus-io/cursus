@@ -30,15 +30,25 @@ type ISRManager struct {
 	heartbeatTimeout time.Duration
 	leaderSince      time.Time
 
+	proofMu             sync.Mutex
+	emptyProofs         map[string]map[string]receivedEmptyISRProof
+	emptyPending        map[string]fsm.ISREmptyRecoveryCommand
+	emptyRecoveryActive map[string]bool
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	startOnce sync.Once
 	done      chan struct{}
 }
 
+type receivedEmptyISRProof struct {
+	proof      fsm.ISRCatchupProof
+	receivedAt time.Time
+}
+
 // NewISRManager creates a new ISRManager. The provided ctx controls the lifetime
 // of the background ISR-check goroutine started by Start().
-func NewISRManager(ctx context.Context, fsm *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Duration, applier CommandApplier) *ISRManager {
+func NewISRManager(ctx context.Context, brokerFSM *fsm.BrokerFSM, brokerID string, heartbeatTimeout time.Duration, applier CommandApplier, configuredMinISR ...int) *ISRManager {
 	if heartbeatTimeout <= 0 {
 		heartbeatTimeout = defaultHeartbeatTimeout
 	}
@@ -49,16 +59,26 @@ func NewISRManager(ctx context.Context, fsm *fsm.BrokerFSM, brokerID string, hea
 	}
 
 	childCtx, cancel := context.WithCancel(ctx)
+	defaultMinISR := 1
+	if len(configuredMinISR) > 0 && configuredMinISR[0] > 0 {
+		defaultMinISR = configuredMinISR[0]
+	}
+	if brokerFSM != nil {
+		brokerFSM.SetDefaultMinISR(defaultMinISR)
+	}
 
 	return &ISRManager{
-		fsm:              fsm,
-		brokerID:         brokerID,
-		applier:          applier,
-		lastSeen:         lastSeen,
-		heartbeatTimeout: heartbeatTimeout,
-		ctx:              childCtx,
-		cancel:           cancel,
-		done:             make(chan struct{}),
+		fsm:                 brokerFSM,
+		brokerID:            brokerID,
+		applier:             applier,
+		lastSeen:            lastSeen,
+		heartbeatTimeout:    heartbeatTimeout,
+		emptyProofs:         make(map[string]map[string]receivedEmptyISRProof),
+		emptyPending:        make(map[string]fsm.ISREmptyRecoveryCommand),
+		emptyRecoveryActive: make(map[string]bool),
+		ctx:                 childCtx,
+		cancel:              cancel,
+		done:                make(chan struct{}),
 	}
 }
 
@@ -164,15 +184,37 @@ func (i *ISRManager) SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupP
 			return fmt.Errorf("ISR catch-up proof broker %q does not match authenticated heartbeat node %q", proof.BrokerID, nodeID)
 		}
 	}
-	if len(proofs) == 0 || i.applier == nil || !i.applier.IsLeader() {
+	if i.applier == nil || !i.applier.IsLeader() {
 		return nil
 	}
 	if i.fsm == nil {
 		recordISRProof(ISRProofOutcomeRejected, ISRProofReasonFSMUnavailable)
 		return fmt.Errorf("FSM is unavailable for ISR catch-up validation")
 	}
+	if err := i.retryPendingEmptyISRRecoveries(); err != nil {
+		return err
+	}
+	if len(proofs) == 0 {
+		return nil
+	}
 	requiredProofs := make([]fsm.ISRCatchupProof, 0, len(proofs))
+	emptyKeys := make(map[string]struct{})
 	for _, proof := range proofs {
+		if isEmptyISRRecoveryProof(proof) {
+			if err := i.fsm.ValidateEmptyISRRecoveryProof(proof); err != nil {
+				recordISRProof(ISRProofOutcomeRejected, ISRProofReasonValidation)
+				return err
+			}
+			key := emptyISRPartitionKey(proof)
+			i.proofMu.Lock()
+			if i.emptyProofs[key] == nil {
+				i.emptyProofs[key] = make(map[string]receivedEmptyISRProof)
+			}
+			i.emptyProofs[key][proof.BrokerID] = receivedEmptyISRProof{proof: proof, receivedAt: time.Now()}
+			i.proofMu.Unlock()
+			emptyKeys[key] = struct{}{}
+			continue
+		}
 		required, err := i.fsm.ValidateISRCatchupProof(proof)
 		if err != nil {
 			recordISRProof(ISRProofOutcomeRejected, ISRProofReasonValidation)
@@ -182,6 +224,11 @@ func (i *ISRManager) SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupP
 			requiredProofs = append(requiredProofs, proof)
 		} else {
 			recordISRProof(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR)
+		}
+	}
+	for key := range emptyKeys {
+		if err := i.tryEmptyISRRecovery(key); err != nil {
+			return err
 		}
 	}
 	for _, proof := range requiredProofs {
@@ -199,6 +246,85 @@ func (i *ISRManager) SubmitCatchupProofs(nodeID string, proofs []fsm.ISRCatchupP
 	return nil
 }
 
+func isEmptyISRRecoveryProof(proof fsm.ISRCatchupProof) bool {
+	return proof.LineagePrefix != nil || proof.RetainedPrefix != nil
+}
+
+func emptyISRPartitionKey(proof fsm.ISRCatchupProof) string {
+	return proof.Topic + "-" + strconv.Itoa(proof.Partition)
+}
+
+func (i *ISRManager) retryPendingEmptyISRRecoveries() error {
+	i.proofMu.Lock()
+	keys := make([]string, 0, len(i.emptyPending))
+	for key := range i.emptyPending {
+		keys = append(keys, key)
+	}
+	i.proofMu.Unlock()
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := i.tryEmptyISRRecovery(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (i *ISRManager) tryEmptyISRRecovery(key string) error {
+	if i.applier == nil || !i.applier.IsLeader() {
+		return nil
+	}
+	i.proofMu.Lock()
+	if i.emptyRecoveryActive[key] {
+		i.proofMu.Unlock()
+		return nil
+	}
+	command, pending := i.emptyPending[key]
+	var proofs []fsm.ISRCatchupProof
+	if !pending {
+		now := time.Now()
+		for brokerID, received := range i.emptyProofs[key] {
+			if now.Sub(received.receivedAt) > i.heartbeatTimeout {
+				delete(i.emptyProofs[key], brokerID)
+				continue
+			}
+			proofs = append(proofs, received.proof)
+		}
+	}
+	i.emptyRecoveryActive[key] = true
+	i.proofMu.Unlock()
+
+	if !pending {
+		var ready bool
+		var err error
+		command, ready, err = i.fsm.BuildISREmptyRecoveryCommand(proofs)
+		if err != nil || !ready {
+			i.proofMu.Lock()
+			delete(i.emptyRecoveryActive, key)
+			i.proofMu.Unlock()
+			return err
+		}
+		i.proofMu.Lock()
+		i.emptyPending[key] = command
+		i.proofMu.Unlock()
+	}
+	data, err := json.Marshal(command)
+	if err == nil {
+		err = i.applier.ApplyCommand("ISR_EMPTY_RECOVER", data)
+	}
+	i.proofMu.Lock()
+	delete(i.emptyRecoveryActive, key)
+	if err == nil {
+		delete(i.emptyPending, key)
+		delete(i.emptyProofs, key)
+	}
+	i.proofMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("apply empty ISR recovery for %s: %w", key, err)
+	}
+	return nil
+}
+
 func (i *ISRManager) SetLeader(isLeader bool) {
 	i.mu.Lock()
 	if isLeader {
@@ -212,6 +338,11 @@ func (i *ISRManager) SetLeader(isLeader bool) {
 		i.leaderSince = time.Time{}
 	}
 	i.mu.Unlock()
+	i.proofMu.Lock()
+	i.emptyProofs = make(map[string]map[string]receivedEmptyISRProof)
+	i.emptyPending = make(map[string]fsm.ISREmptyRecoveryCommand)
+	i.emptyRecoveryActive = make(map[string]bool)
+	i.proofMu.Unlock()
 
 	if isLeader {
 		// Force immediate refresh instead of waiting for ticker
@@ -330,4 +461,16 @@ func (i *ISRManager) CleanStaleHeartbeats() {
 			delete(i.lastSeen, id)
 		}
 	}
+	i.proofMu.Lock()
+	for key, proofs := range i.emptyProofs {
+		for brokerID, received := range proofs {
+			if now.Sub(received.receivedAt) > i.heartbeatTimeout {
+				delete(proofs, brokerID)
+			}
+		}
+		if len(proofs) == 0 {
+			delete(i.emptyProofs, key)
+		}
+	}
+	i.proofMu.Unlock()
 }

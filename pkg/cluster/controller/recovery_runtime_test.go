@@ -43,7 +43,7 @@ func TestRecoveryActivationRequiresInstalledBundle(t *testing.T) {
 	require.Zero(t, version())
 	source.ready = true
 	require.NoError(t, sd.ActivateRecoveryRuntime())
-	require.Equal(t, 2, version())
+	require.Equal(t, fsm.RecoveryProtocolVersionCurrent, version())
 	require.NoError(t, sd.ActivateRecoveryRuntime())
 }
 

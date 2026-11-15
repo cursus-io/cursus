@@ -3,13 +3,16 @@ package replication
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
@@ -52,7 +55,7 @@ type MockCommandApplier struct {
 }
 
 func (m *MockCommandApplier) ApplyCommand(prefix string, data []byte) error {
-	if prefix == "PARTITION" || prefix == "ISR_CATCHUP" {
+	if prefix == "PARTITION" || prefix == "ISR_CATCHUP" || prefix == "ISR_EMPTY_RECOVER" {
 		fullData := fmt.Sprintf("%s:%s", prefix, string(data))
 		result := m.fsm.Apply(&raft.Log{Data: []byte(fullData)})
 		if err, ok := result.(error); ok {
@@ -110,6 +113,113 @@ func TestISRManager_SubmitCatchupProofsFencesIdentityAndAppliesOnLeader(t *testi
 	require.Equal(t, identityBefore+1, isrProofMetricValue(ISRProofOutcomeRejected, ISRProofReasonIdentityMismatch))
 	require.Equal(t, appliedBefore+1, isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonApplied))
 	require.Equal(t, alreadyBefore+1, isrProofMetricValue(ISRProofOutcomeAccepted, ISRProofReasonAlreadyInISR))
+}
+
+func newEmptyISRManagerTest(t *testing.T) (*fsm.BrokerFSM, *ISRManager, *MockCommandApplier) {
+	t.Helper()
+	cfg := &config.Config{LogDir: t.TempDir()}
+	tm := topic.NewTopicManager(cfg, &FakeHandlerProvider{}, nil)
+	state := fsm.NewBrokerFSM(tm, nil)
+	for _, id := range []string{"node1", "node2", "node3"} {
+		data, err := json.Marshal(fsm.BrokerInfo{
+			ID: id, Status: "active", RecoveryProtocol: fsm.RecoveryProtocolVersionCurrent,
+			IncarnationID: id + "-process",
+		})
+		require.NoError(t, err)
+		require.Nil(t, state.Apply(&raft.Log{Data: []byte("REGISTER:" + string(data))}))
+	}
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 3
+	command, err := json.Marshal(fsm.TopicCommand{Definition: &definition, LeaderID: "node3"})
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte("TOPIC:" + string(command))}))
+	metadata := state.GetPartitionMetadata("orders-0")
+	metadata.Leader = "node3"
+	metadata.LeaderEpoch = 5
+	metadata.ISR = []string{}
+	metadata.Replicas = []string{"node1", "node2", "node3"}
+	metadata.CommittedHWM = 0
+	metadata.CommittedHWMKnown = true
+	encoded, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(encoded))}))
+	applier := &MockCommandApplier{IsLeaderResult: true, fsm: state}
+	manager := NewISRManager(context.Background(), state, "node1", time.Second, applier, 2)
+	return state, manager, applier
+}
+
+func emptyISRManagerProof(state *fsm.BrokerFSM, brokerID, digest string) fsm.ISRCatchupProof {
+	broker := state.GetBroker(brokerID)
+	return fsm.ISRCatchupProof{
+		Topic: "orders", Partition: 0, BrokerID: brokerID,
+		CommittedHWM: 0, LocalLEO: 0, LocalHWM: 0,
+		LeaderEpoch: 5, LifecycleEpoch: topic.InitialLifecycleEpoch,
+		IncarnationID: broker.IncarnationID, IncarnationEpoch: broker.IncarnationEpoch,
+		RecoveryProtocol: fsm.IndexedRecoveryProtocolVersion,
+		LineagePrefix:    &disk.LineagePrefix{StartOffset: 0, EndOffset: 0, Digest: digest},
+	}
+}
+
+func TestISRManagerRecoversEmptyISRFromMatchingProofQuorum(t *testing.T) {
+	state, manager, _ := newEmptyISRManagerTest(t)
+	digest := strings.Repeat("a", 64)
+	require.NoError(t, manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node2", digest)}))
+	require.Empty(t, state.GetPartitionMetadata("orders-0").ISR)
+	require.NoError(t, manager.SubmitCatchupProofs("node1", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node1", digest)}))
+	metadata := state.GetPartitionMetadata("orders-0")
+	require.Equal(t, []string{"node1", "node2"}, metadata.ISR)
+	require.Equal(t, "node1", metadata.Leader)
+	require.Equal(t, 6, metadata.LeaderEpoch)
+	require.NotContains(t, metadata.ISR, "node3", "remaining replicas must use normal catch-up admission")
+}
+
+func TestISRManagerDoesNotMixDivergentOrExpiredProofs(t *testing.T) {
+	state, manager, _ := newEmptyISRManagerTest(t)
+	a := strings.Repeat("a", 64)
+	b := strings.Repeat("b", 64)
+	require.NoError(t, manager.SubmitCatchupProofs("node1", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node1", a)}))
+	require.NoError(t, manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node2", b)}))
+	require.Empty(t, state.GetPartitionMetadata("orders-0").ISR)
+
+	manager.proofMu.Lock()
+	stored := manager.emptyProofs["orders-0"]["node1"]
+	stored.receivedAt = time.Now().Add(-2 * manager.heartbeatTimeout)
+	manager.emptyProofs["orders-0"]["node1"] = stored
+	manager.proofMu.Unlock()
+	require.NoError(t, manager.SubmitCatchupProofs("node3", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node3", a)}))
+	require.Empty(t, state.GetPartitionMetadata("orders-0").ISR, "expired matching proof must not form quorum")
+}
+
+type uncertainEmptyISRApply struct {
+	base     *MockCommandApplier
+	failOnce bool
+}
+
+func (a *uncertainEmptyISRApply) IsLeader() bool { return a.base.IsLeader() }
+func (a *uncertainEmptyISRApply) ApplyCommand(prefix string, data []byte) error {
+	err := a.base.ApplyCommand(prefix, data)
+	if err == nil && prefix == "ISR_EMPTY_RECOVER" && a.failOnce {
+		a.failOnce = false
+		return errors.New("unknown raft apply outcome")
+	}
+	return err
+}
+
+func TestISRManagerRetriesUnknownEmptyISRApplyIdempotently(t *testing.T) {
+	state, manager, base := newEmptyISRManagerTest(t)
+	manager.applier = &uncertainEmptyISRApply{base: base, failOnce: true}
+	digest := strings.Repeat("a", 64)
+	require.NoError(t, manager.SubmitCatchupProofs("node1", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node1", digest)}))
+	err := manager.SubmitCatchupProofs("node2", []fsm.ISRCatchupProof{emptyISRManagerProof(state, "node2", digest)})
+	require.ErrorContains(t, err, "unknown raft apply outcome")
+	require.Equal(t, 6, state.GetPartitionMetadata("orders-0").LeaderEpoch)
+
+	require.NoError(t, manager.SubmitCatchupProofs("node1", nil))
+	require.Equal(t, 6, state.GetPartitionMetadata("orders-0").LeaderEpoch)
+	manager.proofMu.Lock()
+	require.Empty(t, manager.emptyPending)
+	manager.proofMu.Unlock()
 }
 
 func isrProofMetricValue(outcome, reason string) uint64 {

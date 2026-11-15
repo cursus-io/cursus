@@ -135,6 +135,9 @@ type RaftReplicationManager struct {
 
 func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID string, topicManager *topic.TopicManager, coordinator *coordinator.Coordinator, client client.TCPClusterClient) (*RaftReplicationManager, error) {
 	brokerFSM := fsm.NewBrokerFSMWithTransactionCoordinatorShards(topicManager, coordinator, cfg.TransactionCoordinatorShards)
+	// Raft may restore snapshots and replay empty-ISR recovery entries during
+	// NewRaft, so Apply must see the configured cluster default immediately.
+	brokerFSM.SetDefaultMinISR(cfg.MinInSyncReplicas)
 	// NewRaft can restore and replay committed TXN_SYNC entries before the
 	// command handler exists. The manager must already be attached, and the
 	// handler must later reuse it rather than replacing the recovered state.
@@ -278,7 +281,7 @@ func NewRaftReplicationManager(ctx context.Context, cfg *config.Config, brokerID
 	}
 
 	ctx, rm.backgroundCancel = context.WithCancel(ctx)
-	rm.isrManager = NewISRManager(ctx, brokerFSM, brokerID, 5*time.Second, rm)
+	rm.isrManager = NewISRManager(ctx, brokerFSM, brokerID, 5*time.Second, rm, cfg.MinInSyncReplicas)
 	rm.isrManager.Start()
 	rm.backgroundWorkers.Add(3)
 	go func() {

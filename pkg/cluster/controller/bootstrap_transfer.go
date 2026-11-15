@@ -33,7 +33,7 @@ func (sd *serviceDiscovery) ActivateRecoveryRuntime() error {
 	if err := runtime.RecoveryRuntimeReady(sd.incarnationID); err != nil {
 		return err
 	}
-	sd.recoveryProtocol = fsm.BootstrapRecoveryProtocolVersion
+	sd.recoveryProtocol = fsm.RecoveryProtocolVersionCurrent
 	return nil
 }
 

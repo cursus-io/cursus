@@ -2,6 +2,7 @@ package e2e_cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -27,6 +28,7 @@ func TestRaftSnapshotRestorePreservesAndAdvancesTopicState(t *testing.T) {
 	keep := LocalTopicDefinition{Topic: "snapshot-keep", Partitions: 2, CleanupPolicy: "delete"}
 	deleted := LocalTopicDefinition{Topic: "snapshot-delete", Partitions: 1, CleanupPolicy: "delete"}
 	created := LocalTopicDefinition{Topic: "post-restore-create", Partitions: 3, CleanupPolicy: "delete"}
+	zeroHWM := LocalTopicDefinition{Topic: "snapshot-zero-hwm", Partitions: 1, CleanupPolicy: "delete"}
 
 	if err := actions.CreateNamedTopic(keep.Topic, keep.Partitions); err != nil {
 		t.Fatalf("create baseline topic %s: %v", keep.Topic, err)
@@ -34,12 +36,19 @@ func TestRaftSnapshotRestorePreservesAndAdvancesTopicState(t *testing.T) {
 	if err := actions.CreateNamedTopic(deleted.Topic, deleted.Partitions); err != nil {
 		t.Fatalf("create baseline topic %s: %v", deleted.Topic, err)
 	}
+	if err := actions.CreateNamedTopic(zeroHWM.Topic, zeroHWM.Partitions); err != nil {
+		t.Fatalf("create zero-HWM topic %s: %v", zeroHWM.Topic, err)
+	}
 	if err := actions.WaitForLocalTopicDefinition(follower, keep, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := actions.WaitForLocalTopicDefinition(follower, deleted, true); err != nil {
 		t.Fatal(err)
 	}
+	if err := actions.WaitForLocalTopicDefinition(follower, zeroHWM, true); err != nil {
+		t.Fatal(err)
+	}
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), zeroHWM.Topic, 0)
 	followerStatus, err := actions.LocalClusterStatus(follower)
 	if err != nil {
 		t.Fatalf("read follower status before snapshot: %v", err)
@@ -121,6 +130,9 @@ func TestRaftSnapshotRestorePreservesAndAdvancesTopicState(t *testing.T) {
 			t.Fatalf("broker-%d did not recover after full restart: %v", node, err)
 		}
 	}
+	waitForNamedTopicStableFullISR(t, ctx, created.Topic, "data-bearing snapshot topic full-cluster restart")
+	waitForNamedTopicStableFullISR(t, ctx, zeroHWM.Topic, "zero-HWM snapshot topic full-cluster restart")
+	requireReplicaOffsetsEventually(t, ctx.GetBrokerAddrs(), zeroHWM.Topic, 0)
 	reader, err := sdk.NewAdminClient(&sdk.AdminConfig{
 		BrokerAddrs: ctx.GetBrokerAddrs(), RequestTimeoutMS: 3000, MaxRetries: 5, RetryBackoffMS: 100,
 	})
@@ -141,6 +153,32 @@ func TestRaftSnapshotRestorePreservesAndAdvancesTopicState(t *testing.T) {
 		}
 		return result.Messages[0].Payload == payload, result.Messages[0].Payload, nil
 	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForNamedTopicStableFullISR(t *testing.T, ctx *ClusterTestContext, topicName, phase string) {
+	t.Helper()
+	err := eventuallyStable(t, phase, 2*clusterReadyTimeout, rollingRestartISRStabilityWindow, func() (bool, string, error) {
+		response, err := ctx.GetClient().SendCommand("", "DESCRIBE topic="+topicName, 5*time.Second)
+		if err != nil {
+			return false, "DESCRIBE failed", err
+		}
+		var metadata topicMetadata
+		if err := json.Unmarshal([]byte(response), &metadata); err != nil {
+			return false, response, err
+		}
+		if len(metadata.Partitions) == 0 {
+			return false, "topic has no partitions", nil
+		}
+		for _, partition := range metadata.Partitions {
+			if len(partition.Replicas) != ctx.clusterSize || len(partition.ISR) != ctx.clusterSize {
+				return false, fmt.Sprintf("partition=%d replicas=%v isr=%v", partition.ID, partition.Replicas, partition.ISR), nil
+			}
+		}
+		return true, fmt.Sprintf("topic=%s partitions=%d full ISR", topicName, len(metadata.Partitions)), nil
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 }
