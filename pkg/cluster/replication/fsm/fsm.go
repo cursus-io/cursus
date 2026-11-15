@@ -40,6 +40,8 @@ const (
 	// Recovery capabilities are additive and do not raise lifecycle requirements.
 	IndexedRecoveryProtocolVersion   = 1
 	BootstrapRecoveryProtocolVersion = 2
+	EmptyISRRecoveryProtocolVersion  = 3
+	RecoveryProtocolVersionCurrent   = EmptyISRRecoveryProtocolVersion
 )
 
 type ReplicationEntry struct {
@@ -143,6 +145,7 @@ type BrokerFSM struct {
 	consumerMetadataRoutingActivated           bool
 	transactionCoordinatorChanges              chan []int
 	topicState                                 map[string]*topic.Definition
+	defaultMinISR                              int
 	topicMaterialization                       map[string]TopicMaterializationIssue
 	topicMaterializationRuns                   map[string]TopicMaterializationAttempts
 	replicaMaterialization                     map[string]ReplicaMaterializationIssue
@@ -164,6 +167,7 @@ func NewBrokerFSMWithTransactionCoordinatorShards(tm *topic.TopicManager, cd *co
 		partitionMetadata:            make(map[string]*PartitionMetadata),
 		producerState:                make(map[string]map[int]map[string]ProducerSequence),
 		topicState:                   make(map[string]*topic.Definition),
+		defaultMinISR:                1,
 		topicMaterialization:         make(map[string]TopicMaterializationIssue),
 		topicMaterializationRuns:     make(map[string]TopicMaterializationAttempts),
 		replicaMaterialization:       make(map[string]ReplicaMaterializationIssue),
@@ -349,6 +353,8 @@ func (f *BrokerFSM) Apply(log *raft.Log) interface{} {
 		res = f.applyReplicaReassignmentCommand(strings.TrimPrefix(data, "REPLICA_REASSIGN:"))
 	case strings.HasPrefix(data, "ISR_CATCHUP:"):
 		res = f.applyISRCatchupCommand(strings.TrimPrefix(data, "ISR_CATCHUP:"))
+	case strings.HasPrefix(data, "ISR_EMPTY_RECOVER:"):
+		res = f.applyISREmptyRecoveryCommand(strings.TrimPrefix(data, "ISR_EMPTY_RECOVER:"))
 	case strings.HasPrefix(data, "ISR_QUARANTINE:"):
 		res = f.applyISRQuarantineCommand(strings.TrimPrefix(data, "ISR_QUARANTINE:"))
 	case strings.HasPrefix(data, "LEADER_ELECTION:"):

@@ -11,7 +11,7 @@ import (
 )
 
 func voterRegistration(state *fsm.BrokerFSM) fsm.BrokerInfo {
-	return fsm.BrokerInfo{ID: "node2", Addr: "localhost:9002", ClientAddr: "localhost:9202", Status: "active", IncarnationID: "new-process", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent, RecoveryProtocol: fsm.BootstrapRecoveryProtocolVersion, TransactionCoordinatorShards: state.TransactionCoordinatorShardCount()}
+	return fsm.BrokerInfo{ID: "node2", Addr: "localhost:9002", ClientAddr: "localhost:9202", Status: "active", IncarnationID: "new-process", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent, RecoveryProtocol: fsm.RecoveryProtocolVersionCurrent, TransactionCoordinatorShards: state.TransactionCoordinatorShardCount()}
 }
 
 func TestNewVoterRejectsIncompleteRegistrationBeforeMutation(t *testing.T) {

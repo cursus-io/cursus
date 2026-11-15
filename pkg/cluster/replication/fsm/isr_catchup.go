@@ -157,14 +157,19 @@ func replicaCatchupBatchDigest(batch ReplicaCatchupBatch) (string, error) {
 // ISRCatchupProof fences ISR re-admission with the authoritative partition
 // boundary and the current leader and topic lifecycle generations.
 type ISRCatchupProof struct {
-	Topic          string `json:"topic"`
-	Partition      int    `json:"partition"`
-	BrokerID       string `json:"broker_id"`
-	CommittedHWM   uint64 `json:"committed_hwm"`
-	LocalLEO       uint64 `json:"local_leo"`
-	LocalHWM       uint64 `json:"local_hwm"`
-	LeaderEpoch    int    `json:"leader_epoch"`
-	LifecycleEpoch uint64 `json:"lifecycle_epoch"`
+	Topic            string               `json:"topic"`
+	Partition        int                  `json:"partition"`
+	BrokerID         string               `json:"broker_id"`
+	CommittedHWM     uint64               `json:"committed_hwm"`
+	LocalLEO         uint64               `json:"local_leo"`
+	LocalHWM         uint64               `json:"local_hwm"`
+	LeaderEpoch      int                  `json:"leader_epoch"`
+	LifecycleEpoch   uint64               `json:"lifecycle_epoch"`
+	IncarnationID    string               `json:"incarnation_id,omitempty"`
+	IncarnationEpoch uint64               `json:"incarnation_epoch,omitempty"`
+	RecoveryProtocol int                  `json:"recovery_protocol,omitempty"`
+	LineagePrefix    *disk.LineagePrefix  `json:"lineage_prefix,omitempty"`
+	RetainedPrefix   *disk.RetainedPrefix `json:"retained_prefix,omitempty"`
 }
 
 // ValidateISRCatchupProof validates a proof against the current FSM view. The
@@ -221,6 +226,9 @@ func (f *BrokerFSM) validateISRCatchupProofLocked(proof ISRCatchupProof) (bool, 
 	if containsString(metadata.ISR, proof.BrokerID) {
 		return false, nil
 	}
+	if len(metadata.ISR) == 0 {
+		return false, fmt.Errorf("partition %s has empty ISR; quorum proof recovery is required", key)
+	}
 	return true, nil
 }
 
@@ -262,11 +270,25 @@ func (f *BrokerFSM) applyISRCatchupCommand(jsonData string) interface{} {
 // BuildISRCatchupProofs returns proofs only for local, synchronized replicas
 // that are currently outside ISR under the same topic lifecycle generation.
 func (f *BrokerFSM) BuildISRCatchupProofs(brokerID string) []ISRCatchupProof {
-	f.transitionMu.Lock()
-	defer f.transitionMu.Unlock()
-	f.materializationMu.Lock()
-	defer f.materializationMu.Unlock()
-	return f.buildISRCatchupProofsPrelocked(brokerID, "")
+	proofs := func() []ISRCatchupProof {
+		f.transitionMu.Lock()
+		defer f.transitionMu.Unlock()
+		f.materializationMu.Lock()
+		defer f.materializationMu.Unlock()
+		return f.buildISRCatchupProofsPrelocked(brokerID, "")
+	}()
+	emptyProofs, err := f.BuildEmptyISRRecoveryProofsContext(context.Background(), brokerID)
+	proofs = append(proofs, emptyProofs...)
+	if err != nil {
+		util.Warn("build empty ISR recovery proofs for %s: %v", brokerID, err)
+	}
+	sort.Slice(proofs, func(i, j int) bool {
+		if proofs[i].Topic != proofs[j].Topic {
+			return proofs[i].Topic < proofs[j].Topic
+		}
+		return proofs[i].Partition < proofs[j].Partition
+	})
+	return proofs
 }
 
 // BuildISRCatchupProofContext examines only the scheduled partition, avoiding an

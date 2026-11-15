@@ -86,7 +86,7 @@ func (sd *serviceDiscovery) LocalRegistrationPayload() ([]byte, error) {
 	source := sd.bootstrapSource
 	sd.bootstrapMu.RUnlock()
 	ready := false
-	if provider, ok := source.(interface{ ConsumerRoutingRecoveryReady() bool }); ok && version == fsm.BootstrapRecoveryProtocolVersion {
+	if provider, ok := source.(interface{ ConsumerRoutingRecoveryReady() bool }); ok && version >= fsm.BootstrapRecoveryProtocolVersion {
 		ready = provider.ConsumerRoutingRecoveryReady()
 	}
 	broker := &fsm.BrokerInfo{
@@ -297,7 +297,7 @@ func (sd *serviceDiscovery) AddNodeWithRegistration(nodeID string, addr string, 
 	}
 
 	if registration == nil || registration.ID != nodeID || registration.Addr != addr || registration.Status != "active" ||
-		registration.IncarnationID == "" || registration.RecoveryProtocol != fsm.BootstrapRecoveryProtocolVersion ||
+		registration.IncarnationID == "" || registration.RecoveryProtocol != fsm.RecoveryProtocolVersionCurrent ||
 		registration.LifecycleProtocol != fsm.BrokerProtocolVersionCurrent || registration.TransactionCoordinatorShards != shardCount {
 		return leaderAddr, fmt.Errorf("new voter requires current process registration and installed recovery runtime")
 	}

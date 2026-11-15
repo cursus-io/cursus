@@ -39,7 +39,7 @@ func TestVoterRegistrationBootstrapsRealThreeNodeRaft(t *testing.T) {
 			require.NoError(t, discovery.Register())
 			continue
 		}
-		registration := fsm.BrokerInfo{ID: id, Addr: address, ClientAddr: address, Status: "active", IncarnationID: id + "-process", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent, RecoveryProtocol: fsm.BootstrapRecoveryProtocolVersion, TransactionCoordinatorShards: cfg.TransactionCoordinatorShards}
+		registration := fsm.BrokerInfo{ID: id, Addr: address, ClientAddr: address, Status: "active", IncarnationID: id + "-process", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent, RecoveryProtocol: fsm.RecoveryProtocolVersionCurrent, TransactionCoordinatorShards: cfg.TransactionCoordinatorShards}
 		_, err = discovery.AddNodeWithRegistration(id, address, cfg.TransactionCoordinatorShards, &registration)
 		require.NoError(t, err)
 		require.Eventually(t, func() bool { return manager.GetFSM().GetBroker(id) != nil }, 10*time.Second, 10*time.Millisecond)
