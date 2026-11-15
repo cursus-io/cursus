@@ -28,6 +28,12 @@ func (ch *CommandHandler) ApplyReplicaCatchupVerified(ctx context.Context, reque
 	if _, needed := replicationFSM.ReplicaPrefixRefinement(request, batch); needed {
 		return nil, fmt.Errorf("indexed rollback requires exact common-prefix refinement")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ch.quarantineReplicaCatchup(ctx, request, batch); err != nil {
+		return nil, err
+	}
 	var witness *topic.ReplicaCatchupWitness
 	err := ch.applyReplicaCatchupRequest(ctx, &request, batch, &witness)
 	return witness, err
@@ -103,7 +109,11 @@ func (ch *CommandHandler) applyReplicaCatchupRequest(ctx context.Context, reques
 		if ch.Cluster.RaftManager.GetFSM() == nil {
 			return fmt.Errorf("replica catch-up metadata is unavailable")
 		}
-		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, func() error { return ch.applyReplicaCatchup(ctx, request, batch, witness) })
+		apply := func() error { return ch.applyReplicaCatchup(ctx, request, batch, witness) }
+		if request != nil {
+			return ch.Cluster.RaftManager.GetFSM().WithReplicaRequestRecoveryFence(*request, batch, apply)
+		}
+		return ch.Cluster.RaftManager.GetFSM().WithReplicaRecoveryFence(batch, apply)
 	}
 	return ch.applyReplicaCatchup(ctx, request, batch, witness)
 }
