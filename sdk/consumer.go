@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cursus-io/cursus/pkg/wire"
@@ -38,6 +39,7 @@ type Consumer struct {
 	coordinatorAddr string
 
 	commitConn     net.Conn
+	commitConnMu   sync.Mutex
 	commitCh       chan commitEntry
 	commitMu       sync.Mutex
 	commitRetryMap map[int]retryCommit
@@ -566,25 +568,6 @@ func (c *Consumer) commitBatch(offsets map[int]uint64, respChannels map[int][]ch
 	}
 }
 
-func (c *Consumer) validateCommitConn() bool {
-	if c.commitConn == nil {
-		return false
-	}
-	if err := c.commitConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
-		_ = c.commitConn.Close()
-		c.commitConn = nil
-		return false
-	}
-	_, err := c.commitConn.Read(make([]byte, 0))
-	if err != nil && !os.IsTimeout(err) {
-		_ = c.commitConn.Close()
-		c.commitConn = nil
-		return false
-	}
-	_ = c.commitConn.SetReadDeadline(time.Time{})
-	return true
-}
-
 func (c *Consumer) sendBatchCommit(offsets map[int]uint64, assignmentGeneration uint64) bool {
 	return c.sendBatchCommitWithState(offsets, assignmentGeneration, false)
 }
@@ -599,31 +582,6 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 	}
 	requestCtx, cancelRequest := boundedRequestContext(requestParent, c.requestTimeout())
 	defer cancelRequest()
-	c.commitMu.Lock()
-	needsNewConn := c.commitConn == nil || !c.validateCommitConn()
-	c.commitMu.Unlock()
-
-	if needsNewConn {
-		newConn, err := c.getCoordinatorConnContext(requestCtx)
-		if err != nil {
-			LogError("Batch commit: failed to get connection: %v", err)
-			return false
-		}
-		c.commitMu.Lock()
-		c.commitConn = newConn
-		c.commitMu.Unlock()
-	}
-
-	c.commitMu.Lock()
-	conn := c.commitConn
-	c.commitMu.Unlock()
-	cleanup, err := bindConnectionToContext(requestCtx, conn)
-	if err != nil {
-		c.closeCommitConn(conn)
-		return false
-	}
-	defer cleanup()
-
 	c.mu.RLock()
 	generation := c.generation
 	memberID := c.memberID
@@ -638,62 +596,73 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 		LogError("Batch commit: invalid offsets: %v", err)
 		return false
 	}
-	command := fmt.Sprintf("BATCH_COMMIT topic=%s group=%s generation=%d member=%s offsets=%s",
-		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets)
+	request := []byte(fmt.Sprintf("BATCH_COMMIT topic=%s group=%s generation=%d member=%s offsets=%s",
+		c.config.Topic, c.config.GroupID, generation, memberID, encodedOffsets))
 
-	c.lifecycleMu.Lock()
-	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
-		c.lifecycleMu.Unlock()
-		return false
-	}
-	err = WriteWithLength(conn, []byte(command))
-	c.lifecycleMu.Unlock()
-	if err != nil {
-		LogError("Batch commit send failed: %v", err)
-		c.commitMu.Lock()
-		if c.commitConn == conn {
-			_ = conn.Close()
-			c.commitConn = nil
-		}
-		c.commitMu.Unlock()
-		return false
-	}
+	c.commitConnMu.Lock()
+	defer c.commitConnMu.Unlock()
 
-	resp, err := ReadWithLength(conn)
-	if err != nil {
-		var brokerErr *BrokerError
-		if errors.As(err, &brokerErr) {
-			if c.handleNotCoordinatorError(brokerErr) {
-				c.closeCommitConn(conn)
-				LogWarn("Batch commit coordinator moved: %v", brokerErr)
-				return false
-			}
-			switch strings.ToUpper(brokerErr.Code) {
-			case "NOT_OWNER", "GEN_MISMATCH", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
-				select {
-				case c.rebalanceSig <- struct{}{}:
-				default:
-				}
-			}
-			LogError("Batch commit rejected: %v", brokerErr)
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := requestCtx.Err(); err != nil {
+			LogDebug("Batch commit stopped before attempt %d: %v", attempt+1, err)
 			return false
 		}
-		LogError("Batch commit response failed: %v", err)
-		c.commitMu.Lock()
-		if c.commitConn == conn {
-			_ = conn.Close()
-			c.commitConn = nil
+		if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
+			return false
 		}
-		c.commitMu.Unlock()
+
+		conn := c.commitConn
+		if conn == nil {
+			newConn, err := c.getCoordinatorConnContext(requestCtx)
+			if err != nil {
+				LogError("Batch commit: failed to get connection: %v", err)
+				return false
+			}
+			c.commitConn = newConn
+			conn = newConn
+		}
+
+		resp, err := c.exchangeBatchCommit(requestCtx, conn, request, assignmentGeneration, allowClosing)
+		if err != nil {
+			if errors.Is(err, ErrConsumerRebalancing) {
+				return false
+			}
+			var brokerErr *BrokerError
+			if errors.As(err, &brokerErr) {
+				if c.handleNotCoordinatorError(brokerErr) {
+					c.discardCommitConnLocked(conn)
+					LogWarn("Batch commit coordinator moved: %v", brokerErr)
+					return false
+				}
+				switch strings.ToUpper(brokerErr.Code) {
+				case "NOT_OWNER", "GEN_MISMATCH", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
+					select {
+					case c.rebalanceSig <- struct{}{}:
+					default:
+					}
+				}
+				LogError("Batch commit rejected: %v", brokerErr)
+				return false
+			}
+			LogError("Batch commit transport failed (attempt %d/2): %v", attempt+1, err)
+			c.discardCommitConnLocked(conn)
+			if attempt == 0 && requestCtx.Err() == nil &&
+				c.assignmentCanCommit(assignmentGeneration, allowClosing) &&
+				isRetryableCommitTransportError(err) {
+				continue
+			}
+			return false
+		}
+
+		respStr := string(resp)
+		if hasOKStatus(respStr) {
+			return true
+		}
+
+		LogError("Batch commit rejected: %s", respStr)
 		return false
 	}
 
-	respStr := string(resp)
-	if hasOKStatus(respStr) {
-		return true
-	}
-
-	LogError("Batch commit rejected: %s", respStr)
 	return false
 }
 
@@ -721,13 +690,55 @@ func (c *Consumer) recordCommittedOffsets(offsets map[int]uint64, assignmentGene
 	}
 }
 
-func (c *Consumer) closeCommitConn(conn net.Conn) {
-	c.commitMu.Lock()
+func (c *Consumer) exchangeBatchCommit(ctx context.Context, conn net.Conn, request []byte, assignmentGeneration uint64, allowClosing bool) ([]byte, error) {
+	cleanup, err := bindConnectionToContext(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	c.lifecycleMu.Lock()
+	if !c.assignmentCanCommit(assignmentGeneration, allowClosing) {
+		c.lifecycleMu.Unlock()
+		return nil, ErrConsumerRebalancing
+	}
+	err = WriteWithLength(conn, request)
+	c.lifecycleMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("send BATCH_COMMIT: %w", err)
+	}
+	resp, err := ReadWithLength(conn)
+	if err != nil {
+		return nil, fmt.Errorf("read BATCH_COMMIT response: %w", err)
+	}
+	return resp, nil
+}
+
+func isRetryableCommitTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return !netErr.Timeout()
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "connection aborted") ||
+		strings.Contains(message, "forcibly closed")
+}
+
+func (c *Consumer) discardCommitConnLocked(conn net.Conn) {
 	if c.commitConn == conn {
 		_ = conn.Close()
 		c.commitConn = nil
 	}
-	c.commitMu.Unlock()
 }
 
 func (c *Consumer) directCommit(partition int, offset uint64, assignmentGeneration uint64) error {
@@ -1208,12 +1219,12 @@ func (c *Consumer) Close() error {
 
 	c.resetHeartbeatConn()
 
-	c.commitMu.Lock()
+	c.commitConnMu.Lock()
 	if c.commitConn != nil {
 		_ = c.commitConn.Close()
 		c.commitConn = nil
 	}
-	c.commitMu.Unlock()
+	c.commitConnMu.Unlock()
 
 	c.mu.Lock()
 	for _, pc := range c.partitionConsumers {
@@ -1245,12 +1256,12 @@ func (c *Consumer) closeActiveConnections() {
 
 	c.resetHeartbeatConn()
 
-	c.commitMu.Lock()
+	c.commitConnMu.Lock()
 	if c.commitConn != nil {
 		_ = c.commitConn.Close()
 		c.commitConn = nil
 	}
-	c.commitMu.Unlock()
+	c.commitConnMu.Unlock()
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
