@@ -272,7 +272,7 @@ func TestBatchCommitCancellationDoesNotReconnect(t *testing.T) {
 }
 
 func TestBatchCommitTimeoutDoesNotReconnect(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := newCommitTestConsumer(t, ctx)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -297,9 +297,17 @@ func TestBatchCommitTimeoutDoesNotReconnect(t *testing.T) {
 	framed, err := openWireConnection(client, 1000, "none")
 	require.NoError(t, err)
 	c.commitConn = framed
+	cancelTimer := time.AfterFunc(50*time.Millisecond, cancel)
+	defer cancelTimer.Stop()
 
 	assert.False(t, c.sendBatchCommit(map[int]uint64{0: 42}, commitTestAssignmentGeneration))
-	require.NoError(t, <-serverDone)
+	select {
+	case serveErr := <-serverDone:
+		require.NoError(t, serveErr)
+	case <-time.After(time.Second):
+		_ = framed.Close()
+		t.Fatal("timed out waiting for commit test server to stop")
+	}
 	assert.Contains(t, <-commands, "offsets=P0:42")
 	expectNoConnection(t, listener)
 }
