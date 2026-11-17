@@ -116,11 +116,12 @@ func TestRunningStreamAbortAndDisconnectPreserveRedelivery(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(ch.StreamManager.GetStreamsForPartition("inputs", 0)) == 0
 	}, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, "OK offset=0", ch.handleFetchOffset("FETCH_OFFSET topic=inputs partition=0 group=workers"), "abort must not advance the broker offset")
 	_ = server.Close()
 
 	replayServer, replayClient := net.Pipe()
 	t.Cleanup(func() { _ = replayClient.Close(); _ = replayServer.Close() })
-	require.NoError(t, ch.HandleStreamCommand(replayServer, "STREAM topic=inputs partition=0 group=workers offset=0 batch=1", NewClientContext("workers", 0)))
+	require.NoError(t, ch.HandleStreamCommand(replayServer, "STREAM topic=inputs partition=0 group=workers batch=1", NewClientContext("workers", 0)))
 	require.Equal(t, uint64(0), readStreamOffset(t, replayClient), "an aborted handler must resume from the unchanged broker offset")
 }
 
