@@ -58,13 +58,13 @@ func (p *Partition) ApplyReplicaRollbackChecked(ctx context.Context, offset, exp
 }
 
 func (p *Partition) applyReplicaRollback(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool) (result error) {
-	return p.repairReplicaTail(ctx, offset, expectedLEO, prefix, hwm, beforeMutation, checked, canonicalReplicaRollback, nil)
+	return p.repairReplicaTail(ctx, offset, expectedLEO, prefix, hwm, beforeMutation, checked, canonicalReplicaRollback, nil, nil)
 }
 
 // repairReplicaTail shares physical repair while keeping the distinct authority
 // rules of canonical divergence rollback, speculative tail repair and Raft HWM
 // reconciliation. No maintenance lock or retained-log scan runs under p.mu.
-func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool, policy replicaRepairPolicy, expectedReconciliation error) (result error) {
+func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO uint64, prefix *disk.LineagePrefix, hwm uint64, beforeMutation func() error, checked bool, policy replicaRepairPolicy, expectedReconciliation error, prepared *ReplicaRollbackPreparation) (result error) {
 	if ctx == nil {
 		return fmt.Errorf("replica rollback requires context")
 	}
@@ -127,6 +127,9 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	if err == nil && (p.closed || p.snapshotRecovery || p.LEO.Load() != expectedLEO || offset > expectedLEO || p.replicaAttempt == math.MaxUint64) {
 		err = fmt.Errorf("replica rollback local state changed")
 	}
+	if err == nil && prepared != nil && !prepared.matches(p, offset, expectedLEO, hwm, prefix) {
+		err = fmt.Errorf("replica rollback preparation changed or already consumed")
+	}
 	if err == nil {
 		err = ctx.Err()
 	}
@@ -171,7 +174,10 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 			return err
 		}
 	}
-	if prefix != nil {
+	if prepared != nil && generation != prepared.generation {
+		return disk.ErrStaleContentGeneration
+	}
+	if prefix != nil && prepared == nil {
 		verifier, ok := p.dh.(interface {
 			VerifyLineagePrefixContext(context.Context, disk.LineagePrefix, uint64) (bool, error)
 		})
@@ -200,6 +206,9 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if prepared != nil {
+		prepared.used = true
+	}
 	if beforeMutation != nil {
 		if err := beforeMutation(); err != nil {
 			return err
@@ -224,6 +233,12 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 		return err
 	}
 	uncertain = true
+	// Disk truncation has committed the local repair. Finish rebuilding state
+	// and durable checkpoints under the existing fences even if the requesting
+	// recovery turn is canceled. Returning halfway would permanently fence a
+	// healthy replica. Preserve context values for recovery accounting; real
+	// storage failures and partition closure still fail closed below.
+	ctx = context.WithoutCancel(ctx)
 	p.mu.Lock()
 	p.LEO.Store(offset)
 	p.appendTimeSeeded = false
@@ -239,10 +254,22 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 		if err != nil {
 			return err
 		}
+		if prepared != nil && !generation.IsImmediateSuccessorOf(prepared.generation) {
+			return disk.ErrStaleContentGeneration
+		}
 	}
-	state, err := p.scanRawRecoveryStateContext(ctx)
-	if err != nil {
-		return err
+	var state *rawRecoveryState
+	if prepared != nil {
+		state = prepared.state
+		if p.dh.GetAbsoluteOffset() != offset {
+			return fmt.Errorf("prepared rollback durable tail changed")
+		}
+		p.resolveRawRecoveryTransactions(state)
+	} else {
+		state, err = p.scanRawRecoveryStateContext(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	if state.end != offset {
 		return fmt.Errorf("replica rollback durable tail changed")
@@ -284,9 +311,6 @@ func (p *Partition) repairReplicaTail(ctx context.Context, offset, expectedLEO u
 	defer p.mu.Unlock()
 	if p.closed {
 		return fmt.Errorf("partition closed during replica rollback")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 	publish := func() {
 		if policy == committedReplicaReconcile {

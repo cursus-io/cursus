@@ -74,6 +74,8 @@ type ReplicaCatchupBatch struct {
 	// RetainedPrefix echoes the exact challenge even when bootstrap is required.
 	RetainedPrefix        *disk.RetainedPrefix `json:"retained_prefix,omitempty"`
 	MatchedRetainedPrefix *disk.RetainedPrefix `json:"matched_retained_prefix,omitempty"`
+	// LocalRollbackPreparation is receiver-owned evidence, never wire authority.
+	LocalRollbackPreparation *topic.ReplicaRollbackPreparation `json:"-"`
 }
 
 // SealReplicaCatchupBatch binds the logical range, fences, source, and decoded

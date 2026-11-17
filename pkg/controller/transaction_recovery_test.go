@@ -184,7 +184,9 @@ func newDiskBackedTransactionHandler(t *testing.T) (*CommandHandler, *topic.Topi
 	cfg := config.DefaultConfig()
 	cfg.LogDir = t.TempDir()
 	cfg.IndexSize = 1024
-	cfg.DiskFlushIntervalMS = 1
+	// Acknowledged writes sync explicitly. A 1ms background sync loop can
+	// starve proof readers on CPU-limited Docker hosts without adding coverage.
+	cfg.DiskFlushIntervalMS = 100
 
 	dm := disk.NewDiskManager(cfg)
 	tm := topic.NewTopicManager(cfg, dm, nil)

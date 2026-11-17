@@ -1749,7 +1749,7 @@ func (p *Partition) ReplicaCatchupVerified(leaderEpoch int, lifecycleEpoch, hwm 
 // ReconcileCommittedHWM prepares a replica for leadership using the durable cluster watermark.
 // Any local tail beyond that watermark was never committed and must not survive leader promotion.
 func (p *Partition) ReconcileCommittedHWM(hwm uint64) error {
-	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile, nil)
+	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile, nil, nil)
 }
 
 // ReconcilePendingPartitionCommit applies an authoritative HWM only while the
@@ -1758,7 +1758,7 @@ func (p *Partition) ReconcilePendingPartitionCommit(pending PendingPartitionComm
 	if pending.marker == nil {
 		return fmt.Errorf("uncertain partition commit marker is unavailable")
 	}
-	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile, pending.marker)
+	return p.repairReplicaTail(context.Background(), hwm, 0, nil, hwm, nil, false, committedReplicaReconcile, pending.marker, nil)
 }
 
 // TruncateReplicaTail removes only records above a repair boundary. It does not
@@ -1769,7 +1769,7 @@ func (p *Partition) TruncateReplicaTail(offset uint64) error {
 
 // TruncateReplicaTailContext cancels queued repair before it changes storage.
 func (p *Partition) TruncateReplicaTailContext(ctx context.Context, offset uint64) error {
-	return p.repairReplicaTail(ctx, offset, 0, nil, 0, nil, false, speculativeReplicaTail, nil)
+	return p.repairReplicaTail(ctx, offset, 0, nil, 0, nil, false, speculativeReplicaTail, nil, nil)
 }
 
 // ApplyReplicaRollback moves a recovering follower to a leader-proven

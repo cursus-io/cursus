@@ -16,6 +16,12 @@ type ContentGeneration struct {
 	revision uint64
 }
 
+// IsImmediateSuccessorOf confirms exactly one destructive transition on the
+// same handler. It is a local comparison, not a substitute for a disk fence.
+func (g ContentGeneration) IsImmediateSuccessorOf(previous ContentGeneration) bool {
+	return g.owner != nil && g.owner == previous.owner && g.revision > previous.revision && g.revision-previous.revision == 1
+}
+
 var ErrStaleContentGeneration = errors.New("stale disk content generation")
 var ErrContentPublicationBusy = errors.New("disk content publication busy")
 

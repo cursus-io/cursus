@@ -13,6 +13,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestContentGenerationImmediateSuccessor(t *testing.T) {
+	d, _ := bootstrapTestHandler(t, 1)
+	foreign, _ := bootstrapTestHandler(t, 1)
+	before := ContentGeneration{owner: d, revision: 7}
+	require.True(t, (ContentGeneration{owner: d, revision: 8}).IsImmediateSuccessorOf(before))
+	for _, after := range []ContentGeneration{{}, {owner: d, revision: 7}, {owner: d, revision: 9}, {owner: foreign, revision: 8}, {owner: d, revision: 0}} {
+		require.False(t, after.IsImmediateSuccessorOf(before))
+	}
+	require.False(t, (ContentGeneration{owner: d, revision: 0}).IsImmediateSuccessorOf(ContentGeneration{owner: d, revision: ^uint64(0)}))
+}
+
 func TestContentGenerationAppendOverlapAndABA(t *testing.T) {
 	d, _ := bootstrapTestHandler(t, 1)
 	g, err := d.CaptureContentGeneration()
