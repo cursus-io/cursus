@@ -291,6 +291,15 @@ func TestBatchCommitTimeoutDoesNotReconnect(t *testing.T) {
 		if serveErr == nil {
 			commands <- command
 			<-ctx.Done()
+			// Let the request context close the client connection. Closing the
+			// server here can race cancellation propagation and manufacture an
+			// EOF while the derived request context still appears active.
+			_, closeErr := server.Read(make([]byte, 1))
+			if closeErr == nil {
+				serveErr = errors.New("commit connection remained open after cancellation")
+			} else if !errors.Is(closeErr, io.EOF) {
+				serveErr = closeErr
+			}
 		}
 		serverDone <- serveErr
 	}()
