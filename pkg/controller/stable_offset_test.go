@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -10,8 +11,10 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
+	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/stream"
+	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/pkg/wire"
 	"github.com/cursus-io/cursus/util"
@@ -19,7 +22,7 @@ import (
 )
 
 func TestReservationFencesFetchConsumeCacheAndStream(t *testing.T) {
-	ch, tm, cd, _ := newDiskBackedTransactionHandler(t)
+	ch, tm, cd := newStreamReservationHandler(t)
 	generation := prepareTransactionGroup(t, tm, cd, "inputs", "workers", "worker")
 	require.NoError(t, cd.CommitOffset("workers", "inputs", 0, 3))
 	reservation := coordinator.TransactionOffsetReservation{TransactionalID: "tx", ProducerID: "producer", MemberID: "worker", Generation: generation,
@@ -70,21 +73,88 @@ func TestConsumeCacheIsScopedToGroupMemberAndGeneration(t *testing.T) {
 	read(0)
 }
 
-func TestRunningStreamStopsWhenReservationAppears(t *testing.T) {
-	ch, tm, cd, _ := newDiskBackedTransactionHandler(t)
+func TestRunningStreamWaitsForReservationCommitWithoutReconnect(t *testing.T) {
+	ch, tm, cd := newStreamReservationHandler(t)
 	generation := prepareTransactionGroup(t, tm, cd, "inputs", "workers", "worker")
-	ch.StreamManager = stream.NewStreamManager(2, time.Second)
+	ch.StreamManager = stream.NewStreamManager(2, 10*time.Second)
+	require.NoError(t, tm.PublishToPartitionWithAck("inputs", 0, &types.Message{Payload: "message-0"}))
 	server, client := net.Pipe()
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
-	require.NoError(t, ch.HandleStreamCommand(server, "STREAM topic=inputs partition=0 group=workers offset=0", NewClientContext("workers", 0)))
+	require.NoError(t, ch.HandleStreamCommand(server, "STREAM topic=inputs partition=0 group=workers offset=0 batch=1", NewClientContext("workers", 0)))
+	require.Equal(t, uint64(0), readStreamOffset(t, client))
 	require.NoError(t, cd.PrepareOffsetReservation("workers", cd.GetRegistrationEpoch("workers"), coordinator.TransactionOffsetReservation{
 		TransactionalID: "tx", ProducerID: "producer", MemberID: "worker", Generation: generation,
 		Offsets: []coordinator.ReservedTransactionOffset{{Topic: "inputs", Partition: 0, Offset: 1}},
 	}))
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	control, err := util.ReadWithLength(client)
+	require.NoError(t, tm.PublishToPartitionWithAck("inputs", 0, &types.Message{Payload: "message-1"}))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(250*time.Millisecond)))
+	_, err := util.ReadWithLength(client)
+	require.Error(t, err)
+	var netErr net.Error
+	require.ErrorAs(t, err, &netErr)
+	require.True(t, netErr.Timeout(), "reservation fence must block rather than close the stream")
+	require.NoError(t, cd.ResolveOffsetReservation("workers", cd.GetRegistrationEpoch("workers"), "tx", "producer", 0, true))
+	require.Equal(t, uint64(1), readStreamOffset(t, client), "the same stream must continue at the committed offset")
+}
+
+func TestRunningStreamAbortAndDisconnectPreserveRedelivery(t *testing.T) {
+	ch, tm, cd := newStreamReservationHandler(t)
+	generation := prepareTransactionGroup(t, tm, cd, "inputs", "workers", "worker")
+	ch.StreamManager = stream.NewStreamManager(2, 10*time.Second)
+	require.NoError(t, tm.PublishToPartitionWithAck("inputs", 0, &types.Message{Payload: "message-0"}))
+	server, client := net.Pipe()
+	require.NoError(t, ch.HandleStreamCommand(server, "STREAM topic=inputs partition=0 group=workers offset=0 batch=1", NewClientContext("workers", 0)))
+	require.Equal(t, uint64(0), readStreamOffset(t, client))
+	require.NoError(t, cd.PrepareOffsetReservation("workers", cd.GetRegistrationEpoch("workers"), coordinator.TransactionOffsetReservation{
+		TransactionalID: "tx-abort", ProducerID: "producer", MemberID: "worker", Generation: generation,
+		Offsets: []coordinator.ReservedTransactionOffset{{Topic: "inputs", Partition: 0, Offset: 1}},
+	}))
+	require.NoError(t, tm.PublishToPartitionWithAck("inputs", 0, &types.Message{Payload: "message-1"}))
+	time.Sleep(150 * time.Millisecond)
+	require.NoError(t, client.Close(), "a failed handler closes its stream after aborting the transaction")
+	require.NoError(t, cd.ResolveOffsetReservation("workers", cd.GetRegistrationEpoch("workers"), "tx-abort", "producer", 0, false))
+	require.Eventually(t, func() bool {
+		return len(ch.StreamManager.GetStreamsForPartition("inputs", 0)) == 0
+	}, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, "OK offset=0", ch.handleFetchOffset("FETCH_OFFSET topic=inputs partition=0 group=workers"), "abort must not advance the broker offset")
+	_ = server.Close()
+
+	replayServer, replayClient := net.Pipe()
+	t.Cleanup(func() { _ = replayClient.Close(); _ = replayServer.Close() })
+	require.NoError(t, ch.HandleStreamCommand(replayServer, "STREAM topic=inputs partition=0 group=workers batch=1", NewClientContext("workers", 0)))
+	require.Equal(t, uint64(0), readStreamOffset(t, replayClient), "an aborted handler must resume from the unchanged broker offset")
+}
+
+func readStreamOffset(t *testing.T, conn net.Conn) uint64 {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	data, err := util.ReadWithLength(conn)
 	require.NoError(t, err)
-	require.Contains(t, string(control), "error", "the existing stream must stop instead of consuming reserved input")
+	batch, err := util.DecodeBatchMessages(data)
+	require.NoError(t, err)
+	require.Len(t, batch.Messages, 1)
+	return batch.Messages[0].Offset
+}
+
+func newStreamReservationHandler(t *testing.T) (*CommandHandler, *topic.TopicManager, *coordinator.Coordinator) {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.IndexSize = 1024
+	cfg.DiskFlushIntervalMS = 1
+	cfg.DiskMinFreeBytes = 1
+	cfg.DiskMinFreePercent = 0.1
+	dm := disk.NewDiskManager(cfg)
+	tm := topic.NewTopicManager(cfg, dm, nil)
+	coord := coordinator.NewCoordinator(context.Background(), cfg, tm)
+	ch := NewCommandHandler(tm, cfg, coord, nil, nil)
+	t.Cleanup(func() {
+		_ = ch.Close()
+		coord.Stop()
+		tm.Stop()
+		dm.CloseAllHandlers()
+	})
+	return ch, tm, coord
 }
 
 func TestStableOffsetResponseRejectsAmbiguousOrUnavailableView(t *testing.T) {
