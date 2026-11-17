@@ -310,12 +310,12 @@ func (c *Consumer) handleRebalanceSignal() {
 	}
 
 	c.resetHeartbeatConn()
-	c.commitMu.Lock()
+	c.commitConnMu.Lock()
 	if c.commitConn != nil {
 		_ = c.commitConn.Close()
 		c.commitConn = nil
 	}
-	c.commitMu.Unlock()
+	c.commitConnMu.Unlock()
 
 	c.mu.Lock()
 	for _, pc := range c.partitionConsumers {

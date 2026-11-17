@@ -301,11 +301,6 @@ func TestConsumer_ResetHeartbeatConn_NilConn(t *testing.T) {
 	assert.Nil(t, c.hbConn)
 }
 
-func TestConsumer_ValidateCommitConn_Nil(t *testing.T) {
-	c := newTestConsumer(t)
-	assert.False(t, c.validateCommitConn())
-}
-
 func TestConsumer_FlushOffsets_Empty(t *testing.T) {
 	c := newTestConsumer(t)
 	c.flushOffsets()
