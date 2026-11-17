@@ -3,6 +3,8 @@ package stream
 import (
 	"errors"
 	"fmt"
+	"math"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -22,6 +24,9 @@ const (
 	StreamControlReasonTimeout          = "timeout"
 	StreamControlReasonError            = "error"
 	StreamControlReasonOffsetOutOfRange = "offset_out_of_range"
+
+	defaultTransientFenceBackoffBase = 100 * time.Millisecond
+	defaultTransientFenceBackoffMax  = time.Second
 )
 
 type StreamConnection struct {
@@ -51,22 +56,30 @@ type StreamConnection struct {
 	nextKeepalive     time.Time
 	pollPending       bool
 	keepalivePending  bool
+	scheduleWake      func()
+
+	transientFenceBackoffBase time.Duration
+	transientFenceBackoffMax  time.Duration
+	transientFenceJitter      func() float64
 }
 
 // NewStreamConnection creates a new stream connection
 func NewStreamConnection(conn net.Conn, topic string, partition int, group string, offset uint64) *StreamConnection {
 	sc := &StreamConnection{
-		conn:              conn,
-		topic:             topic,
-		partition:         partition,
-		group:             group,
-		offset:            offset,
-		lastActive:        time.Now(),
-		stopCh:            make(chan struct{}),
-		batchSize:         10,
-		interval:          100 * time.Millisecond,
-		keepaliveInterval: 5 * time.Second,
-		wakeCh:            make(chan struct{}, 1),
+		conn:                      conn,
+		topic:                     topic,
+		partition:                 partition,
+		group:                     group,
+		offset:                    offset,
+		lastActive:                time.Now(),
+		stopCh:                    make(chan struct{}),
+		batchSize:                 10,
+		interval:                  100 * time.Millisecond,
+		keepaliveInterval:         5 * time.Second,
+		wakeCh:                    make(chan struct{}, 1),
+		transientFenceBackoffBase: defaultTransientFenceBackoffBase,
+		transientFenceBackoffMax:  defaultTransientFenceBackoffMax,
+		transientFenceJitter:      rand.Float64,
 	}
 	return sc
 }
@@ -101,13 +114,50 @@ func (sc *StreamConnection) SetMessageSource(source func() (uint64, <-chan struc
 	sc.messageSource = source
 }
 
+func (sc *StreamConnection) setScheduleWake(wake func()) {
+	sc.mu.Lock()
+	sc.scheduleWake = wake
+	sc.mu.Unlock()
+}
+
+func (sc *StreamConnection) setTransientFenceBackoff(base, max time.Duration, jitter func() float64) {
+	if base <= 0 {
+		base = defaultTransientFenceBackoffBase
+	}
+	if max < base {
+		max = base
+	}
+	if jitter == nil {
+		jitter = rand.Float64
+	}
+	sc.mu.Lock()
+	sc.transientFenceBackoffBase = base
+	sc.transientFenceBackoffMax = max
+	sc.transientFenceJitter = jitter
+	sc.mu.Unlock()
+}
+
 func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Message, error)) {
+	transientOffsetFence := false
+	transientOffsetFenceStarted := time.Time{}
+	transientOffsetFenceAttempt := 0
+	finishTransientOffsetFence := func(cleared bool) {
+		if !transientOffsetFence {
+			return
+		}
+		metrics.StreamTransientOffsetFenceDuration.Observe(time.Since(transientOffsetFenceStarted).Seconds())
+		transientOffsetFence = false
+		transientOffsetFenceStarted = time.Time{}
+		transientOffsetFenceAttempt = 0
+		if cleared {
+			util.Debug("Stream offset fence cleared for %s/%d group=%s", sc.topic, sc.partition, sc.group)
+		}
+	}
 	defer func() {
+		finishTransientOffsetFence(false)
 		sc.sendCloseControlFrame()
 		sc.closeConn()
 	}()
-
-	transientOffsetFence := false
 
 	// sendMessages reads and sends one available batch. The manager schedules
 	// catch-up polls; partition generations provide immediate broadcast wakeups.
@@ -122,6 +172,9 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 		}
 
 		currentOffset := sc.Offset()
+		if transientOffsetFence {
+			metrics.StreamTransientOffsetFenceRechecks.Inc()
+		}
 		msgs, err := readFn(currentOffset, bs)
 		if err != nil {
 			if isTransientOffsetFence(err) {
@@ -130,9 +183,14 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 				// the commit or abort decision; the scheduler will check again.
 				if !transientOffsetFence {
 					transientOffsetFence = true
+					transientOffsetFenceStarted = time.Now()
+					transientOffsetFenceAttempt = 0
 					metrics.StreamTransientOffsetFences.Inc()
 					util.Debug("Stream offset temporarily fenced for %s/%d group=%s: %v", sc.topic, sc.partition, sc.group, err)
+				} else {
+					transientOffsetFenceAttempt++
 				}
+				sc.scheduleTransientFenceRetry(time.Now(), transientOffsetFenceAttempt)
 				return false, true
 			}
 			util.Error("Stream read error for %s/%d: %v", sc.topic, sc.partition, err)
@@ -145,8 +203,7 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 			return false, false
 		}
 		if transientOffsetFence {
-			transientOffsetFence = false
-			util.Debug("Stream offset fence cleared for %s/%d group=%s", sc.topic, sc.partition, sc.group)
+			finishTransientOffsetFence(true)
 		}
 
 		if len(msgs) == 0 {
@@ -206,6 +263,9 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 				continue
 			}
 			observedGeneration = generation
+			if transientOffsetFence {
+				continue
+			}
 			if _, ok := sendMessages(); !ok {
 				sc.StopWithReason(StreamControlReasonError)
 				return
@@ -216,16 +276,65 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 			if !poll && !keepalive {
 				continue
 			}
-			sent, ok := sendMessages()
-			if !ok {
-				sc.StopWithReason(StreamControlReasonError)
-				return
+			sent := false
+			if poll {
+				var ok bool
+				sent, ok = sendMessages()
+				if !ok {
+					sc.StopWithReason(StreamControlReasonError)
+					return
+				}
 			}
 			if keepalive && !sent && !sc.sendKeepalive() {
 				sc.StopWithReason(StreamControlReasonError)
 				return
 			}
 		}
+	}
+}
+
+func transientFenceBackoff(base, max time.Duration, attempt int, jitter float64) time.Duration {
+	if base <= 0 {
+		base = defaultTransientFenceBackoffBase
+	}
+	if max < base {
+		max = base
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := base
+	for range attempt {
+		if delay >= max || delay > max/2 {
+			delay = max
+			break
+		}
+		delay *= 2
+	}
+	if delay > max {
+		delay = max
+	}
+	if math.IsNaN(jitter) || jitter < 0 {
+		jitter = 0
+	} else if jitter > 1 {
+		jitter = 1
+	}
+	delay = time.Duration(float64(delay) * (0.8 + 0.4*jitter))
+	if delay <= 0 {
+		return time.Nanosecond
+	}
+	return delay
+}
+
+func (sc *StreamConnection) scheduleTransientFenceRetry(now time.Time, attempt int) {
+	sc.mu.Lock()
+	delay := transientFenceBackoff(sc.transientFenceBackoffBase, sc.transientFenceBackoffMax, attempt, sc.transientFenceJitter())
+	sc.nextPoll = now.Add(delay)
+	sc.pollPending = false
+	wake := sc.scheduleWake
+	sc.mu.Unlock()
+	if wake != nil {
+		wake()
 	}
 }
 

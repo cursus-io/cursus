@@ -30,6 +30,7 @@ func NewStreamManager(maxConn int, timeout time.Duration) *StreamManager {
 func (sm *StreamManager) AddStream(key string, stream *StreamConnection,
 	readFn func(offset uint64, max int) ([]types.Message, error),
 ) error {
+	stream.setScheduleWake(sm.wakeScheduler)
 	sm.mu.Lock()
 	previous, exists := sm.streams[key]
 	if !exists && len(sm.streams) >= sm.maxConn {

@@ -205,10 +205,18 @@ func TestStreamConnectionWaitsForTransientOffsetFence(t *testing.T) {
 	defer func() { _ = client.Close() }()
 
 	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+	sc.SetInterval(time.Hour)
 	sc.SetMessageSource(generation.snapshot)
+	sc.setTransientFenceBackoff(20*time.Millisecond, 40*time.Millisecond, func() float64 { return 0.5 })
 	metric := &dto.Metric{}
 	require.NoError(t, metrics.StreamTransientOffsetFences.Write(metric))
 	before := metric.GetCounter().GetValue()
+	recheckMetric := &dto.Metric{}
+	require.NoError(t, metrics.StreamTransientOffsetFenceRechecks.Write(recheckMetric))
+	rechecksBefore := recheckMetric.GetCounter().GetValue()
+	durationMetric := &dto.Metric{}
+	require.NoError(t, metrics.StreamTransientOffsetFenceDuration.Write(durationMetric))
+	durationsBefore := durationMetric.GetHistogram().GetSampleCount()
 	var mu sync.Mutex
 	reads := 0
 	readFn := func(offset uint64, _ int) ([]types.Message, error) {
@@ -220,29 +228,26 @@ func TestStreamConnectionWaitsForTransientOffsetFence(t *testing.T) {
 		}
 		return []types.Message{{Offset: offset, Payload: "next"}}, nil
 	}
-	done := make(chan struct{})
-	go func() {
-		sc.Run(readFn)
-		close(done)
-	}()
+	manager := NewStreamManager(1, time.Hour)
+	require.NoError(t, manager.AddStream("orders:0:workers", sc, readFn))
 
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return reads == 1
 	}, time.Second, time.Millisecond)
-	generation.notify()
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return reads == 2
-	}, time.Second, time.Millisecond)
+	for range 20 {
+		generation.notify()
+	}
+	time.Sleep(10 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, reads, "partition appends cannot clear a coordinator reservation")
+	mu.Unlock()
 	select {
-	case <-done:
+	case <-sc.StopCh():
 		t.Fatal("transient offset fence closed the stream")
 	default:
 	}
-	generation.notify()
 	require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
 	data, err := util.ReadWithLength(client)
 	require.NoError(t, err)
@@ -250,17 +255,193 @@ func TestStreamConnectionWaitsForTransientOffsetFence(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batch.Messages, 1)
 	require.Equal(t, uint64(7), batch.Messages[0].Offset)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return reads == 3
+	}, time.Second, time.Millisecond)
 	metric.Reset()
 	require.NoError(t, metrics.StreamTransientOffsetFences.Write(metric))
 	require.Equal(t, before+1, metric.GetCounter().GetValue(), "one blocked episode must increment the metric once")
+	recheckMetric.Reset()
+	require.NoError(t, metrics.StreamTransientOffsetFenceRechecks.Write(recheckMetric))
+	require.Equal(t, rechecksBefore+2, recheckMetric.GetCounter().GetValue())
+	durationMetric.Reset()
+	require.NoError(t, metrics.StreamTransientOffsetFenceDuration.Write(durationMetric))
+	require.Equal(t, durationsBefore+1, durationMetric.GetHistogram().GetSampleCount())
 
-	require.NoError(t, client.Close())
 	sc.Stop()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("stream did not stop")
+	require.Eventually(t, func() bool { return manager.ActiveCount() == 0 }, time.Second, time.Millisecond)
+}
+
+func TestTransientFenceBackoffIsBoundedAndJittered(t *testing.T) {
+	base, max := 100*time.Millisecond, time.Second
+	require.Equal(t, 80*time.Millisecond, transientFenceBackoff(base, max, 0, 0))
+	require.Equal(t, 100*time.Millisecond, transientFenceBackoff(base, max, 0, 0.5))
+	require.Equal(t, 120*time.Millisecond, transientFenceBackoff(base, max, 0, 1))
+	require.Equal(t, 200*time.Millisecond, transientFenceBackoff(base, max, 1, 0.5))
+	require.Equal(t, 400*time.Millisecond, transientFenceBackoff(base, max, 2, 0.5))
+	require.Equal(t, 800*time.Millisecond, transientFenceBackoff(base, max, 3, 0.5))
+	require.Equal(t, time.Second, transientFenceBackoff(base, max, 4, 0.5))
+	require.Equal(t, 1200*time.Millisecond, transientFenceBackoff(base, max, 20, 1))
+}
+
+func TestStreamConnectionLongFenceCapsCoordinatorRechecks(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+	sc.SetInterval(time.Hour)
+	sc.setTransientFenceBackoff(10*time.Millisecond, 40*time.Millisecond, func() float64 { return 0.5 })
+	var mu sync.Mutex
+	var calls []time.Time
+	readFn := func(offset uint64, _ int) ([]types.Message, error) {
+		mu.Lock()
+		calls = append(calls, time.Now())
+		count := len(calls)
+		mu.Unlock()
+		if count <= 5 {
+			return nil, fmt.Errorf("ERROR: unstable_offset_commit group=workers topic=orders partition=0")
+		}
+		return []types.Message{{Offset: offset, Payload: "next"}}, nil
 	}
+	manager := NewStreamManager(1, time.Hour)
+	require.NoError(t, manager.AddStream("orders:0:workers", sc, readFn))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+	data, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	batch, err := util.DecodeBatchMessages(data)
+	require.NoError(t, err)
+	require.Len(t, batch.Messages, 1)
+	require.Equal(t, uint64(7), batch.Messages[0].Offset)
+
+	mu.Lock()
+	require.Len(t, calls, 6)
+	intervals := make([]time.Duration, 0, len(calls)-1)
+	for i := 1; i < len(calls); i++ {
+		intervals = append(intervals, calls[i].Sub(calls[i-1]))
+	}
+	mu.Unlock()
+	for i, minimum := range []time.Duration{8 * time.Millisecond, 18 * time.Millisecond, 35 * time.Millisecond, 35 * time.Millisecond, 35 * time.Millisecond} {
+		require.GreaterOrEqual(t, intervals[i], minimum, "retry %d ignored its exponential backoff", i+1)
+	}
+	sc.Stop()
+}
+
+func TestStreamConnectionFenceKeepaliveDoesNotRecheckOffset(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+	sc.SetInterval(time.Hour)
+	sc.SetKeepaliveInterval(20 * time.Millisecond)
+	sc.setTransientFenceBackoff(200*time.Millisecond, 200*time.Millisecond, func() float64 { return 0.5 })
+	var mu sync.Mutex
+	reads := 0
+	manager := NewStreamManager(1, time.Hour)
+	require.NoError(t, manager.AddStream("orders:0:workers", sc, func(uint64, int) ([]types.Message, error) {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		return nil, fmt.Errorf("ERROR: unstable_offset_commit group=workers topic=orders partition=0")
+	}))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+	keepalive, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	require.Empty(t, keepalive)
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, reads, "keepalives must not perform stable-offset checks")
+	mu.Unlock()
+	require.NoError(t, client.Close())
+	require.Eventually(t, func() bool { return manager.ActiveCount() == 0 }, time.Second, time.Millisecond)
+	time.Sleep(220 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, reads, "connection failure must cancel later fence checks")
+	mu.Unlock()
+}
+
+func TestStreamConnectionStopCancelsFenceRechecks(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+	sc.SetInterval(time.Hour)
+	sc.setTransientFenceBackoff(40*time.Millisecond, 40*time.Millisecond, func() float64 { return 0.5 })
+	var mu sync.Mutex
+	reads := 0
+	manager := NewStreamManager(1, time.Hour)
+	require.NoError(t, manager.AddStream("orders:0:workers", sc, func(uint64, int) ([]types.Message, error) {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		return nil, fmt.Errorf("ERROR: unstable_offset_commit group=workers topic=orders partition=0")
+	}))
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return reads == 1
+	}, time.Second, time.Millisecond)
+	sc.Stop()
+	require.Eventually(t, func() bool { return manager.ActiveCount() == 0 }, time.Second, time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, reads)
+	mu.Unlock()
+}
+
+func TestStreamConnectionTimeoutCancelsFenceRechecks(t *testing.T) {
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+	sc.SetInterval(time.Hour)
+	sc.setTransientFenceBackoff(200*time.Millisecond, 200*time.Millisecond, func() float64 { return 0.5 })
+	var mu sync.Mutex
+	reads := 0
+	manager := NewStreamManager(1, 30*time.Millisecond)
+	require.NoError(t, manager.AddStream("orders:0:workers", sc, func(uint64, int) ([]types.Message, error) {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		return nil, fmt.Errorf("ERROR: unstable_offset_commit group=workers topic=orders partition=0")
+	}))
+	require.Eventually(t, func() bool { return manager.ActiveCount() == 0 }, time.Second, time.Millisecond)
+	time.Sleep(220 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, reads)
+	mu.Unlock()
+}
+
+func TestStreamConnectionReplacementCancelsFenceRechecks(t *testing.T) {
+	firstServer, firstClient := net.Pipe()
+	defer func() { _ = firstClient.Close() }()
+	first := NewStreamConnection(firstServer, "orders", 0, "workers", 7)
+	first.SetInterval(time.Hour)
+	first.setTransientFenceBackoff(200*time.Millisecond, 200*time.Millisecond, func() float64 { return 0.5 })
+	var mu sync.Mutex
+	reads := 0
+	manager := NewStreamManager(1, time.Hour)
+	require.NoError(t, manager.AddStream("orders:0:workers", first, func(uint64, int) ([]types.Message, error) {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		return nil, fmt.Errorf("ERROR: unstable_offset_commit group=workers topic=orders partition=0")
+	}))
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return reads == 1
+	}, time.Second, time.Millisecond)
+
+	secondServer, secondClient := net.Pipe()
+	defer func() { _ = secondClient.Close() }()
+	second := NewStreamConnection(secondServer, "orders", 0, "workers", 7)
+	second.SetInterval(time.Hour)
+	require.NoError(t, manager.AddStream("orders:0:workers", second, func(uint64, int) ([]types.Message, error) {
+		return nil, nil
+	}))
+	time.Sleep(220 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, reads)
+	mu.Unlock()
+	second.Stop()
 }
 
 func TestStreamConnectionStillClosesForOtherProtocolErrors(t *testing.T) {

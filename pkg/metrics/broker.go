@@ -59,6 +59,17 @@ var (
 		Help: "Stream offset reservation fences handled without closing the consumer connection",
 	})
 
+	StreamTransientOffsetFenceRechecks = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "cursus_broker_stream_transient_offset_fence_rechecks_total",
+		Help: "Coordinator rechecks performed while stream offset reservations remain fenced",
+	})
+
+	StreamTransientOffsetFenceDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "cursus_broker_stream_transient_offset_fence_duration_seconds",
+		Help:    "Duration of stream offset reservation fence episodes",
+		Buckets: prometheus.DefBuckets,
+	})
+
 	RequestsInflight = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "cursus_broker_requests_inflight",
 		Help: "Decoded requests currently queued or processed by the broker",
