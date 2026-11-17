@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -123,22 +124,21 @@ func TestAckFaultFirewallHealRetriesAndVerifiesAbsence(t *testing.T) {
 	checks := 0
 	deletes := 0
 	runner := func(_ time.Duration, args ...string) (string, int, error) {
-		require.Greater(t, len(args), 5)
-		switch args[5] {
-		case "-C":
+		switch {
+		case slices.Contains(args, "-C"):
 			checks++
 			if deletes >= 2 {
-				return "", 1, nil
+				return ackFaultFirewallAbsentMarker, 0, nil
 			}
 			return "", 0, nil
-		case "-D":
+		case slices.Contains(args, "-D"):
 			deletes++
 			if deletes == 1 {
 				return "xtables lock busy", 4, nil
 			}
 			return "", 0, nil
 		default:
-			t.Fatalf("unexpected iptables operation %q", args[5])
+			t.Fatalf("missing iptables operation in %q", args)
 			return "", -1, nil
 		}
 	}
@@ -152,21 +152,21 @@ func TestAckFaultFirewallHealFailsAfterBoundedRetries(t *testing.T) {
 	checks := 0
 	deletes := 0
 	runner := func(_ time.Duration, args ...string) (string, int, error) {
-		switch args[5] {
-		case "-C":
+		switch {
+		case slices.Contains(args, "-C"):
 			checks++
-			return "", 0, nil
-		case "-D":
+			return "docker exec API error", 1, nil
+		case slices.Contains(args, "-D"):
 			deletes++
-			return "xtables lock busy", 4, nil
+			return "", 0, nil
 		default:
-			t.Fatalf("unexpected iptables operation %q", args[5])
+			t.Fatalf("missing iptables operation in %q", args)
 			return "", -1, nil
 		}
 	}
 
 	err := removeAckFaultFirewallRule(runner, "broker-2", "OUTPUT", "-d", "192.0.2.3")
 	require.ErrorContains(t, err, "attempt 3")
-	require.Equal(t, 3, deletes)
+	require.Equal(t, 0, deletes, "Docker exit 1 must not be treated as in-container rule absence")
 	require.Equal(t, 3, checks)
 }

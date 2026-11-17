@@ -314,6 +314,8 @@ func ackFaultDocker(t *testing.T, args ...string) string {
 
 type ackFaultCommandRunner func(time.Duration, ...string) (string, int, error)
 
+const ackFaultFirewallAbsentMarker = "__CURSUS_ACK_FAULT_FIREWALL_RULE_ABSENT__"
+
 func runAckFaultDockerCommand(timeout time.Duration, args ...string) (string, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -336,27 +338,37 @@ func runAckFaultDockerCommand(timeout time.Duration, args ...string) (string, in
 // retaining a DROP rule that would turn recovery checks into false failures.
 func removeAckFaultFirewallRule(run ackFaultCommandRunner, container, chain, selector, ip string) error {
 	rule := []string{chain, selector, ip, "-j", "DROP"}
-	command := func(operation string) []string {
-		return append([]string{"exec", "-u", "0", container, "iptables", operation}, rule...)
+	deleteCommand := func() []string {
+		return append([]string{"exec", "-u", "0", container, "iptables", "-D"}, rule...)
+	}
+	checkCommand := func() []string {
+		// Docker CLI v29 can return exit code 1 before the in-container command
+		// runs. Map only iptables' own absent-rule result to a successful exec
+		// carrying a marker, so Docker/API failures remain retryable failures.
+		script := `iptables "$@"; status=$?; if [ "$status" -eq 1 ]; then printf '%s\n' ` + ackFaultFirewallAbsentMarker + `; exit 0; fi; exit "$status"`
+		return append([]string{"exec", "-u", "0", container, "sh", "-c", script, "cursus-iptables", "-C"}, rule...)
+	}
+	ruleAbsent := func(output string, exitCode int, err error) bool {
+		return err == nil && exitCode == 0 && strings.TrimSpace(output) == ackFaultFirewallAbsentMarker
 	}
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		output, exitCode, err := run(5*time.Second, command("-C")...)
+		output, exitCode, err := run(5*time.Second, checkCommand()...)
 		if err != nil {
 			lastErr = fmt.Errorf("check firewall rule attempt %d: %w: %s", attempt, err, output)
-		} else if exitCode == 1 {
+		} else if ruleAbsent(output, exitCode, err) {
 			return nil
 		} else if exitCode != 0 {
 			lastErr = fmt.Errorf("check firewall rule attempt %d exited %d: %s", attempt, exitCode, output)
 		} else {
-			output, exitCode, err = run(5*time.Second, command("-D")...)
+			output, exitCode, err = run(5*time.Second, deleteCommand()...)
 			if err != nil {
 				lastErr = fmt.Errorf("delete firewall rule attempt %d: %w: %s", attempt, err, output)
 			} else if exitCode != 0 {
 				lastErr = fmt.Errorf("delete firewall rule attempt %d exited %d: %s", attempt, exitCode, output)
 			} else {
-				output, exitCode, err = run(5*time.Second, command("-C")...)
-				if err == nil && exitCode == 1 {
+				output, exitCode, err = run(5*time.Second, checkCommand()...)
+				if ruleAbsent(output, exitCode, err) {
 					return nil
 				}
 				if err != nil {
