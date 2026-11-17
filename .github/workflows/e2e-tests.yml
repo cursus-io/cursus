@@ -55,15 +55,18 @@ jobs:
           # The internal-wire host ports overlap Linux's ephemeral range.
           existing=$(sysctl -n net.ipv4.ip_local_reserved_ports)
           sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${existing:+$existing,}42001-42003"
-      - name: Verify acknowledged writes across response loss and leader isolation
+      - name: Verify acknowledged writes across individual and compound faults
         env:
           RUN_E2E_ACK_FAULTS: "1"
+          RUN_E2E_COMPOUND_FAULTS: "1"
+          CURSUS_COMPOUND_SEED: "3271337"
+          CURSUS_COMPOUND_ROUNDS: "3"
           CURSUS_ACK_FAULT_RESULTS: ${{ github.workspace }}/ack-fault-results
         run: |
           set -o pipefail
           mkdir -p ack-fault-results
           go test -json -race -count=1 -timeout 25m ./test/e2e-cluster \
-            -run '^Test(WriteHistoryOracle|AckFaultReplyProxy|AcknowledgedWritesSurviveLostReplyAndLeaderKill|AcknowledgedWritesFenceIsolatedLeader)$' \
+            -run '^Test(WriteHistoryOracle|AckFaultReplyProxy|AckFaultConcurrentJournal|AckFaultJournalErrorsReturnToOwner|CompoundScheduleAndBounds|AcknowledgedWritesSurviveLostReplyAndLeaderKill|AcknowledgedWritesFenceIsolatedLeader|AcknowledgedWritesSurviveCompoundFaults)$' \
             | tee ack-fault-results/tests.jsonl
           python3 - <<'PY'
           import json
@@ -72,8 +75,12 @@ jobs:
           required = {
               "TestWriteHistoryOracle",
               "TestAckFaultReplyProxy",
+              "TestAckFaultConcurrentJournal",
+              "TestAckFaultJournalErrorsReturnToOwner",
+              "TestCompoundScheduleAndBounds",
               "TestAcknowledgedWritesSurviveLostReplyAndLeaderKill",
               "TestAcknowledgedWritesFenceIsolatedLeader",
+              "TestAcknowledgedWritesSurviveCompoundFaults",
           }
           passed = {e.get("Test") for e in events if e.get("Action") == "pass"}
           skipped = {e.get("Test") for e in events if e.get("Action") == "skip"}
