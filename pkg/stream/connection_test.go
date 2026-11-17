@@ -207,7 +207,7 @@ func TestStreamConnectionWaitsForTransientOffsetFence(t *testing.T) {
 	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
 	sc.SetInterval(time.Hour)
 	sc.SetMessageSource(generation.snapshot)
-	sc.setTransientFenceBackoff(20*time.Millisecond, 40*time.Millisecond, func() float64 { return 0.5 })
+	sc.setTransientFenceBackoff(200*time.Millisecond, 200*time.Millisecond, func() float64 { return 0.5 })
 	metric := &dto.Metric{}
 	require.NoError(t, metrics.StreamTransientOffsetFences.Write(metric))
 	before := metric.GetCounter().GetValue()
