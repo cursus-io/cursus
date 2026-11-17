@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -8,9 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testMessageGeneration struct {
@@ -193,4 +197,98 @@ func TestMessageGenerationWakesEveryStream(t *testing.T) {
 	waitForRead("second generation", secondReads)
 	first.Stop()
 	second.Stop()
+}
+
+func TestStreamConnectionWaitsForTransientOffsetFence(t *testing.T) {
+	generation := newTestMessageGeneration()
+	server, client := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+	sc.SetMessageSource(generation.snapshot)
+	metric := &dto.Metric{}
+	require.NoError(t, metrics.StreamTransientOffsetFences.Write(metric))
+	before := metric.GetCounter().GetValue()
+	var mu sync.Mutex
+	reads := 0
+	readFn := func(offset uint64, _ int) ([]types.Message, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reads++
+		if reads <= 2 {
+			return nil, fmt.Errorf("ERROR: unstable_offset_commit group=workers topic=orders partition=0")
+		}
+		return []types.Message{{Offset: offset, Payload: "next"}}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		sc.Run(readFn)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return reads == 1
+	}, time.Second, time.Millisecond)
+	generation.notify()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return reads == 2
+	}, time.Second, time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("transient offset fence closed the stream")
+	default:
+	}
+	generation.notify()
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+	data, err := util.ReadWithLength(client)
+	require.NoError(t, err)
+	batch, err := util.DecodeBatchMessages(data)
+	require.NoError(t, err)
+	require.Len(t, batch.Messages, 1)
+	require.Equal(t, uint64(7), batch.Messages[0].Offset)
+	metric.Reset()
+	require.NoError(t, metrics.StreamTransientOffsetFences.Write(metric))
+	require.Equal(t, before+1, metric.GetCounter().GetValue(), "one blocked episode must increment the metric once")
+
+	require.NoError(t, client.Close())
+	sc.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not stop")
+	}
+}
+
+func TestStreamConnectionStillClosesForOtherProtocolErrors(t *testing.T) {
+	for name, response := range map[string]string{
+		"coordinator moved":   "ERROR: NOT_COORDINATOR",
+		"generation mismatch": "ERROR: GEN_MISMATCH",
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, client := net.Pipe()
+			defer func() { _ = client.Close() }()
+			sc := NewStreamConnection(server, "orders", 0, "workers", 7)
+			done := make(chan struct{})
+			go func() {
+				sc.Run(func(uint64, int) ([]types.Message, error) {
+					return nil, fmt.Errorf("%s", response)
+				})
+				close(done)
+			}()
+
+			require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+			control, err := util.ReadWithLength(client)
+			require.NoError(t, err)
+			require.Contains(t, string(control), "reason=error")
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("non-fence protocol error did not stop the stream")
+			}
+		})
+	}
 }

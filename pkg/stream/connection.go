@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cursus-io/cursus/pkg/metrics"
+	"github.com/cursus-io/cursus/pkg/protocol"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/cursus-io/cursus/util"
 )
@@ -105,6 +107,8 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 		sc.closeConn()
 	}()
 
+	transientOffsetFence := false
+
 	// sendMessages reads and sends one available batch. The manager schedules
 	// catch-up polls; partition generations provide immediate broadcast wakeups.
 	sendMessages := func() (bool, bool) {
@@ -120,6 +124,17 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 		currentOffset := sc.Offset()
 		msgs, err := readFn(currentOffset, bs)
 		if err != nil {
+			if isTransientOffsetFence(err) {
+				// A Saga transaction temporarily reserves the delivered offset.
+				// Keep this stream and cursor intact until the coordinator publishes
+				// the commit or abort decision; the scheduler will check again.
+				if !transientOffsetFence {
+					transientOffsetFence = true
+					metrics.StreamTransientOffsetFences.Inc()
+					util.Debug("Stream offset temporarily fenced for %s/%d group=%s: %v", sc.topic, sc.partition, sc.group, err)
+				}
+				return false, true
+			}
 			util.Error("Stream read error for %s/%d: %v", sc.topic, sc.partition, err)
 			var offsetErr *types.OffsetOutOfRangeError
 			if errors.As(err, &offsetErr) {
@@ -128,6 +143,10 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 				sc.setStopReason(StreamControlReasonError)
 			}
 			return false, false
+		}
+		if transientOffsetFence {
+			transientOffsetFence = false
+			util.Debug("Stream offset fence cleared for %s/%d group=%s", sc.topic, sc.partition, sc.group)
 		}
 
 		if len(msgs) == 0 {
@@ -208,6 +227,16 @@ func (sc *StreamConnection) Run(readFn func(offset uint64, max int) ([]types.Mes
 			}
 		}
 	}
+}
+
+func isTransientOffsetFence(err error) bool {
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		parsed, ok := protocol.ParseErrorResponse(current.Error())
+		if ok && parsed.Code == "unstable_offset_commit" {
+			return true
+		}
+	}
+	return false
 }
 
 func (sc *StreamConnection) schedule(now time.Time) {

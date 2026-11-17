@@ -54,6 +54,11 @@ var (
 		Help: "Broker client response write failures by bounded reason",
 	}, []string{"reason"})
 
+	StreamTransientOffsetFences = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "cursus_broker_stream_transient_offset_fences_total",
+		Help: "Stream offset reservation fences handled without closing the consumer connection",
+	})
+
 	RequestsInflight = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "cursus_broker_requests_inflight",
 		Help: "Decoded requests currently queued or processed by the broker",
