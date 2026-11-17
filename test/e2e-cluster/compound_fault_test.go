@@ -128,7 +128,7 @@ func TestAckFaultFirewallHealRetriesAndVerifiesAbsence(t *testing.T) {
 		case slices.Contains(args, "-C"):
 			checks++
 			if deletes >= 2 {
-				return ackFaultFirewallAbsentMarker, 0, nil
+				return "iptables: Bad rule (does a matching rule exist in that chain?).\n" + ackFaultFirewallAbsentMarker + "\n", 0, nil
 			}
 			return "", 0, nil
 		case slices.Contains(args, "-D"):

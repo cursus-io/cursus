@@ -349,7 +349,7 @@ func removeAckFaultFirewallRule(run ackFaultCommandRunner, container, chain, sel
 		return append([]string{"exec", "-u", "0", container, "sh", "-c", script, "cursus-iptables", "-C"}, rule...)
 	}
 	ruleAbsent := func(output string, exitCode int, err error) bool {
-		return err == nil && exitCode == 0 && strings.TrimSpace(output) == ackFaultFirewallAbsentMarker
+		return err == nil && exitCode == 0 && strings.HasSuffix(strings.TrimSpace(output), ackFaultFirewallAbsentMarker)
 	}
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
