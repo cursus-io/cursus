@@ -142,6 +142,23 @@ const (
 	ReadUncommitted ReadIsolation = "read_uncommitted"
 )
 
+// ConsumerClientRole is a bounded application role used by coordinator metrics.
+// Use Prometheus scrape target labels such as job or service for application identity.
+type ConsumerClientRole string
+
+const (
+	// ConsumerClientRoleConsumer is the default general-purpose consumer role.
+	ConsumerClientRoleConsumer ConsumerClientRole = "consumer"
+	// ConsumerClientRoleCooperative identifies cooperative consumers.
+	ConsumerClientRoleCooperative ConsumerClientRole = "cooperative_consumer"
+	// ConsumerClientRoleProcessor identifies stream or event processors.
+	ConsumerClientRoleProcessor ConsumerClientRole = "processor"
+	// ConsumerClientRoleSaga identifies saga participants.
+	ConsumerClientRoleSaga ConsumerClientRole = "saga"
+	// ConsumerClientRoleObserver identifies read-only observer workloads.
+	ConsumerClientRoleObserver ConsumerClientRole = "observer"
+)
+
 type ConsumerConfig struct {
 	BrokerAddrs                              []string `yaml:"broker_addrs" json:"broker_addrs"`
 	CurrentBrokerIndex                       int      `yaml:"-" json:"-"`
@@ -205,7 +222,8 @@ type ConsumerConfig struct {
 
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
-	EnableMetrics bool `yaml:"enable_metrics" json:"enable_metrics"`
+	EnableMetrics bool               `yaml:"enable_metrics" json:"enable_metrics"`
+	ClientRole    ConsumerClientRole `yaml:"client_role" json:"client_role"`
 }
 
 func (c *ConsumerConfig) Validate() error {
@@ -236,6 +254,12 @@ func (c *ConsumerConfig) Validate() error {
 	}
 	if c.ReadIsolation != "" && c.ReadIsolation != ReadCommitted && c.ReadIsolation != ReadUncommitted {
 		return fmt.Errorf("unsupported read isolation %q", c.ReadIsolation)
+	}
+	if c.ClientRole == "" {
+		c.ClientRole = ConsumerClientRoleConsumer
+	}
+	if !validConsumerClientRole(c.ClientRole) {
+		return fmt.Errorf("unsupported consumer client role %q", c.ClientRole)
 	}
 	if c.PollInterval < 0 || c.AutoCommitInterval < 0 || c.CommitRetryBackoff < 0 ||
 		c.CommitRetryMaxBackoff < 0 || c.HandlerRetryBackoff < 0 ||
@@ -325,6 +349,20 @@ func NewDefaultConsumerConfig() *ConsumerConfig {
 		LeaderStaleness:         30 * time.Second,
 		StreamingReadDeadlineMS: 300000,
 		Mode:                    ModePolling,
+		ClientRole:              ConsumerClientRoleConsumer,
+	}
+}
+
+func validConsumerClientRole(role ConsumerClientRole) bool {
+	switch role {
+	case ConsumerClientRoleConsumer,
+		ConsumerClientRoleCooperative,
+		ConsumerClientRoleProcessor,
+		ConsumerClientRoleSaga,
+		ConsumerClientRoleObserver:
+		return true
+	default:
+		return false
 	}
 }
 

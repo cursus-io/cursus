@@ -98,7 +98,9 @@ func NewCooperativeConsumer(cfg *ConsumerConfig) (*CooperativeConsumer, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport.coordinatorAddr = copied.CoordinatorAddr
+	if copied.CoordinatorAddr != "" {
+		transport.setCoordinatorCache(copied.CoordinatorAddr, coordinatorRouteCache, coordinatorReasonInitial)
+	}
 	return &CooperativeConsumer{membershipRPC: newCooperativeRPC(), operationsRPC: newCooperativeRPC(), transport: transport, workers: make(map[int]*cooperativeWorker), failures: make(chan error, 1)}, nil
 }
 
@@ -139,8 +141,14 @@ func (c *CooperativeConsumer) Run(ctx context.Context, handler func(context.Cont
 		c.workers = make(map[int]*cooperativeWorker)
 		c.closed.Store(true)
 		c.mu.Unlock()
-		defer c.membershipRPC.close()
-		defer c.operationsRPC.close()
+		defer func() {
+			c.transport.forgetCoordinatorConnection(c.membershipRPC.conn)
+			c.membershipRPC.close()
+		}()
+		defer func() {
+			c.transport.forgetCoordinatorConnection(c.operationsRPC.conn)
+			c.operationsRPC.close()
+		}()
 		if membership.Session != 0 {
 			leaveCtx, done := context.WithTimeout(context.Background(), c.transport.requestTimeout())
 			defer done()
@@ -296,6 +304,7 @@ func (c *CooperativeConsumer) command(ctx context.Context, command string, requi
 	reusable := false
 	defer func() {
 		if !reusable {
+			c.transport.forgetCoordinatorConnection(conn)
 			_ = conn.Close()
 			rpc.conn = nil
 		}
@@ -311,24 +320,32 @@ func (c *CooperativeConsumer) command(ctx context.Context, command string, requi
 		}
 	}
 	if err = WriteWithLength(conn, []byte(command)); err != nil {
+		c.transport.recordCoordinatorCommand(conn, command, coordinatorResultFailure)
+		c.transport.markCoordinatorReconnect()
 		return "", err
 	}
 	data, err := ReadWithLength(conn)
 	if err != nil {
+		c.transport.recordCoordinatorCommand(conn, command, coordinatorResultFailure)
 		var broker *BrokerError
 		if errors.As(err, &broker) {
-			c.transport.handleNotCoordinatorError(broker)
+			c.transport.handleNotCoordinatorResponse(conn, command, broker)
+		} else {
+			c.transport.markCoordinatorReconnect()
 		}
 		return "", err
 	}
 	response := strings.TrimSpace(string(data))
 	if broker, ok := ParseBrokerError(response); ok {
-		c.transport.handleNotCoordinatorError(broker)
+		c.transport.recordCoordinatorCommand(conn, command, coordinatorResultFailure)
+		c.transport.handleNotCoordinatorResponse(conn, command, broker)
 		return "", broker
 	}
 	if !hasOKStatus(response) {
+		c.transport.recordCoordinatorCommand(conn, command, coordinatorResultFailure)
 		return "", fmt.Errorf("invalid cooperative response: %s", response)
 	}
+	c.transport.recordCoordinatorCommand(conn, command, coordinatorResultSuccess)
 	reusable = true
 	return response, nil
 }

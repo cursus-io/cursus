@@ -48,9 +48,11 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 			hb := fmt.Sprintf("HEARTBEAT topic=%s group=%s member=%s generation=%d",
 				c.config.Topic, c.config.GroupID, memberID, generation)
 			if err := WriteWithLength(conn, []byte(hb)); err != nil {
+				c.recordCoordinatorCommand(conn, "HEARTBEAT", coordinatorResultFailure)
 				cleanup()
 				cancelRequest()
 				LogError("Heartbeat send failed: %v", err)
+				c.markCoordinatorReconnect()
 				c.cleanupHbConn(conn)
 				continue
 			}
@@ -59,9 +61,10 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 			cleanup()
 			cancelRequest()
 			if err != nil {
+				c.recordCoordinatorCommand(conn, "HEARTBEAT", coordinatorResultFailure)
 				var brokerErr *BrokerError
 				if errors.As(err, &brokerErr) {
-					_ = c.handleNotCoordinatorError(brokerErr)
+					_ = c.handleNotCoordinatorResponse(conn, "HEARTBEAT", brokerErr)
 					switch strings.ToUpper(brokerErr.Code) {
 					case "REBALANCE_REQUIRED", "GEN_MISMATCH", "NOT_OWNER", "MEMBER_NOT_FOUND":
 						LogWarn("Heartbeat: rebalance triggered: %v", brokerErr)
@@ -71,6 +74,8 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 						}
 						return
 					}
+				} else {
+					c.markCoordinatorReconnect()
 				}
 				LogError("Heartbeat response failed: %v", err)
 				c.cleanupHbConn(conn)
@@ -79,14 +84,19 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 
 			respStr := string(resp)
 			if !hasOKStatus(respStr) {
+				c.recordCoordinatorCommand(conn, "HEARTBEAT", coordinatorResultFailure)
 				LogError("Heartbeat returned an unexpected response: %s", respStr)
+				c.markCoordinatorReconnect()
 				c.cleanupHbConn(conn)
+				continue
 			}
+			c.recordCoordinatorCommand(conn, "HEARTBEAT", coordinatorResultSuccess)
 		}
 	}
 }
 
 func (c *Consumer) cleanupHbConn(bad net.Conn) {
+	c.forgetCoordinatorConnection(bad)
 	_ = bad.Close()
 	c.hbMu.Lock()
 	if c.hbConn == bad {
@@ -142,6 +152,7 @@ func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 func (c *Consumer) resetHeartbeatConn() {
 	c.hbMu.Lock()
 	if c.hbConn != nil {
+		c.forgetCoordinatorConnection(c.hbConn)
 		_ = c.hbConn.Close()
 		c.hbConn = nil
 	}
@@ -328,9 +339,7 @@ func (c *Consumer) handleRebalanceSignal() {
 	assignmentCtx := c.replaceAssignmentContext()
 
 	if coordAddr, err := c.findCoordinatorContext(assignmentCtx); err == nil {
-		c.mu.Lock()
-		c.coordinatorAddr = coordAddr
-		c.mu.Unlock()
+		c.setCoordinatorCache(coordAddr, coordinatorRouteCache, coordinatorReasonInitial)
 	}
 
 	gen, mid, assignments, err := c.joinGroupWithRetry()

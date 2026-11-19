@@ -143,6 +143,10 @@ still waiting for its configured acknowledgement.
 
 ## Cluster Consumer Routing
 
+Coordinator redirects, cache refreshes, reconnects, bounded labels, and
+recommended PromQL are documented in
+[Go SDK consumer coordinator observability](sdk-coordinator-observability.md).
+
 ```mermaid
 sequenceDiagram
     participant SDK as Any SDK
