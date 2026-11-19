@@ -1464,7 +1464,3 @@ func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string
 	}
 	return bootstrap[0]
 }
-
-func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {
-	return c.handleNotCoordinatorResponse(nil, "", brokerErr)
-}

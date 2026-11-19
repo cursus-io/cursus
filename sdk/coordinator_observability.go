@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -317,10 +316,4 @@ func (c *Consumer) logCoordinatorEvent(event, command, routeSource, reason, resu
 		attempt,
 		limit,
 	)
-}
-
-func (c *Consumer) coordinatorDebugState() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return fmt.Sprintf("address=%q source=%s pending_reason=%s", c.coordinatorAddr, normalizeCoordinatorRoute(c.coordinatorRouteSource), normalizeCoordinatorReason(c.coordinatorPendingReason))
 }
