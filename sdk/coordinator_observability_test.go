@@ -61,6 +61,11 @@ func TestInitialBootstrapRedirectFillsCoordinatorCacheAndRetryStabilizesIt(t *te
 	c.mu.RLock()
 	assert.Equal(t, coordinatorRouteCache, c.coordinatorRouteSource)
 	c.mu.RUnlock()
+	assert.Equal(t, coordinatorRouteCache, c.coordinatorRouteOf(retry))
+
+	// A persistent connection is a normal cached route after recovery. Later
+	// commands must not inflate the retry counter.
+	c.recordCoordinatorCommand(retry, "FETCH_OFFSET", coordinatorResultSuccess)
 
 	redirectMetric, err := consumerCoordinatorRedirects.GetMetricWithLabelValues("fetch_offset", "processor", "bootstrap")
 	require.NoError(t, err)
@@ -71,6 +76,25 @@ func TestInitialBootstrapRedirectFillsCoordinatorCacheAndRetryStabilizesIt(t *te
 	retryMetric, err := consumerCoordinatorRetry.GetMetricWithLabelValues("fetch_offset", "success", "processor")
 	require.NoError(t, err)
 	assert.Equal(t, float64(1), counterVecValue(t, retryMetric))
+	cacheCommandMetric, err := consumerCoordinatorCommands.GetMetricWithLabelValues("fetch_offset", "processor", "cache", "success")
+	require.NoError(t, err)
+	assert.Equal(t, float64(1), counterVecValue(t, cacheCommandMetric))
+}
+
+func TestSuccessfulReconnectPromotesPersistentConnectionToCache(t *testing.T) {
+	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleConsumer)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	c.setCoordinatorCache("coordinator-1:9000", coordinatorRouteReconnect, coordinatorReasonReconnect)
+	conn := c.trackCoordinatorConnection(client, "coordinator-1:9000", coordinatorRouteReconnect)
+	c.recordCoordinatorCommand(conn, "HEARTBEAT", coordinatorResultSuccess)
+
+	assert.Equal(t, coordinatorRouteCache, c.coordinatorRouteOf(conn))
+	c.mu.RLock()
+	assert.Equal(t, coordinatorRouteCache, c.coordinatorRouteSource)
+	c.mu.RUnlock()
 }
 
 func TestStableCachedCoordinatorSuccessDoesNotRecordRedirect(t *testing.T) {
@@ -125,6 +149,59 @@ func TestSameCoordinatorRedirectInvalidatesCacheBeforeRediscovery(t *testing.T) 
 	c.mu.RLock()
 	assert.Empty(t, c.coordinatorAddr)
 	assert.Equal(t, coordinatorReasonRedirect, c.coordinatorPendingReason)
+	c.mu.RUnlock()
+}
+
+func TestAddresslessRedirectKeepsConfiguredCoordinatorPinForRetryRoute(t *testing.T) {
+	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleConsumer)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	c.config.CoordinatorAddr = "mapped-host:19000"
+	c.setCoordinatorCache(c.config.CoordinatorAddr, coordinatorRouteCache, coordinatorReasonInitial)
+	conn := c.trackCoordinatorConnection(client, c.config.CoordinatorAddr, coordinatorRouteCache)
+	require.True(t, c.handleNotCoordinatorResponse(conn, "HEARTBEAT", &BrokerError{Code: "NOT_COORDINATOR"}))
+
+	c.mu.RLock()
+	assert.Equal(t, "mapped-host:19000", c.coordinatorAddr)
+	assert.Equal(t, coordinatorRouteRetry, c.coordinatorRouteSource)
+	assert.Empty(t, c.coordinatorPendingReason)
+	c.mu.RUnlock()
+}
+
+func TestAddresslessRedirectInvalidatesDynamicCoordinatorBeforeRediscovery(t *testing.T) {
+	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleConsumer)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	c.setCoordinatorCache("coordinator-1:9000", coordinatorRouteCache, coordinatorReasonInitial)
+	conn := c.trackCoordinatorConnection(client, "coordinator-1:9000", coordinatorRouteCache)
+	require.True(t, c.handleNotCoordinatorResponse(conn, "HEARTBEAT", &BrokerError{Code: "NOT_COORDINATOR"}))
+
+	c.mu.RLock()
+	assert.Empty(t, c.coordinatorAddr)
+	assert.Equal(t, coordinatorRouteBootstrap, c.coordinatorRouteSource)
+	assert.Equal(t, coordinatorReasonRedirect, c.coordinatorPendingReason)
+	c.mu.RUnlock()
+}
+
+func TestAddresslessRedirectFromInvalidatedPinDoesNotRestoreCache(t *testing.T) {
+	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleConsumer)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	c.config.CoordinatorAddr = "mapped-host:19000"
+	c.setCoordinatorCache(c.config.CoordinatorAddr, coordinatorRouteCache, coordinatorReasonInitial)
+	conn := c.trackCoordinatorConnection(client, c.config.CoordinatorAddr, coordinatorRouteCache)
+	require.True(t, c.invalidateCoordinatorCacheIfCurrent(c.config.CoordinatorAddr, coordinatorReasonReconnect))
+	require.True(t, c.handleNotCoordinatorResponse(conn, "HEARTBEAT", &BrokerError{Code: "NOT_COORDINATOR"}))
+
+	c.mu.RLock()
+	assert.Empty(t, c.coordinatorAddr)
+	assert.Equal(t, coordinatorRouteBootstrap, c.coordinatorRouteSource)
 	c.mu.RUnlock()
 }
 

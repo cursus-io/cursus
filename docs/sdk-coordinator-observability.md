@@ -33,14 +33,24 @@ The cache contract is now:
 - A redirect to a different usable address atomically refreshes the cache. The
   next existing command attempt is classified as `retry`; no extra discovery
   request is added.
-- A redirect to the same address, or one without a usable address, invalidates
-  the cache. The next existing bounded attempt performs `FIND_COORDINATOR`.
+- A redirect to the same address invalidates the cache. A redirect without a
+  usable address also invalidates a dynamically discovered route, and the next
+  existing bounded attempt performs `FIND_COORDINATOR`.
+- When the current route is the explicitly configured `CoordinatorAddr`, an
+  address-less redirect keeps that deployment pin and classifies the next
+  existing bounded attempt as `retry`. This avoids replacing a host-port
+  mapping with an unreachable in-container advertised address. No retry loop
+  is added: commands keep their existing deadline and retry budget, while
+  heartbeat continues on its existing periodic lifecycle. A stale pin can
+  therefore remain observable as repeated redirects until configuration or a
+  usable broker redirect replaces it.
 - A late redirect from an already superseded connection cannot roll the cache
   back to its old address.
 - A transport reconnect first reuses the cached address. A failed dial causes
   invalidation and rediscovery. Reconnect does not clear a healthy cache.
-- The first successful command on a `retry` or `reconnect` route promotes that
-  route to the normal `cache` state.
+- The first successful command on a `retry` or `reconnect` route promotes both
+  the consumer cache and that persistent connection to the normal `cache`
+  state. Later commands on the same connection are not counted as retries.
 
 `CoordinatorAddr` remains an optional initial/pinned deployment override, but
 a broker redirect can replace it. Production Kubernetes brokers advertise
@@ -59,22 +69,28 @@ Kafka treats `NOT_COORDINATOR` as retriable, marks the coordinator unknown for
 heartbeat, sync, offset fetch, and offset commit responses, and performs
 rediscovery inside the caller's timer and retry backoff.
 
-Cursus adopts the safety property that an invalid coordinator is not kept as a
-valid cache entry and that retries remain deadline/budget bounded. It differs
-by retaining Cursus Wire v2's redirect-address optimization: a different
-broker address in the structured error can refresh the cache without a second
-lookup. This avoids extra recovery work while preserving rediscovery for
-missing or self-referential redirects. No wire protocol or public method
-signature changed.
+Cursus adopts the safety property that an invalid dynamically discovered
+coordinator is not kept as a valid cache entry and that retries remain
+deadline/budget bounded. It differs by retaining Cursus Wire v2's
+redirect-address optimization: a different broker address in the structured
+error can refresh the cache without a second lookup. It also keeps an explicit
+`CoordinatorAddr` deployment pin when an error has no replacement address,
+because Kafka's broker identity is directly reachable while a Cursus
+host-port mapping can intentionally differ from the advertised address. A
+usable structured redirect can still replace the pin. No wire protocol or
+public method signature changed.
 
-Recovery work is bounded by the existing command budget. A usable redirect
-costs one failed command response, one replacement connection, and one command
-retry. A missing or same-address redirect additionally costs one framed
-`FIND_COORDINATOR` request/response on the next existing attempt. The exact
-byte count depends on group-name length, Wire v2 framing, authentication, and
-compression; the change does not add background polling, payload reads, or
-unbounded recovery requests. Recovery bytes therefore grow with at most that
-single bounded lookup per invalidated attempt, not with topic data volume.
+Command recovery work is bounded by the existing command budget. A usable
+redirect costs one failed command response, one replacement connection, and
+one command retry. A missing redirect on a dynamic route, or a same-address
+redirect, additionally costs one framed `FIND_COORDINATOR` request/response on
+the next existing attempt. A missing redirect on an explicit pin skips that
+lookup and reuses the pin on the caller's next existing attempt or heartbeat
+tick. The exact byte count depends on group-name length, Wire v2 framing,
+authentication, and compression; the change does not add background polling,
+payload reads, or a new retry loop. Recovery bytes therefore grow with at most
+that single bounded lookup per invalidated dynamic attempt, not with topic
+data volume.
 
 ## Metrics
 
@@ -88,8 +104,8 @@ SDK labels.
 | `cursus_consumer_coordinator_commands_total` | Counter | `command`, `client_role`, `route_source`, `result` | Completed coordinator command attempts, including success and failure. This is the denominator for redirect ratios. |
 | `cursus_consumer_coordinator_redirects_total` | Counter | `command`, `client_role`, `route_source` | Structured `NOT_COORDINATOR` responses. |
 | `cursus_consumer_coordinator_resolution_total` | Counter | `result`, `reason`, `client_role` | Coordinator lookup or classified reconnect outcomes. |
-| `cursus_consumer_coordinator_cache_refresh_total` | Counter | `result`, `reason`, `client_role` | Cache refresh outcomes. A missing/same-address redirect is counted when its subsequent lookup succeeds or fails. |
-| `cursus_consumer_coordinator_retry_total` | Counter | `command`, `result`, `client_role` | Outcome of commands sent on a route learned from a redirect. |
+| `cursus_consumer_coordinator_cache_refresh_total` | Counter | `result`, `reason`, `client_role` | Cache refresh outcomes. A missing redirect on a dynamic route, or a same-address redirect, is counted when its subsequent lookup succeeds or fails. An address-less configured-pin retry is not a refresh. |
+| `cursus_consumer_coordinator_retry_total` | Counter | `command`, `result`, `client_role` | Outcome of the recovery command sent on a route learned from a redirect. After the first success, later commands on that persistent connection use the normal `cache` route and do not increment this counter. |
 | `cursus_consumer_coordinator_resolution_duration_seconds` | Histogram | `result`, `reason`, `client_role` | Lookup or reconnect latency. |
 
 Bounded `command` values are `join_group`, `sync_group`, `leave_group`,

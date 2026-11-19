@@ -256,16 +256,17 @@ func (c *Consumer) markCoordinatorReconnect() {
 }
 
 func (c *Consumer) promoteCoordinatorRoute(conn net.Conn) {
-	c.coordinatorConnMu.RLock()
-	tracked, ok := c.coordinatorConns[conn]
-	c.coordinatorConnMu.RUnlock()
-	if !ok || (tracked.routeSource != coordinatorRouteRetry && tracked.routeSource != coordinatorRouteReconnect) {
-		return
-	}
 	c.mu.Lock()
-	if c.coordinatorAddr == tracked.address {
+	c.coordinatorConnMu.Lock()
+	tracked, ok := c.coordinatorConns[conn]
+	if ok &&
+		(tracked.routeSource == coordinatorRouteRetry || tracked.routeSource == coordinatorRouteReconnect) &&
+		c.coordinatorAddr == tracked.address {
 		c.coordinatorRouteSource = coordinatorRouteCache
+		tracked.routeSource = coordinatorRouteCache
+		c.coordinatorConns[conn] = tracked
 	}
+	c.coordinatorConnMu.Unlock()
 	c.mu.Unlock()
 }
 
@@ -287,12 +288,20 @@ func (c *Consumer) handleNotCoordinatorResponse(conn net.Conn, command string, b
 		newAddress = c.coordinatorAddrFromHostPort(host, port)
 	}
 	sameCoordinator := newAddress != "" && newAddress == oldAddress
+	configuredPin := ""
+	if c.config != nil {
+		configuredPin = strings.TrimSpace(c.config.CoordinatorAddr)
+	}
 
 	cacheRefreshed := false
 	c.mu.Lock()
 	responseFromSupersededRoute := c.coordinatorAddr != "" && oldAddress != "" && c.coordinatorAddr != oldAddress
 	if !responseFromSupersededRoute {
-		if newAddress == "" || sameCoordinator {
+		pinIsCurrent := newAddress == "" && configuredPin != "" && oldAddress == configuredPin && c.coordinatorAddr == configuredPin
+		if pinIsCurrent {
+			c.coordinatorRouteSource = coordinatorRouteRetry
+			c.coordinatorPendingReason = ""
+		} else if newAddress == "" || sameCoordinator {
 			c.coordinatorAddr = ""
 			c.coordinatorRouteSource = coordinatorRouteBootstrap
 			c.coordinatorPendingReason = coordinatorReasonRedirect
