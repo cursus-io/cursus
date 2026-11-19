@@ -130,7 +130,10 @@ func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 		LogError("Heartbeat: failed to connect: %v", err)
 		return nil
 	}
+	return c.installHeartbeatConn(ctx, newConn)
+}
 
+func (c *Consumer) installHeartbeatConn(ctx context.Context, newConn net.Conn) net.Conn {
 	c.hbMu.Lock()
 	select {
 	case <-ctx.Done():
@@ -140,6 +143,7 @@ func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 		return nil
 	default:
 	}
+	var conn net.Conn
 	if c.hbConn != nil {
 		c.forgetCoordinatorConnection(newConn)
 		_ = newConn.Close()
