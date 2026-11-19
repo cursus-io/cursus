@@ -25,6 +25,12 @@ func resetMetricsState() {
 	consumerOffsetGapTotal = nil
 	consumerCompactedOffsetsSkipped = nil
 	consumerStaleWorkers = nil
+	consumerCoordinatorCommands = nil
+	consumerCoordinatorRedirects = nil
+	consumerCoordinatorResolution = nil
+	consumerCoordinatorCacheRefresh = nil
+	consumerCoordinatorRetry = nil
+	consumerCoordinatorResolutionLag = nil
 }
 
 func TestInitMetrics_CreatesRegistry(t *testing.T) {
@@ -92,6 +98,12 @@ func TestConsumerMetrics_CanBeIncremented(t *testing.T) {
 	consumerRebalanceTotal.WithLabelValues("events", "grp1").Inc()
 	consumerCompactedOffsetsSkipped.WithLabelValues("events", "grp1").Add(3)
 	consumerStaleWorkers.WithLabelValues("events", "grp1", "poller").Inc()
+	consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
+	consumerCoordinatorRedirects.WithLabelValues("heartbeat", "consumer", "cache").Inc()
+	consumerCoordinatorResolution.WithLabelValues("success", "initial", "consumer").Inc()
+	consumerCoordinatorCacheRefresh.WithLabelValues("success", "initial", "consumer").Inc()
+	consumerCoordinatorRetry.WithLabelValues("heartbeat", "success", "consumer").Inc()
+	consumerCoordinatorResolutionLag.WithLabelValues("success", "initial", "consumer").Observe(0.01)
 
 	metrics, err := metricsRegistry.Gather()
 	assert.NoError(t, err)
@@ -107,6 +119,12 @@ func TestConsumerMetrics_CanBeIncremented(t *testing.T) {
 	assert.True(t, names["cursus_consumer_rebalance_total"])
 	assert.True(t, names["cursus_consumer_compacted_offsets_skipped_total"])
 	assert.True(t, names["cursus_consumer_stale_workers_total"])
+	assert.True(t, names["cursus_consumer_coordinator_commands_total"])
+	assert.True(t, names["cursus_consumer_coordinator_redirects_total"])
+	assert.True(t, names["cursus_consumer_coordinator_resolution_total"])
+	assert.True(t, names["cursus_consumer_coordinator_cache_refresh_total"])
+	assert.True(t, names["cursus_consumer_coordinator_retry_total"])
+	assert.True(t, names["cursus_consumer_coordinator_resolution_duration_seconds"])
 }
 
 func TestMetricsHandler_ServesPrometheusFormat(t *testing.T) {

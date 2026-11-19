@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"errors"
 	"net"
 	"testing"
@@ -261,6 +262,65 @@ func TestConsumer_GetOrDialHeartbeatConn_NilConnGetLeaderFails(t *testing.T) {
 
 	conn := c.getOrDialHeartbeatConn(c.assignmentContext())
 	assert.Nil(t, conn)
+}
+
+func TestConsumer_GetOrDialHeartbeatConn_CanceledContextForgetsExistingConn(t *testing.T) {
+	c := newTestConsumer(t)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+
+	c.trackCoordinatorConnection(client, "coordinator:9000", coordinatorRouteCache)
+	c.hbMu.Lock()
+	c.hbConn = client
+	c.hbMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.Nil(t, c.getOrDialHeartbeatConn(ctx))
+	assert.Nil(t, c.hbConn)
+	assertCoordinatorConnectionTracked(t, c, client, false)
+}
+
+func TestConsumer_InstallHeartbeatConn_CanceledContextForgetsDialedConn(t *testing.T) {
+	c := newTestConsumer(t)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+
+	c.trackCoordinatorConnection(client, "coordinator:9000", coordinatorRouteCache)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.Nil(t, c.installHeartbeatConn(ctx, client))
+	assert.Nil(t, c.hbConn)
+	assertCoordinatorConnectionTracked(t, c, client, false)
+}
+
+func TestConsumer_InstallHeartbeatConn_RedundantDialForgetsDiscardedConn(t *testing.T) {
+	c := newTestConsumer(t)
+	installedServer, installedClient := net.Pipe()
+	defer func() { _ = installedServer.Close() }()
+	redundantServer, redundantClient := net.Pipe()
+	defer func() { _ = redundantServer.Close() }()
+
+	c.trackCoordinatorConnection(installedClient, "coordinator:9000", coordinatorRouteCache)
+	c.trackCoordinatorConnection(redundantClient, "coordinator:9000", coordinatorRouteCache)
+	c.hbMu.Lock()
+	c.hbConn = installedClient
+	c.hbMu.Unlock()
+	defer c.resetHeartbeatConn()
+
+	assert.Equal(t, installedClient, c.installHeartbeatConn(context.Background(), redundantClient))
+	assertCoordinatorConnectionTracked(t, c, installedClient, true)
+	assertCoordinatorConnectionTracked(t, c, redundantClient, false)
+}
+
+func assertCoordinatorConnectionTracked(t *testing.T, c *Consumer, conn net.Conn, want bool) {
+	t.Helper()
+	c.coordinatorConnMu.RLock()
+	_, tracked := c.coordinatorConns[conn]
+	c.coordinatorConnMu.RUnlock()
+	assert.Equal(t, want, tracked)
 }
 
 func TestParseFetchOffsetResponse_StrictContract(t *testing.T) {

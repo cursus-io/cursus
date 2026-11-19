@@ -37,6 +37,15 @@ type Consumer struct {
 	generation      int64
 	memberID        string
 	coordinatorAddr string
+	// coordinatorRouteSource describes how the cached address was learned. The
+	// values are bounded before they reach Prometheus labels.
+	coordinatorRouteSource      string
+	coordinatorPendingReason    string
+	coordinatorReconnectPending bool
+	coordinatorLogMu            sync.Mutex
+	coordinatorLogLast          map[string]time.Time
+	coordinatorConnMu           sync.RWMutex
+	coordinatorConns            map[net.Conn]coordinatorConnectionMetadata
 
 	commitConn     net.Conn
 	commitConnMu   sync.Mutex
@@ -147,6 +156,9 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 		rootCtx:                  rootCtx,
 		rootCancel:               rootCancel,
 		mainCancel:               cancel,
+		coordinatorRouteSource:   coordinatorRouteBootstrap,
+		coordinatorPendingReason: coordinatorReasonInitial,
+		coordinatorConns:         make(map[net.Conn]coordinatorConnectionMetadata),
 	}
 
 	c.commitCh = make(chan commitEntry, 1024)
@@ -216,14 +228,10 @@ func (c *Consumer) Start(handler func(Message) error) error {
 	c.MessageHandler = handler
 
 	if c.config.CoordinatorAddr != "" {
-		c.mu.Lock()
-		c.coordinatorAddr = c.config.CoordinatorAddr
-		c.mu.Unlock()
+		c.setCoordinatorCache(c.config.CoordinatorAddr, coordinatorRouteCache, coordinatorReasonInitial)
 		LogInfo("Using configured coordinator for group '%s': %s", c.config.GroupID, c.coordinatorAddr)
 	} else if coordAddr, err := c.findCoordinatorContext(c.assignmentContext()); err == nil {
-		c.mu.Lock()
-		c.coordinatorAddr = coordAddr
-		c.mu.Unlock()
+		c.setCoordinatorCache(coordAddr, coordinatorRouteCache, coordinatorReasonInitial)
 		LogInfo("Coordinator for group '%s': %s", c.config.GroupID, coordAddr)
 	}
 
@@ -624,12 +632,13 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 
 		resp, err := c.exchangeBatchCommit(requestCtx, conn, request, assignmentGeneration, allowClosing)
 		if err != nil {
+			c.recordCoordinatorCommand(conn, "BATCH_COMMIT", coordinatorResultFailure)
 			if errors.Is(err, ErrConsumerRebalancing) {
 				return false
 			}
 			var brokerErr *BrokerError
 			if errors.As(err, &brokerErr) {
-				if c.handleNotCoordinatorError(brokerErr) {
+				if c.handleNotCoordinatorResponse(conn, "BATCH_COMMIT", brokerErr) {
 					c.discardCommitConnLocked(conn)
 					LogWarn("Batch commit coordinator moved: %v", brokerErr)
 					return false
@@ -645,6 +654,7 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 				return false
 			}
 			LogError("Batch commit transport failed (attempt %d/2): %v", attempt+1, err)
+			c.markCoordinatorReconnect()
 			c.discardCommitConnLocked(conn)
 			if attempt == 0 && requestCtx.Err() == nil &&
 				c.assignmentCanCommit(assignmentGeneration, allowClosing) &&
@@ -656,9 +666,11 @@ func (c *Consumer) sendBatchCommitWithState(offsets map[int]uint64, assignmentGe
 
 		respStr := string(resp)
 		if hasOKStatus(respStr) {
+			c.recordCoordinatorCommand(conn, "BATCH_COMMIT", coordinatorResultSuccess)
 			return true
 		}
 
+		c.recordCoordinatorCommand(conn, "BATCH_COMMIT", coordinatorResultFailure)
 		LogError("Batch commit rejected: %s", respStr)
 		return false
 	}
@@ -736,6 +748,7 @@ func isRetryableCommitTransportError(err error) bool {
 
 func (c *Consumer) discardCommitConnLocked(conn net.Conn) {
 	if c.commitConn == conn {
+		c.forgetCoordinatorConnection(conn)
 		_ = conn.Close()
 		c.commitConn = nil
 	}
@@ -756,6 +769,7 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 	if err != nil {
 		return err
 	}
+	defer c.forgetCoordinatorConnection(conn)
 	defer func() { _ = conn.Close() }()
 	cleanup, err := bindConnectionToContext(requestCtx, conn)
 	if err != nil {
@@ -774,14 +788,16 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 	err = WriteWithLength(conn, []byte(commitCmd))
 	c.lifecycleMu.Unlock()
 	if err != nil {
+		c.recordCoordinatorCommand(conn, "COMMIT_OFFSET", coordinatorResultFailure)
 		return fmt.Errorf("direct commit send: %w", err)
 	}
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		c.recordCoordinatorCommand(conn, "COMMIT_OFFSET", coordinatorResultFailure)
 		var brokerErr *BrokerError
 		if errors.As(err, &brokerErr) {
-			_ = c.handleNotCoordinatorError(brokerErr)
+			_ = c.handleNotCoordinatorResponse(conn, "COMMIT_OFFSET", brokerErr)
 			switch strings.ToUpper(brokerErr.Code) {
 			case "GEN_MISMATCH", "NOT_OWNER", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
 				select {
@@ -796,8 +812,10 @@ func (c *Consumer) directCommit(partition int, offset uint64, assignmentGenerati
 
 	respStr := strings.TrimSpace(string(resp))
 	if !hasOKStatus(respStr) {
+		c.recordCoordinatorCommand(conn, "COMMIT_OFFSET", coordinatorResultFailure)
 		return fmt.Errorf("unexpected direct commit response: %s", respStr)
 	}
+	c.recordCoordinatorCommand(conn, "COMMIT_OFFSET", coordinatorResultSuccess)
 	return nil
 }
 
@@ -899,12 +917,14 @@ func (c *Consumer) metadataRefreshLoop(ctx context.Context) {
 func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 	const maxAttempts = 30
 	bo := newBackoff(1*time.Second, 5*time.Second)
+	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		gen, mid, assignments, err := c.joinGroup()
 		if err == nil {
 			return gen, mid, assignments, nil
 		}
+		lastErr = err
 
 		LogWarn("Join group attempt %d/%d failed: %v", attempt, maxAttempts, err)
 		if attempt == maxAttempts {
@@ -918,6 +938,10 @@ func (c *Consumer) joinGroupWithRetry() (int64, string, []int, error) {
 		case <-time.After(waitDur):
 		}
 	}
+	var brokerErr *BrokerError
+	if errors.As(lastErr, &brokerErr) && strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+		c.logCoordinatorRetryExhausted("JOIN_GROUP", maxAttempts, maxAttempts)
+	}
 	return 0, "", nil, fmt.Errorf("failed to join group after %d attempts", maxAttempts)
 }
 
@@ -928,6 +952,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 	if err != nil {
 		return 0, "", nil, err
 	}
+	defer c.forgetCoordinatorConnection(conn)
 	defer func() { _ = conn.Close() }()
 	cleanup, err := bindConnectionToContext(requestCtx, conn)
 	if err != nil {
@@ -949,16 +974,18 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 		joinCmd += fmt.Sprintf(" generation=%d", generation)
 	}
 	if err := WriteWithLength(conn, []byte(joinCmd)); err != nil {
+		c.recordCoordinatorCommand(conn, "JOIN_GROUP", coordinatorResultFailure)
 		return 0, "", nil, fmt.Errorf("send join: %w", err)
 	}
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		c.recordCoordinatorCommand(conn, "JOIN_GROUP", coordinatorResultFailure)
 		var brokerErr *BrokerError
 		if !errors.As(err, &brokerErr) {
 			return 0, "", nil, fmt.Errorf("read join response: %w", err)
 		}
-		if c.handleNotCoordinatorError(brokerErr) {
+		if c.handleNotCoordinatorResponse(conn, "JOIN_GROUP", brokerErr) {
 			return 0, "", nil, fmt.Errorf("coordinator moved, retry: %w", brokerErr)
 		}
 		if resuming && strings.EqualFold(brokerErr.Code, "GEN_MISMATCH") {
@@ -985,6 +1012,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 
 	respStr := strings.TrimSpace(string(resp))
 	if !hasOKStatus(respStr) {
+		c.recordCoordinatorCommand(conn, "JOIN_GROUP", coordinatorResultFailure)
 		return 0, "", nil, fmt.Errorf("join rejected: %s", respStr)
 	}
 
@@ -999,6 +1027,7 @@ func (c *Consumer) joinGroup() (int64, string, []int, error) {
 		}
 	}
 
+	c.recordCoordinatorCommand(conn, "JOIN_GROUP", coordinatorResultSuccess)
 	return gen, mid, parseGroupAssignments(respStr), nil
 }
 
@@ -1009,6 +1038,7 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer c.forgetCoordinatorConnection(conn)
 	defer func() { _ = conn.Close() }()
 	cleanup, err := bindConnectionToContext(requestCtx, conn)
 	if err != nil {
@@ -1019,16 +1049,23 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	syncCmd := fmt.Sprintf("SYNC_GROUP topic=%s group=%s member=%s generation=%d",
 		c.config.Topic, c.config.GroupID, memberID, generation)
 	if err := WriteWithLength(conn, []byte(syncCmd)); err != nil {
+		c.recordCoordinatorCommand(conn, "SYNC_GROUP", coordinatorResultFailure)
 		return nil, fmt.Errorf("send sync: %w", err)
 	}
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		c.recordCoordinatorCommand(conn, "SYNC_GROUP", coordinatorResultFailure)
+		var brokerErr *BrokerError
+		if errors.As(err, &brokerErr) {
+			_ = c.handleNotCoordinatorResponse(conn, "SYNC_GROUP", brokerErr)
+		}
 		return nil, fmt.Errorf("read sync response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
 	if !hasOKStatus(respStr) {
+		c.recordCoordinatorCommand(conn, "SYNC_GROUP", coordinatorResultFailure)
 		return nil, fmt.Errorf("sync rejected: %s", respStr)
 	}
 
@@ -1037,6 +1074,7 @@ func (c *Consumer) syncGroup(generation int64, memberID string) ([]int, error) {
 	c.memberID = memberID
 	c.mu.Unlock()
 
+	c.recordCoordinatorCommand(conn, "SYNC_GROUP", coordinatorResultSuccess)
 	return parseGroupAssignments(respStr), nil
 }
 
@@ -1071,6 +1109,10 @@ func (c *Consumer) fetchOffsetWithRetry(partition int) (uint64, error) {
 			return 0, err
 		}
 		if attempt == 5 {
+			var brokerErr *BrokerError
+			if errors.As(err, &brokerErr) && strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
+				c.logCoordinatorRetryExhausted("FETCH_OFFSET", attempt, 5)
+			}
 			break
 		}
 		select {
@@ -1093,6 +1135,7 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer c.forgetCoordinatorConnection(conn)
 	defer func() { _ = conn.Close() }()
 	cleanup, err := bindConnectionToContext(requestCtx, conn)
 	if err != nil {
@@ -1102,21 +1145,29 @@ func (c *Consumer) fetchOffset(partition int) (uint64, error) {
 	fetchCmd := fmt.Sprintf("FETCH_OFFSET topic=%s partition=%d group=%s",
 		c.config.Topic, partition, c.config.GroupID)
 	if err := WriteWithLength(conn, []byte(fetchCmd)); err != nil {
+		c.recordCoordinatorCommand(conn, "FETCH_OFFSET", coordinatorResultFailure)
 		return 0, fmt.Errorf("fetch offset send: %w", err)
 	}
 
 	resp, err := ReadWithLength(conn)
 	if err != nil {
+		c.recordCoordinatorCommand(conn, "FETCH_OFFSET", coordinatorResultFailure)
 		var brokerErr *BrokerError
 		if errors.As(err, &brokerErr) {
-			_ = c.handleNotCoordinatorError(brokerErr)
+			_ = c.handleNotCoordinatorResponse(conn, "FETCH_OFFSET", brokerErr)
 			return 0, brokerErr
 		}
 		return 0, fmt.Errorf("fetch offset response: %w", err)
 	}
 
 	respStr := strings.TrimSpace(string(resp))
-	return parseFetchOffsetResponse(respStr)
+	offset, err := parseFetchOffsetResponse(respStr)
+	if err != nil {
+		c.recordCoordinatorCommand(conn, "FETCH_OFFSET", coordinatorResultFailure)
+		return 0, err
+	}
+	c.recordCoordinatorCommand(conn, "FETCH_OFFSET", coordinatorResultSuccess)
+	return offset, nil
 }
 
 func isRetryableFetchOffsetError(err error) bool {
@@ -1195,19 +1246,30 @@ func (c *Consumer) Close() error {
 			cleanup, bindErr := bindConnectionToContext(requestCtx, conn)
 			if bindErr != nil {
 				closeErr = errors.Join(closeErr, bindErr)
+				c.forgetCoordinatorConnection(conn)
 				_ = conn.Close()
 				cancelRequest()
 			} else {
 				leaveCmd := fmt.Sprintf("LEAVE_GROUP topic=%s group=%s member=%s generation=%d",
 					c.config.Topic, c.config.GroupID, memberID, generation)
 				if err := WriteWithLength(conn, []byte(leaveCmd)); err != nil {
+					c.recordCoordinatorCommand(conn, "LEAVE_GROUP", coordinatorResultFailure)
 					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
 				} else if response, err := ReadWithLength(conn); err != nil {
+					c.recordCoordinatorCommand(conn, "LEAVE_GROUP", coordinatorResultFailure)
+					var brokerErr *BrokerError
+					if errors.As(err, &brokerErr) {
+						_ = c.handleNotCoordinatorResponse(conn, "LEAVE_GROUP", brokerErr)
+					}
 					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: %w", err))
 				} else if !hasOKStatus(strings.TrimSpace(string(response))) {
+					c.recordCoordinatorCommand(conn, "LEAVE_GROUP", coordinatorResultFailure)
 					closeErr = errors.Join(closeErr, fmt.Errorf("leave consumer group: unexpected response %q", strings.TrimSpace(string(response))))
+				} else {
+					c.recordCoordinatorCommand(conn, "LEAVE_GROUP", coordinatorResultSuccess)
 				}
 				cleanup()
+				c.forgetCoordinatorConnection(conn)
 				_ = conn.Close()
 				cancelRequest()
 			}
@@ -1221,6 +1283,7 @@ func (c *Consumer) Close() error {
 
 	c.commitConnMu.Lock()
 	if c.commitConn != nil {
+		c.forgetCoordinatorConnection(c.commitConn)
 		_ = c.commitConn.Close()
 		c.commitConn = nil
 	}
@@ -1258,6 +1321,7 @@ func (c *Consumer) closeActiveConnections() {
 
 	c.commitConnMu.Lock()
 	if c.commitConn != nil {
+		c.forgetCoordinatorConnection(c.commitConn)
 		_ = c.commitConn.Close()
 		c.commitConn = nil
 	}
@@ -1279,6 +1343,15 @@ func (c *Consumer) getLeaderConnContext(ctx context.Context) (net.Conn, error) {
 }
 
 func (c *Consumer) findCoordinatorContext(ctx context.Context) (string, error) {
+	return c.resolveCoordinatorContext(ctx, coordinatorReasonInitial)
+}
+
+func (c *Consumer) resolveCoordinatorContext(ctx context.Context, reason string) (string, error) {
+	started := time.Now()
+	result := coordinatorResultFailure
+	defer func() {
+		c.recordCoordinatorResolution(result, reason, time.Since(started))
+	}()
 	requestCtx, cancelRequest := boundedRequestContext(ctx, c.requestTimeout())
 	defer cancelRequest()
 	conn, _, err := c.client.ConnectWithFailoverContext(requestCtx)
@@ -1312,34 +1385,59 @@ func (c *Consumer) findCoordinatorContext(ctx context.Context) (string, error) {
 	if host == "" || port == "" {
 		return "", fmt.Errorf("find_coordinator: missing host/port in response: %s", respStr)
 	}
+	result = coordinatorResultSuccess
 	return c.coordinatorAddrFromHostPort(host, port), nil
 }
 
 func (c *Consumer) getCoordinatorConnContext(ctx context.Context) (net.Conn, error) {
-	c.mu.RLock()
-	addr := c.coordinatorAddr
-	c.mu.RUnlock()
+	addr, source, pendingReason, reconnect := c.coordinatorCacheSnapshot()
+	if reconnect {
+		source = coordinatorRouteReconnect
+	}
 
 	if addr != "" {
+		started := time.Now()
 		conn, err := c.client.ConnectContext(ctx, addr)
 		if err == nil {
-			return conn, nil
+			if reconnect {
+				c.recordCoordinatorResolution(coordinatorResultSuccess, coordinatorReasonReconnect, time.Since(started))
+			}
+			return c.trackCoordinatorConnection(conn, addr, source), nil
+		}
+		if reconnect {
+			c.recordCoordinatorResolution(coordinatorResultFailure, coordinatorReasonReconnect, time.Since(started))
 		}
 		LogWarn("Coordinator %s unreachable: %v, rediscovering", addr, err)
+		if !c.invalidateCoordinatorCacheIfCurrent(addr, coordinatorReasonReconnect) {
+			// Another command replaced this stale route while the dial was in
+			// flight. Use that newer cache instead of clearing or overwriting it.
+			return c.getCoordinatorConnContext(ctx)
+		}
+		pendingReason = coordinatorReasonReconnect
 	}
 
-	newAddr, err := c.findCoordinatorContext(ctx)
+	newAddr, err := c.resolveCoordinatorContext(ctx, pendingReason)
 	if err != nil {
-		return c.getLeaderConnContext(ctx)
+		c.recordCoordinatorCacheRefresh(coordinatorResultFailure, pendingReason)
+		conn, leaderErr := c.getLeaderConnContext(ctx)
+		if leaderErr != nil {
+			return nil, leaderErr
+		}
+		return c.trackCoordinatorConnection(conn, "", coordinatorRouteBootstrap), nil
 	}
-	c.mu.Lock()
-	c.coordinatorAddr = newAddr
-	c.mu.Unlock()
-	conn, err := c.client.ConnectContext(ctx, newAddr)
+	routeSource := coordinatorRouteCache
+	switch pendingReason {
+	case coordinatorReasonRedirect:
+		routeSource = coordinatorRouteRetry
+	case coordinatorReasonReconnect:
+		routeSource = coordinatorRouteReconnect
+	}
+	selectedAddr, selectedSource, _ := c.setCoordinatorCacheIfCurrent("", newAddr, routeSource, pendingReason)
+	conn, err := c.client.ConnectContext(ctx, selectedAddr)
 	if err != nil {
 		return nil, err
 	}
-	return conn, nil
+	return c.trackCoordinatorConnection(conn, selectedAddr, selectedSource), nil
 }
 
 func (c *Consumer) coordinatorAddrFromHostPort(host, port string) string {
@@ -1369,19 +1467,4 @@ func bootstrapAddressForAdvertisedLoopback(advertised string, bootstrap []string
 		return advertised
 	}
 	return bootstrap[0]
-}
-
-func (c *Consumer) handleNotCoordinatorError(brokerErr *BrokerError) bool {
-	if brokerErr == nil || !strings.EqualFold(brokerErr.Code, "NOT_COORDINATOR") {
-		return false
-	}
-	host, port := brokerErr.Fields["host"], brokerErr.Fields["port"]
-	if host != "" && port != "" {
-		newAddr := c.coordinatorAddrFromHostPort(host, port)
-		c.mu.Lock()
-		c.coordinatorAddr = newAddr
-		c.mu.Unlock()
-		LogInfo("Coordinator moved to %s", newAddr)
-	}
-	return true
 }

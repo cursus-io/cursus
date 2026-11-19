@@ -16,14 +16,20 @@ var (
 	producerSendErrors   *prometheus.CounterVec
 	producerBatchLatency *prometheus.HistogramVec
 
-	consumerMessagesReceived        *prometheus.CounterVec
-	consumerCommitTotal             *prometheus.CounterVec
-	consumerCommitErrors            *prometheus.CounterVec
-	consumerPollLatency             *prometheus.HistogramVec
-	consumerRebalanceTotal          *prometheus.CounterVec
-	consumerOffsetGapTotal          *prometheus.CounterVec
-	consumerCompactedOffsetsSkipped *prometheus.CounterVec
-	consumerStaleWorkers            *prometheus.CounterVec
+	consumerMessagesReceived         *prometheus.CounterVec
+	consumerCommitTotal              *prometheus.CounterVec
+	consumerCommitErrors             *prometheus.CounterVec
+	consumerPollLatency              *prometheus.HistogramVec
+	consumerRebalanceTotal           *prometheus.CounterVec
+	consumerOffsetGapTotal           *prometheus.CounterVec
+	consumerCompactedOffsetsSkipped  *prometheus.CounterVec
+	consumerStaleWorkers             *prometheus.CounterVec
+	consumerCoordinatorCommands      *prometheus.CounterVec
+	consumerCoordinatorRedirects     *prometheus.CounterVec
+	consumerCoordinatorResolution    *prometheus.CounterVec
+	consumerCoordinatorCacheRefresh  *prometheus.CounterVec
+	consumerCoordinatorRetry         *prometheus.CounterVec
+	consumerCoordinatorResolutionLag *prometheus.HistogramVec
 )
 
 func initMetrics() {
@@ -142,6 +148,67 @@ func initMetrics() {
 			[]string{"topic", "group", "worker"},
 		)
 
+		consumerCoordinatorCommands = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "coordinator_commands_total",
+				Help:      "Completed consumer coordinator command attempts by bounded command, client role, route source, and result.",
+			},
+			[]string{"command", "client_role", "route_source", "result"},
+		)
+
+		consumerCoordinatorRedirects = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "coordinator_redirects_total",
+				Help:      "NOT_COORDINATOR responses received by consumer coordinator commands.",
+			},
+			[]string{"command", "client_role", "route_source"},
+		)
+
+		consumerCoordinatorResolution = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "coordinator_resolution_total",
+				Help:      "Consumer coordinator resolution attempts by bounded result, reason, and client role.",
+			},
+			[]string{"result", "reason", "client_role"},
+		)
+
+		consumerCoordinatorCacheRefresh = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "coordinator_cache_refresh_total",
+				Help:      "Consumer coordinator cache refresh outcomes by bounded result, reason, and client role.",
+			},
+			[]string{"result", "reason", "client_role"},
+		)
+
+		consumerCoordinatorRetry = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "coordinator_retry_total",
+				Help:      "Consumer coordinator command attempts made on a route learned after NOT_COORDINATOR.",
+			},
+			[]string{"command", "result", "client_role"},
+		)
+
+		consumerCoordinatorResolutionLag = prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Namespace: "cursus",
+				Subsystem: "consumer",
+				Name:      "coordinator_resolution_duration_seconds",
+				Help:      "Time spent resolving or reconnecting a consumer coordinator.",
+				Buckets:   prometheus.DefBuckets,
+			},
+			[]string{"result", "reason", "client_role"},
+		)
+
 		metricsRegistry.MustRegister(
 			producerMessagesSent,
 			producerSendErrors,
@@ -154,6 +221,12 @@ func initMetrics() {
 			consumerOffsetGapTotal,
 			consumerCompactedOffsetsSkipped,
 			consumerStaleWorkers,
+			consumerCoordinatorCommands,
+			consumerCoordinatorRedirects,
+			consumerCoordinatorResolution,
+			consumerCoordinatorCacheRefresh,
+			consumerCoordinatorRetry,
+			consumerCoordinatorResolutionLag,
 		)
 	})
 }

@@ -309,6 +309,32 @@ func TestConsumerConfig_EnableMetrics(t *testing.T) {
 	assert.True(t, cfg.EnableMetrics)
 }
 
+func TestConsumerConfigClientRoleIsBounded(t *testing.T) {
+	cfg := NewDefaultConsumerConfig()
+	assert.Equal(t, ConsumerClientRoleConsumer, cfg.ClientRole)
+
+	for _, role := range []ConsumerClientRole{
+		ConsumerClientRoleConsumer,
+		ConsumerClientRoleCooperative,
+		ConsumerClientRoleProcessor,
+		ConsumerClientRoleSaga,
+		ConsumerClientRoleObserver,
+	} {
+		candidate := *cfg
+		candidate.ClientRole = role
+		assert.NoError(t, candidate.Validate())
+	}
+
+	invalid := *cfg
+	invalid.ClientRole = "tenant-or-random-client-id"
+	assert.ErrorContains(t, invalid.Validate(), "unsupported consumer client role")
+
+	empty := *cfg
+	empty.ClientRole = ""
+	require.NoError(t, empty.Validate())
+	assert.Equal(t, ConsumerClientRoleConsumer, empty.ClientRole)
+}
+
 func TestPublisherConfig_EnableMetrics(t *testing.T) {
 	cfg := NewDefaultPublisherConfig()
 	assert.False(t, cfg.EnableMetrics)
