@@ -1408,7 +1408,11 @@ func (c *Consumer) getCoordinatorConnContext(ctx context.Context) (net.Conn, err
 			c.recordCoordinatorResolution(coordinatorResultFailure, coordinatorReasonReconnect, time.Since(started))
 		}
 		LogWarn("Coordinator %s unreachable: %v, rediscovering", addr, err)
-		c.invalidateCoordinatorCache(coordinatorReasonReconnect)
+		if !c.invalidateCoordinatorCacheIfCurrent(addr, coordinatorReasonReconnect) {
+			// Another command replaced this stale route while the dial was in
+			// flight. Use that newer cache instead of clearing or overwriting it.
+			return c.getCoordinatorConnContext(ctx)
+		}
 		pendingReason = coordinatorReasonReconnect
 	}
 
@@ -1428,12 +1432,12 @@ func (c *Consumer) getCoordinatorConnContext(ctx context.Context) (net.Conn, err
 	case coordinatorReasonReconnect:
 		routeSource = coordinatorRouteReconnect
 	}
-	c.setCoordinatorCache(newAddr, routeSource, pendingReason)
-	conn, err := c.client.ConnectContext(ctx, newAddr)
+	selectedAddr, selectedSource, _ := c.setCoordinatorCacheIfCurrent("", newAddr, routeSource, pendingReason)
+	conn, err := c.client.ConnectContext(ctx, selectedAddr)
 	if err != nil {
 		return nil, err
 	}
-	return c.trackCoordinatorConnection(conn, newAddr, routeSource), nil
+	return c.trackCoordinatorConnection(conn, selectedAddr, selectedSource), nil
 }
 
 func (c *Consumer) coordinatorAddrFromHostPort(host, port string) string {

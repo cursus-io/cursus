@@ -147,6 +147,33 @@ func TestLateRedirectFromSupersededConnectionDoesNotRollBackCache(t *testing.T) 
 	c.mu.RUnlock()
 }
 
+func TestAddresslessLateRedirectFromSupersededConnectionPreservesCache(t *testing.T) {
+	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleConsumer)
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	oldConn := c.trackCoordinatorConnection(client, "coordinator-1:9000", coordinatorRouteCache)
+	c.setCoordinatorCache("coordinator-2:9000", coordinatorRouteRetry, coordinatorReasonRedirect)
+	require.True(t, c.handleNotCoordinatorResponse(oldConn, "HEARTBEAT", &BrokerError{Code: "NOT_COORDINATOR"}))
+
+	c.mu.RLock()
+	assert.Equal(t, "coordinator-2:9000", c.coordinatorAddr)
+	assert.Equal(t, coordinatorRouteRetry, c.coordinatorRouteSource)
+	c.mu.RUnlock()
+}
+
+func TestFailedStaleDialCannotInvalidateNewerCoordinatorCache(t *testing.T) {
+	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleConsumer)
+	c.setCoordinatorCache("coordinator-2:9000", coordinatorRouteRetry, coordinatorReasonRedirect)
+
+	assert.False(t, c.invalidateCoordinatorCacheIfCurrent("coordinator-1:9000", coordinatorReasonReconnect))
+	c.mu.RLock()
+	assert.Equal(t, "coordinator-2:9000", c.coordinatorAddr)
+	assert.Equal(t, coordinatorRouteRetry, c.coordinatorRouteSource)
+	c.mu.RUnlock()
+}
+
 func TestReconnectReusesCacheUntilDialOrBrokerProvesItStale(t *testing.T) {
 	c := newCoordinatorMetricsConsumer(t, ConsumerClientRoleCooperative)
 	c.setCoordinatorCache("coordinator-2:9000", coordinatorRouteCache, coordinatorReasonInitial)
@@ -172,7 +199,7 @@ func TestConsumerCoordinatorStateIsPerClient(t *testing.T) {
 
 	first.setCoordinatorCache("coordinator-1:9000", coordinatorRouteCache, coordinatorReasonInitial)
 	second.setCoordinatorCache("coordinator-2:9000", coordinatorRouteCache, coordinatorReasonInitial)
-	first.invalidateCoordinatorCache(coordinatorReasonRedirect)
+	assert.True(t, first.invalidateCoordinatorCacheIfCurrent("coordinator-1:9000", coordinatorReasonRedirect))
 
 	first.mu.RLock()
 	assert.Empty(t, first.coordinatorAddr)

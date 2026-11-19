@@ -208,14 +208,42 @@ func (c *Consumer) setCoordinatorCache(address, source, reason string) {
 	}
 }
 
-func (c *Consumer) invalidateCoordinatorCache(reason string) string {
+func (c *Consumer) setCoordinatorCacheIfCurrent(expected, address, source, reason string) (string, string, bool) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		c.recordCoordinatorCacheRefresh(coordinatorResultFailure, reason)
+		return "", coordinatorRouteBootstrap, false
+	}
 	c.mu.Lock()
+	if c.coordinatorAddr != expected {
+		currentAddress := c.coordinatorAddr
+		currentSource := normalizeCoordinatorRoute(c.coordinatorRouteSource)
+		c.mu.Unlock()
+		return currentAddress, currentSource, false
+	}
 	old := c.coordinatorAddr
+	c.coordinatorAddr = address
+	c.coordinatorRouteSource = normalizeCoordinatorRoute(source)
+	c.coordinatorPendingReason = ""
+	c.mu.Unlock()
+	c.recordCoordinatorCacheRefresh(coordinatorResultSuccess, reason)
+	if reason == coordinatorReasonRedirect || reason == coordinatorReasonReconnect {
+		c.logCoordinatorEvent("coordinator_cache_refresh", "", source, reason, coordinatorResultSuccess, old, address, false, 0, 0)
+	}
+	return address, normalizeCoordinatorRoute(source), true
+}
+
+func (c *Consumer) invalidateCoordinatorCacheIfCurrent(expected, reason string) bool {
+	c.mu.Lock()
+	if c.coordinatorAddr != expected {
+		c.mu.Unlock()
+		return false
+	}
 	c.coordinatorAddr = ""
 	c.coordinatorRouteSource = coordinatorRouteBootstrap
 	c.coordinatorPendingReason = normalizeCoordinatorReason(reason)
 	c.mu.Unlock()
-	return old
+	return true
 }
 
 func (c *Consumer) markCoordinatorReconnect() {
@@ -259,17 +287,26 @@ func (c *Consumer) handleNotCoordinatorResponse(conn net.Conn, command string, b
 		newAddress = c.coordinatorAddrFromHostPort(host, port)
 	}
 	sameCoordinator := newAddress != "" && newAddress == oldAddress
-	c.mu.RLock()
-	currentAddress := c.coordinatorAddr
-	c.mu.RUnlock()
-	responseFromSupersededRoute := currentAddress != "" && oldAddress != "" && currentAddress != oldAddress && newAddress == oldAddress
-	if responseFromSupersededRoute {
-		// A concurrent command has already refreshed the cache. Do not let the
-		// late response from the old connection roll it back.
-	} else if newAddress == "" || sameCoordinator {
-		c.invalidateCoordinatorCache(coordinatorReasonRedirect)
-	} else {
-		c.setCoordinatorCache(newAddress, coordinatorRouteRetry, coordinatorReasonRedirect)
+
+	cacheRefreshed := false
+	c.mu.Lock()
+	responseFromSupersededRoute := c.coordinatorAddr != "" && oldAddress != "" && c.coordinatorAddr != oldAddress
+	if !responseFromSupersededRoute {
+		if newAddress == "" || sameCoordinator {
+			c.coordinatorAddr = ""
+			c.coordinatorRouteSource = coordinatorRouteBootstrap
+			c.coordinatorPendingReason = coordinatorReasonRedirect
+		} else {
+			c.coordinatorAddr = newAddress
+			c.coordinatorRouteSource = coordinatorRouteRetry
+			c.coordinatorPendingReason = ""
+			cacheRefreshed = true
+		}
+	}
+	c.mu.Unlock()
+	if cacheRefreshed {
+		c.recordCoordinatorCacheRefresh(coordinatorResultSuccess, coordinatorReasonRedirect)
+		c.logCoordinatorEvent("coordinator_cache_refresh", "", coordinatorRouteRetry, coordinatorReasonRedirect, coordinatorResultSuccess, oldAddress, newAddress, false, 0, 0)
 	}
 	c.logCoordinatorEvent("coordinator_redirect", command, c.coordinatorRouteOf(conn), coordinatorReasonRedirect, coordinatorResultFailure, oldAddress, newAddress, sameCoordinator, 0, 0)
 	return true

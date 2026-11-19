@@ -110,6 +110,7 @@ func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 	select {
 	case <-ctx.Done():
 		if c.hbConn != nil {
+			c.forgetCoordinatorConnection(c.hbConn)
 			_ = c.hbConn.Close()
 			c.hbConn = nil
 		}
@@ -134,11 +135,13 @@ func (c *Consumer) getOrDialHeartbeatConn(ctx context.Context) net.Conn {
 	select {
 	case <-ctx.Done():
 		c.hbMu.Unlock()
+		c.forgetCoordinatorConnection(newConn)
 		_ = newConn.Close()
 		return nil
 	default:
 	}
 	if c.hbConn != nil {
+		c.forgetCoordinatorConnection(newConn)
 		_ = newConn.Close()
 		conn = c.hbConn
 	} else {
