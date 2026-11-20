@@ -104,13 +104,13 @@ func (c *Consumer) assignmentActive(generation uint64) bool {
 }
 
 func (c *Consumer) recordStaleWorker(worker string, generation uint64) {
-	if c == nil || c.config == nil || !c.config.EnableMetrics || generation == 0 {
+	if c == nil || c.config == nil || c.activeMetrics() == nil || generation == 0 {
 		return
 	}
 	if c.assignmentGeneration.Load() == generation {
 		return
 	}
-	consumerStaleWorkers.WithLabelValues(c.config.Topic, c.config.GroupID, worker).Inc()
+	c.activeMetrics().consumerStaleWorkers.WithLabelValues(c.config.Topic, c.config.GroupID, worker).Inc()
 }
 
 func (c *Consumer) assignmentContext() context.Context {

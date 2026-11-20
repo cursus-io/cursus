@@ -76,26 +76,25 @@ func (c *Consumer) coordinatorClientRole() string {
 }
 
 func (c *Consumer) coordinatorMetricsEnabled() bool {
-	return c != nil && c.config != nil && c.config.EnableMetrics
+	return c.activeMetrics() != nil
 }
 
 func (c *Consumer) recordCoordinatorResolution(result, reason string, elapsed time.Duration) {
 	if !c.coordinatorMetricsEnabled() {
 		return
 	}
-	initMetrics()
 	reason = normalizeCoordinatorReason(reason)
 	role := c.coordinatorClientRole()
-	consumerCoordinatorResolution.WithLabelValues(result, reason, role).Inc()
-	consumerCoordinatorResolutionLag.WithLabelValues(result, reason, role).Observe(elapsed.Seconds())
+	metrics := c.activeMetrics()
+	metrics.consumerCoordinatorResolution.WithLabelValues(result, reason, role).Inc()
+	metrics.consumerCoordinatorResolutionLag.WithLabelValues(result, reason, role).Observe(elapsed.Seconds())
 }
 
 func (c *Consumer) recordCoordinatorCacheRefresh(result, reason string) {
 	if !c.coordinatorMetricsEnabled() {
 		return
 	}
-	initMetrics()
-	consumerCoordinatorCacheRefresh.WithLabelValues(result, normalizeCoordinatorReason(reason), c.coordinatorClientRole()).Inc()
+	c.activeMetrics().consumerCoordinatorCacheRefresh.WithLabelValues(result, normalizeCoordinatorReason(reason), c.coordinatorClientRole()).Inc()
 }
 
 func (c *Consumer) recordCoordinatorCommand(conn net.Conn, command, result string) {
@@ -105,13 +104,13 @@ func (c *Consumer) recordCoordinatorCommand(conn net.Conn, command, result strin
 		}
 		return
 	}
-	initMetrics()
 	label := coordinatorCommandLabel(command)
 	source := c.coordinatorRouteOf(conn)
 	role := c.coordinatorClientRole()
-	consumerCoordinatorCommands.WithLabelValues(label, role, source, result).Inc()
+	metrics := c.activeMetrics()
+	metrics.consumerCoordinatorCommands.WithLabelValues(label, role, source, result).Inc()
 	if source == coordinatorRouteRetry {
-		consumerCoordinatorRetry.WithLabelValues(label, result, role).Inc()
+		metrics.consumerCoordinatorRetry.WithLabelValues(label, result, role).Inc()
 	}
 	if result == coordinatorResultSuccess {
 		c.promoteCoordinatorRoute(conn)
@@ -122,8 +121,7 @@ func (c *Consumer) recordCoordinatorRedirect(conn net.Conn, command string) {
 	if !c.coordinatorMetricsEnabled() {
 		return
 	}
-	initMetrics()
-	consumerCoordinatorRedirects.WithLabelValues(
+	c.activeMetrics().consumerCoordinatorRedirects.WithLabelValues(
 		coordinatorCommandLabel(command),
 		c.coordinatorClientRole(),
 		c.coordinatorRouteOf(conn),

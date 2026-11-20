@@ -32,6 +32,7 @@ type retryCommit struct {
 type Consumer struct {
 	config             *ConsumerConfig
 	client             *ConsumerClient
+	metrics            *Metrics
 	partitionConsumers map[int]*PartitionConsumer
 
 	generation      int64
@@ -129,8 +130,9 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if cfg.EnableMetrics {
-		initMetrics()
+	metrics := cfg.Metrics
+	if metrics == nil && cfg.EnableMetrics {
+		metrics = defaultSDKMetrics()
 	}
 
 	client, err := NewConsumerClient(cfg)
@@ -143,6 +145,7 @@ func NewConsumerWithContext(ctx context.Context, cfg *ConsumerConfig) (*Consumer
 	c := &Consumer{
 		config:                   cfg,
 		client:                   client,
+		metrics:                  metrics,
 		partitionConsumers:       make(map[int]*PartitionConsumer),
 		offsets:                  make(map[int]uint64),
 		currentOffsets:           make(map[int]uint64),

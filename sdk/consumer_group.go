@@ -314,8 +314,8 @@ func (c *Consumer) handleRebalanceSignal() {
 	}
 	defer c.finishRebalance()
 
-	if c.config.EnableMetrics {
-		consumerRebalanceTotal.WithLabelValues(c.config.Topic, c.config.GroupID).Inc()
+	if metrics := c.activeMetrics(); metrics != nil {
+		metrics.consumerRebalanceTotal.WithLabelValues(c.config.Topic, c.config.GroupID).Inc()
 	}
 
 	LogInfo("Rebalance started — stopping existing workers")

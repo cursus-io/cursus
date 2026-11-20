@@ -222,8 +222,11 @@ type ConsumerConfig struct {
 
 	CompressionType string `yaml:"compression_type" json:"compression_type"` // "none", "gzip", "snappy", "lz4"
 
-	EnableMetrics bool               `yaml:"enable_metrics" json:"enable_metrics"`
-	ClientRole    ConsumerClientRole `yaml:"client_role" json:"client_role"`
+	EnableMetrics bool `yaml:"enable_metrics" json:"enable_metrics"`
+	// Metrics selects caller-owned Prometheus collectors. A non-nil value
+	// enables metrics and takes precedence over the default SDK registry.
+	Metrics    *Metrics           `yaml:"-" json:"-"`
+	ClientRole ConsumerClientRole `yaml:"client_role" json:"client_role"`
 }
 
 func (c *ConsumerConfig) Validate() error {

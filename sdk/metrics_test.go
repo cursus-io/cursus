@@ -7,13 +7,16 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func resetMetricsState() {
 	metricsOnce = sync.Once{}
 	metricsRegistry = nil
+	defaultMetrics = nil
 	producerMessagesSent = nil
 	producerSendErrors = nil
 	producerBatchLatency = nil
@@ -31,6 +34,46 @@ func resetMetricsState() {
 	consumerCoordinatorCacheRefresh = nil
 	consumerCoordinatorRetry = nil
 	consumerCoordinatorResolutionLag = nil
+}
+
+func TestNewMetrics_ReusesCollectorsAcrossConsumers(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	first, err := NewMetrics(registry, registry)
+	require.NoError(t, err)
+	second, err := NewMetrics(registry, registry)
+	require.NoError(t, err)
+
+	first.consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
+	second.consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
+
+	families, err := registry.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != "cursus_consumer_coordinator_commands_total" {
+			continue
+		}
+		require.Len(t, family.Metric, 1)
+		require.Equal(t, float64(2), family.Metric[0].GetCounter().GetValue())
+		return
+	}
+	t.Fatal("coordinator command metric was not gathered")
+}
+
+func TestMetricsHandler_SharesApplicationRegistry(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	applicationCollector := prometheus.NewGauge(prometheus.GaugeOpts{Name: "commerce_consumer_ready"})
+	require.NoError(t, registry.Register(applicationCollector))
+	metrics, err := NewMetrics(registry, registry)
+	require.NoError(t, err)
+
+	applicationCollector.Set(1)
+	metrics.consumerMessagesReceived.WithLabelValues("orders", "workers").Inc()
+	recorder := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "commerce_consumer_ready")
+	require.Contains(t, recorder.Body.String(), "cursus_consumer_messages_received_total")
 }
 
 func TestInitMetrics_CreatesRegistry(t *testing.T) {

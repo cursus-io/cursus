@@ -209,8 +209,8 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	pollStart := time.Now()
 	cfg := pc.consumer.config
 	defer func() {
-		if cfg.EnableMetrics {
-			consumerPollLatency.WithLabelValues(cfg.Topic, cfg.GroupID).Observe(time.Since(pollStart).Seconds())
+		if metrics := pc.consumer.activeMetrics(); metrics != nil {
+			metrics.consumerPollLatency.WithLabelValues(cfg.Topic, cfg.GroupID).Observe(time.Since(pollStart).Seconds())
 		}
 	}()
 
@@ -284,8 +284,8 @@ func (pc *PartitionConsumer) pollAndProcess() {
 	atomic.StoreUint64(&pc.fetchOffset, newOffset)
 	bo.reset()
 
-	if cfg.EnableMetrics {
-		consumerMessagesReceived.WithLabelValues(cfg.Topic, cfg.GroupID).Add(float64(len(messages)))
+	if metrics := pc.consumer.activeMetrics(); metrics != nil {
+		metrics.consumerMessagesReceived.WithLabelValues(cfg.Topic, cfg.GroupID).Add(float64(len(messages)))
 	}
 
 	select {
@@ -471,8 +471,8 @@ func (pc *PartitionConsumer) startStreamLoop() {
 			atomic.StoreUint64(&pc.fetchOffset, lastOffset+1)
 			bo.reset()
 
-			if c.config.EnableMetrics {
-				consumerMessagesReceived.WithLabelValues(c.config.Topic, c.config.GroupID).Add(float64(len(messages)))
+			if metrics := c.activeMetrics(); metrics != nil {
+				metrics.consumerMessagesReceived.WithLabelValues(c.config.Topic, c.config.GroupID).Add(float64(len(messages)))
 			}
 
 			batch := &messageBatch{topic: topic, messages: messages}
@@ -501,8 +501,8 @@ func (pc *PartitionConsumer) recordOffsetAdvance(expectedOffset uint64, messages
 			return
 		}
 		LogDebug("Partition [%d] skipped %d compacted offsets from %d", pc.partitionID, skipped, expectedOffset)
-		if pc.consumer.config.EnableMetrics {
-			consumerCompactedOffsetsSkipped.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Add(float64(skipped))
+		if metrics := pc.consumer.activeMetrics(); metrics != nil {
+			metrics.consumerCompactedOffsetsSkipped.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Add(float64(skipped))
 		}
 		return
 	}
@@ -513,8 +513,8 @@ func (pc *PartitionConsumer) recordOffsetAdvance(expectedOffset uint64, messages
 	if expectedOffset > 0 && firstOffset > expectedOffset {
 		LogError("Partition [%d] offset gap: expected %d, received %d (missing %d messages)",
 			pc.partitionID, expectedOffset, firstOffset, firstOffset-expectedOffset)
-		if pc.consumer.config.EnableMetrics {
-			consumerOffsetGapTotal.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Add(float64(firstOffset - expectedOffset))
+		if metrics := pc.consumer.activeMetrics(); metrics != nil {
+			metrics.consumerOffsetGapTotal.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Add(float64(firstOffset - expectedOffset))
 		}
 	}
 }
@@ -847,15 +847,15 @@ func (pc *PartitionConsumer) commitOffsetWithRetry(offset uint64) error {
 		}()
 
 		if err == nil {
-			if pc.consumer.config.EnableMetrics {
-				consumerCommitTotal.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Inc()
+			if metrics := pc.consumer.activeMetrics(); metrics != nil {
+				metrics.consumerCommitTotal.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Inc()
 			}
 			return nil
 		}
 
 		lastErr = err
-		if pc.consumer.config.EnableMetrics {
-			consumerCommitErrors.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Inc()
+		if metrics := pc.consumer.activeMetrics(); metrics != nil {
+			metrics.consumerCommitErrors.WithLabelValues(pc.consumer.config.Topic, pc.consumer.config.GroupID).Inc()
 		}
 		LogError("Partition [%d] commit attempt %d/%d failed: %v", pc.partitionID, attempt+1, maxRetries, err)
 
