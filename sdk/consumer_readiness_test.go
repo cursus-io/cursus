@@ -45,6 +45,35 @@ func TestConsumerMembershipRequiresAssignedPartition(t *testing.T) {
 	require.False(t, consumer.Membership().Ready)
 }
 
+func TestConsumerMembershipRejectsStaleAndClosedPublications(t *testing.T) {
+	consumer := newTestConsumer(t)
+	consumer.assignmentGeneration.Store(2)
+
+	consumer.publishMembership(7, "member-7", 1, []int{0})
+	require.False(t, consumer.Membership().Ready)
+
+	consumer.publishMembership(8, "member-8", 2, []int{0})
+	require.True(t, consumer.Membership().Ready)
+	require.NoError(t, consumer.Close())
+
+	consumer.publishMembership(8, "member-8", 2, []int{0})
+	require.Equal(t, ConsumerMembership{}, consumer.Membership())
+}
+
+func TestConsumerRebalanceCannotRepublishSupersededMembership(t *testing.T) {
+	consumer := newTestConsumer(t)
+	consumer.publishMembership(7, "member-7", 1, []int{0})
+
+	next, ok := consumer.beginRebalance()
+	require.True(t, ok)
+	require.Equal(t, uint64(2), next)
+	consumer.publishMembership(7, "member-7", 1, []int{0})
+
+	require.Equal(t, ConsumerMembership{}, consumer.Membership())
+	consumer.finishRebalance()
+	require.NoError(t, consumer.Close())
+}
+
 func TestConsumerMembershipBecomesReadyOnlyAfterSyncAssignment(t *testing.T) {
 	addr, commands := startSDKCommandServer(
 		t,

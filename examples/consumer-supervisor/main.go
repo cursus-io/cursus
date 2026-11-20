@@ -44,12 +44,17 @@ func main() {
 	mux.Handle("/metrics", metrics.Handler())
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
 		consumer := active.Load()
-		if consumer == nil || !consumer.Membership().Ready {
+		if consumer == nil {
+			http.Error(w, "consumer membership is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		membership := consumer.Membership()
+		if !membership.Ready {
 			http.Error(w, "consumer membership is not ready", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(consumer.Membership())
+		_ = json.NewEncoder(w).Encode(membership)
 	})
 	server := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {

@@ -169,13 +169,42 @@ func TestConsumerBatchCommitRejectsRebalanceAndStaleGeneration(t *testing.T) {
 	require.ErrorIs(t, err, ErrConsumerStaleGeneration)
 }
 
+func TestConsumerBatchLateBrokerFailurePreservesReplacementMembership(t *testing.T) {
+	consumer, pc := newManualBatchTestConsumer(t, "")
+	batch := consumer.makeConsumerBatch(pc, []Message{{Offset: 5}})
+
+	nextAssignment, ok := consumer.beginRebalance()
+	require.True(t, ok)
+	consumer.finishRebalance()
+	consumer.generation = 8
+	consumer.memberID = "member-8"
+	consumer.partitionConsumers[0] = &PartitionConsumer{
+		partitionID:          0,
+		consumer:             consumer,
+		assignmentGeneration: nextAssignment,
+	}
+	consumer.publishMembership(8, "member-8", nextAssignment, []int{0})
+
+	err := consumer.classifyBatchCommitError(batch, &BrokerError{Code: "GEN_MISMATCH"})
+	require.ErrorIs(t, err, ErrConsumerStaleGeneration)
+	require.Equal(t, ConsumerMembership{
+		Ready:                true,
+		Generation:           8,
+		AssignmentGeneration: nextAssignment,
+		MemberID:             "member-8",
+		Partitions:           []int{0},
+	}, consumer.Membership())
+}
+
 func TestConsumerBatchHandlerIsSerialPerPartition(t *testing.T) {
 	consumer, pc := newManualBatchTestConsumer(t, "")
 	var active atomic.Int32
 	var maximum atomic.Int32
 	consumer.batchHandler = func(context.Context, ConsumerBatch) error {
 		current := active.Add(1)
-		for current > maximum.Load() && !maximum.CompareAndSwap(maximum.Load(), current) {
+		observed := maximum.Load()
+		for current > observed && !maximum.CompareAndSwap(observed, current) {
+			observed = maximum.Load()
 		}
 		time.Sleep(10 * time.Millisecond)
 		active.Add(-1)

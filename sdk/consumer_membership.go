@@ -26,13 +26,22 @@ func (c *Consumer) Membership() ConsumerMembership {
 }
 
 func (c *Consumer) publishMembership(generation int64, memberID string, assignmentGeneration uint64, partitions []int) {
-	if c == nil || generation <= 0 || memberID == "" || assignmentGeneration == 0 || len(partitions) == 0 {
-		c.clearMembership()
+	if c == nil {
 		return
 	}
 	assigned := append([]int(nil), partitions...)
 	sort.Ints(assigned)
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
 	c.membershipMu.Lock()
+	defer c.membershipMu.Unlock()
+	if c.State() != ConsumerStateRunning || c.assignmentGeneration.Load() != assignmentGeneration {
+		return
+	}
+	if generation <= 0 || memberID == "" || assignmentGeneration == 0 || len(assigned) == 0 {
+		c.membership = ConsumerMembership{}
+		return
+	}
 	c.membership = ConsumerMembership{
 		Ready:                true,
 		Generation:           generation,
@@ -40,7 +49,6 @@ func (c *Consumer) publishMembership(generation int64, memberID string, assignme
 		MemberID:             memberID,
 		Partitions:           assigned,
 	}
-	c.membershipMu.Unlock()
 }
 
 func (c *Consumer) clearMembership() {
@@ -50,4 +58,18 @@ func (c *Consumer) clearMembership() {
 	c.membershipMu.Lock()
 	c.membership = ConsumerMembership{}
 	c.membershipMu.Unlock()
+}
+
+func (c *Consumer) clearMembershipIfCurrent(generation int64, memberID string, assignmentGeneration uint64) {
+	if c == nil {
+		return
+	}
+	c.membershipMu.Lock()
+	defer c.membershipMu.Unlock()
+	current := c.membership
+	if current.Generation != generation || current.MemberID != memberID ||
+		current.AssignmentGeneration != assignmentGeneration {
+		return
+	}
+	c.membership = ConsumerMembership{}
 }

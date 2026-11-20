@@ -363,6 +363,8 @@ func (c *Consumer) startCommitWorker() {
 
 		for {
 			select {
+			case <-c.rootCtx.Done():
+				return
 			case entry, ok := <-c.commitCh:
 				if !ok {
 					flush()
@@ -1269,7 +1271,6 @@ func (c *Consumer) CloseContext(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("consumer close context must not be nil")
 	}
-	c.clearMembership()
 	c.lifecycleMu.Lock()
 	state := c.State()
 	if state == ConsumerStateClosing || state == ConsumerStateClosed {
@@ -1285,13 +1286,18 @@ func (c *Consumer) CloseContext(ctx context.Context) error {
 		}
 	}
 	c.state.Store(uint32(ConsumerStateClosing))
+	c.membershipMu.Lock()
+	c.membership = ConsumerMembership{}
+	c.membershipMu.Unlock()
 	c.lifecycleMu.Unlock()
 
 	c.rootCancel()
 	c.cancelAssignment()
 	c.closeActiveConnections()
 	var closeErr error
+	assignmentWorkersStopped := true
 	if err := waitGroupContext(ctx, &c.wg); err != nil {
+		assignmentWorkersStopped = false
 		closeErr = errors.Join(closeErr, fmt.Errorf("wait for consumer assignment workers: %w", err))
 	}
 	if c.config.EnableAutoCommit && ctx.Err() == nil && !c.flushAutoCommitOffsetsContext(ctx, true) {
@@ -1303,7 +1309,6 @@ func (c *Consumer) CloseContext(ctx context.Context) error {
 		}
 	}
 
-	close(c.commitCh)
 	if ctx.Err() == nil {
 		if err := waitGroupContext(ctx, &c.commitWg); err != nil {
 			closeErr = errors.Join(closeErr, fmt.Errorf("wait for consumer commit worker: %w", err))
@@ -1336,7 +1341,11 @@ func (c *Consumer) CloseContext(ctx context.Context) error {
 
 	c.mu.Lock()
 	for _, pc := range c.partitionConsumers {
-		pc.close()
+		if assignmentWorkersStopped {
+			pc.close()
+		} else {
+			pc.closeConnection()
+		}
 	}
 	c.partitionConsumers = make(map[int]*PartitionConsumer)
 	c.mu.Unlock()

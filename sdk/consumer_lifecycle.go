@@ -58,13 +58,14 @@ func (c *Consumer) fail(err error) {
 		c.failureErr = err
 	}
 	c.failureMu.Unlock()
-	c.clearMembership()
-
 	c.lifecycleMu.Lock()
 	state := c.State()
 	if state != ConsumerStateClosing && state != ConsumerStateClosed {
 		c.state.Store(uint32(ConsumerStateFailed))
 	}
+	c.membershipMu.Lock()
+	c.membership = ConsumerMembership{}
+	c.membershipMu.Unlock()
 	c.lifecycleMu.Unlock()
 
 	c.rootCancel()
@@ -83,14 +84,17 @@ func (c *Consumer) beginStart() error {
 }
 
 func (c *Consumer) beginRebalance() (uint64, bool) {
-	c.clearMembership()
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 	if c.State() != ConsumerStateRunning {
 		return 0, false
 	}
 	c.state.Store(uint32(ConsumerStateRebalancing))
-	return c.assignmentGeneration.Add(1), true
+	generation := c.assignmentGeneration.Add(1)
+	c.membershipMu.Lock()
+	c.membership = ConsumerMembership{}
+	c.membershipMu.Unlock()
+	return generation, true
 }
 
 func (c *Consumer) finishRebalance() {

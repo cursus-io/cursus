@@ -109,7 +109,7 @@ func (c *Consumer) classifyBatchCommitError(batch ConsumerBatch, err error) erro
 	if errors.As(err, &brokerErr) {
 		switch strings.ToUpper(brokerErr.Code) {
 		case "GEN_MISMATCH", "NOT_OWNER", "REBALANCE_REQUIRED", "MEMBER_NOT_FOUND":
-			c.clearMembership()
+			c.clearMembershipIfCurrent(batch.Generation, batch.memberID, batch.AssignmentGeneration)
 			return errors.Join(ErrConsumerStaleGeneration, brokerErr)
 		}
 	}

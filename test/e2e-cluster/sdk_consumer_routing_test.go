@@ -107,6 +107,11 @@ func runSDKConsumerRoutingScenario(
 
 	consumer, err := sdk.NewConsumer(cfg)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = consumer.CloseContext(closeCtx)
+	})
 	started := make(chan error, 1)
 	go func() { started <- consumer.Start(func(sdk.Message) error { return nil }) }()
 
