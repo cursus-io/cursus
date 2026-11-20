@@ -139,7 +139,12 @@ still waiting for its configured acknowledgement.
 
 ## Go Consumer Handler Contract
 
-`Consumer.Start` requires a non-nil message handler in polling and streaming modes. It returns `sdk.ErrConsumerHandlerRequired` and closes the consumer before coordinator discovery, group membership, or broker I/O when the handler is missing. A partition advances or automatically commits its next offset only after the handler successfully processes every preceding record in that batch. Disable `EnableAutoCommit` and call `CommitOffset` after the application's durable side effect when processing and offset acknowledgement must share an application-controlled boundary.
+`Consumer.Start` requires a non-nil message handler in polling and streaming modes. It returns `sdk.ErrConsumerHandlerRequired` and closes the consumer before coordinator discovery, group membership, or broker I/O when the handler is missing. A partition advances or automatically commits its next offset only after the handler successfully processes every preceding record in that batch. Existing applications may disable `EnableAutoCommit` and call `CommitOffset` after a durable side effect. New ordered-batch integrations should use `StartBatch` and `CommitBatch`, which fence commits by membership and assignment generation.
+
+Caller-owned Prometheus registries, membership readiness, fail-closed catalog
+validation, manual batch commits, bounded shutdown, and the one-shot supervisor
+pattern are documented in
+[Go SDK consumer integration contracts](sdk-consumer-integration.md).
 
 ## Cluster Consumer Routing
 

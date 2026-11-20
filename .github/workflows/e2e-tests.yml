@@ -638,6 +638,10 @@ jobs:
         run: |
           go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestConsumerLifecycleMetricsAcrossThreeBrokerCluster$' -count=1
 
+      - name: Run SDK consumer coordinator routing E2E
+        run: |
+          go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestSDKConsumerCoordinatorRoutingAcrossThreeBrokerCluster$' -count=1
+
       - name: Run durable group coordinator failover E2E
         env:
           RUN_E2E_GROUP_COORDINATOR_FAILOVER: "1"

@@ -43,8 +43,21 @@ func TestNewMetrics_ReusesCollectorsAcrossConsumers(t *testing.T) {
 	second, err := NewMetrics(registry, registry)
 	require.NoError(t, err)
 
-	first.consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
-	second.consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
+	firstConfig := NewDefaultConsumerConfig()
+	firstConfig.Metrics = first
+	firstConsumer, err := NewConsumer(firstConfig)
+	require.NoError(t, err)
+	secondConfig := NewDefaultConsumerConfig()
+	secondConfig.Metrics = second
+	secondConsumer, err := NewConsumer(secondConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = firstConsumer.Close()
+		_ = secondConsumer.Close()
+	})
+
+	firstConsumer.activeMetrics().consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
+	secondConsumer.activeMetrics().consumerCoordinatorCommands.WithLabelValues("heartbeat", "consumer", "cache", "success").Inc()
 
 	families, err := registry.Gather()
 	require.NoError(t, err)

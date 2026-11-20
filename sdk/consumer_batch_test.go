@@ -93,6 +93,36 @@ func TestConsumerBatchHandlerFailureDoesNotCommit(t *testing.T) {
 	require.Equal(t, uint64(0), atomic.LoadUint64(&pc.fetchOffset))
 }
 
+func TestConsumerBatchFailureIsRedeliveredToReplacementConsumer(t *testing.T) {
+	const failedOffset = uint64(4)
+	deliveries := 0
+
+	first, firstPartition := newManualBatchTestConsumer(t, "")
+	first.batchHandler = func(context.Context, ConsumerBatch) error {
+		deliveries++
+		return errors.New("database transaction rolled back")
+	}
+	firstPartition.dataCh <- &messageBatch{messages: []Message{{Offset: failedOffset, Payload: "retry"}}}
+	close(firstPartition.dataCh)
+	runManualBatchWorker(t, first, firstPartition)
+	require.Equal(t, uint64(0), first.offsets[0])
+
+	addr, commands := startSDKCommandServer(t, "OK committed=true")
+	replacement, replacementPartition := newManualBatchTestConsumer(t, addr)
+	replacement.batchHandler = func(ctx context.Context, batch ConsumerBatch) error {
+		deliveries++
+		require.Equal(t, failedOffset, batch.Messages[0].Offset)
+		return replacement.CommitBatch(ctx, batch)
+	}
+	replacementPartition.dataCh <- &messageBatch{messages: []Message{{Offset: failedOffset, Payload: "retry"}}}
+	close(replacementPartition.dataCh)
+	runManualBatchWorker(t, replacement, replacementPartition)
+
+	require.Equal(t, 2, deliveries)
+	require.Equal(t, uint64(5), replacement.offsets[0])
+	require.Equal(t, "COMMIT_OFFSET topic=default-topic partition=0 group=default-group offset=5 generation=7 member=member-7", requireSDKCommand(t, commands))
+}
+
 func TestConsumerBatchCancellationDoesNotCommit(t *testing.T) {
 	consumer, pc := newManualBatchTestConsumer(t, "")
 	started := make(chan struct{})
