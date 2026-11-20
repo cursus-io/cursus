@@ -100,11 +100,35 @@ func (pc *PartitionConsumer) runWorker() {
 			pc.consumer.mu.RUnlock()
 			atomic.StoreUint64(&pc.fetchOffset, committed)
 			LogWarn("Partition [%d] worker stopping: context cancelled, rolled back to offset %d", pc.partitionID, committed)
+			completeMessageBatch(batch)
 			continue
 		default:
 		}
 
 		if len(batch.messages) == 0 {
+			completeMessageBatch(batch)
+			continue
+		}
+
+		if handler := pc.consumer.batchHandler; handler != nil {
+			consumerBatch := pc.consumer.makeConsumerBatch(pc, batch.messages)
+			err := handler(pc.workerContext(), consumerBatch)
+			completeMessageBatch(batch)
+			if err != nil {
+				pc.rollbackFetchOffset()
+				pc.closeConnection()
+				if pc.workerContext().Err() == nil {
+					pc.consumer.fail(&ConsumerBatchHandlerError{
+						Partition:  consumerBatch.Partition,
+						NextOffset: consumerBatch.NextOffset,
+						Cause:      err,
+					})
+				}
+				return
+			}
+			if !pc.assignmentActive() || pc.workerContext().Err() != nil {
+				pc.rollbackFetchOffset()
+			}
 			continue
 		}
 
@@ -143,15 +167,17 @@ func (pc *PartitionConsumer) runWorker() {
 		lastOffset := batch.messages[len(batch.messages)-1].Offset
 		commitOffset := lastOffset + 1
 		if !pc.consumer.config.EnableAutoCommit {
-			if batch.done != nil {
-				close(batch.done)
-			}
+			completeMessageBatch(batch)
 			continue
 		}
 		pc.consumer.recordAutoCommitOffset(pc.partitionID, commitOffset, pc.assignmentToken())
-		if batch.done != nil {
-			close(batch.done)
-		}
+		completeMessageBatch(batch)
+	}
+}
+
+func completeMessageBatch(batch *messageBatch) {
+	if batch != nil && batch.done != nil {
+		close(batch.done)
 	}
 }
 
@@ -792,6 +818,7 @@ func (pc *PartitionConsumer) handleBrokerError(err error) bool {
 
 	switch strings.ToUpper(brokerErr.Code) {
 	case "GEN_MISMATCH", "REBALANCE_REQUIRED", "NOT_OWNER", "MEMBER_NOT_FOUND":
+		pc.consumer.clearMembership()
 		pc.close()
 		select {
 		case pc.consumer.rebalanceSig <- struct{}{}:

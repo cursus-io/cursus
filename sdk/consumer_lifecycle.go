@@ -58,6 +58,7 @@ func (c *Consumer) fail(err error) {
 		c.failureErr = err
 	}
 	c.failureMu.Unlock()
+	c.clearMembership()
 
 	c.lifecycleMu.Lock()
 	state := c.State()
@@ -82,6 +83,7 @@ func (c *Consumer) beginStart() error {
 }
 
 func (c *Consumer) beginRebalance() (uint64, bool) {
+	c.clearMembership()
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 	if c.State() != ConsumerStateRunning {

@@ -225,8 +225,11 @@ type ConsumerConfig struct {
 	EnableMetrics bool `yaml:"enable_metrics" json:"enable_metrics"`
 	// Metrics selects caller-owned Prometheus collectors. A non-nil value
 	// enables metrics and takes precedence over the default SDK registry.
-	Metrics    *Metrics           `yaml:"-" json:"-"`
-	ClientRole ConsumerClientRole `yaml:"client_role" json:"client_role"`
+	Metrics *Metrics `yaml:"-" json:"-"`
+	// RequireExistingCatalog rejects a missing topic or durable consumer group
+	// before JOIN_GROUP can take the broker's first-member registration path.
+	RequireExistingCatalog bool               `yaml:"require_existing_catalog" json:"require_existing_catalog"`
+	ClientRole             ConsumerClientRole `yaml:"client_role" json:"client_role"`
 }
 
 func (c *ConsumerConfig) Validate() error {
