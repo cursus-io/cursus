@@ -58,12 +58,14 @@ func (c *Consumer) fail(err error) {
 		c.failureErr = err
 	}
 	c.failureMu.Unlock()
-
 	c.lifecycleMu.Lock()
 	state := c.State()
 	if state != ConsumerStateClosing && state != ConsumerStateClosed {
 		c.state.Store(uint32(ConsumerStateFailed))
 	}
+	c.membershipMu.Lock()
+	c.membership = ConsumerMembership{}
+	c.membershipMu.Unlock()
 	c.lifecycleMu.Unlock()
 
 	c.rootCancel()
@@ -88,7 +90,11 @@ func (c *Consumer) beginRebalance() (uint64, bool) {
 		return 0, false
 	}
 	c.state.Store(uint32(ConsumerStateRebalancing))
-	return c.assignmentGeneration.Add(1), true
+	generation := c.assignmentGeneration.Add(1)
+	c.membershipMu.Lock()
+	c.membership = ConsumerMembership{}
+	c.membershipMu.Unlock()
+	return generation, true
 }
 
 func (c *Consumer) finishRebalance() {
@@ -104,13 +110,13 @@ func (c *Consumer) assignmentActive(generation uint64) bool {
 }
 
 func (c *Consumer) recordStaleWorker(worker string, generation uint64) {
-	if c == nil || c.config == nil || !c.config.EnableMetrics || generation == 0 {
+	if c == nil || c.config == nil || c.activeMetrics() == nil || generation == 0 {
 		return
 	}
 	if c.assignmentGeneration.Load() == generation {
 		return
 	}
-	consumerStaleWorkers.WithLabelValues(c.config.Topic, c.config.GroupID, worker).Inc()
+	c.activeMetrics().consumerStaleWorkers.WithLabelValues(c.config.Topic, c.config.GroupID, worker).Inc()
 }
 
 func (c *Consumer) assignmentContext() context.Context {

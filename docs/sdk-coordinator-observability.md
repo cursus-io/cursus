@@ -13,9 +13,10 @@ The legacy consumer uses the coordinator route for `JOIN_GROUP`, `SYNC_GROUP`,
 `LEAVE_GROUP`. Heartbeat and batched commit each reuse their own connection;
 the remaining legacy paths normally open a bounded request connection. The
 cooperative consumer also keeps separate membership and operation connections.
-`GROUP_STATUS` is not emitted by the production Go consumer. It appears in
-broker-facing integration fixtures, so a broker-side `GROUP_STATUS`
-`NOT_COORDINATOR` series cannot by itself be attributed to this SDK.
+`GROUP_STATUS` is emitted only when a Go consumer opts into
+`RequireExistingCatalog`. It is not part of the default startup path. A
+broker-side `GROUP_STATUS` `NOT_COORDINATOR` series can therefore come from an
+opted-in Go consumer, another application, or a broker-facing fixture.
 
 Before this change, `NOT_COORDINATOR` with `host` and `port` overwrote
 `Consumer.coordinatorAddr`, including when the returned address was identical
@@ -94,10 +95,10 @@ data volume.
 
 ## Metrics
 
-All metrics use the SDK-owned Prometheus registry returned by `MetricsHandler`.
-Prometheus target labels such as `job`, `service`, `namespace`, and `pod`
-identify the application deployment and are intentionally not duplicated as
-SDK labels.
+Metrics may use either the default SDK registry returned by `MetricsHandler`
+or a caller-owned registry supplied through `NewMetrics`. Prometheus target
+labels such as `job`, `service`, `namespace`, and `pod` identify the
+application deployment and are intentionally not duplicated as SDK labels.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -236,12 +237,13 @@ routing.
 
 The previously observed aggregate of about 4 redirects/s cannot be classified
 as normal initial discovery from the broker counter alone. Successful Go SDK
-startup resolves before its first group command, and the production Go SDK does
-not send `GROUP_STATUS`. A sustained warm-state rate across `FETCH_OFFSET`,
-`GROUP_STATUS`, and `HEARTBEAT` therefore points to multiple applications, an
-older/custom client, a pinned stale address, or an advertised address that
-load-balances back to non-coordinators. The new SDK metrics can prove or exclude
-this Go process by `job`/`service`, `client_role`, command, and route source.
+startup resolves before its first group command; `GROUP_STATUS` additionally
+requires `RequireExistingCatalog`. A sustained warm-state rate across
+`FETCH_OFFSET`, `GROUP_STATUS`, and `HEARTBEAT` therefore points to opted-in or
+multiple applications, an older/custom client, a pinned stale address, or an
+advertised address that load-balances back to non-coordinators. SDK metrics can
+prove or exclude this Go process by `job`/`service`, `client_role`, command, and
+route source.
 
 Rate-limited key/value logs supplement metrics with `event`, `command`,
 `client_role`, `route_source`, `reason`, `result`, `group`, `topic`, `member`,

@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -155,5 +156,106 @@ func TestConsumerCloseIsIdempotentAndWaitsForShutdown(t *testing.T) {
 	}
 	if consumer.State() != ConsumerStateClosed {
 		t.Fatalf("expected closed state after Done, got %s", consumer.State())
+	}
+}
+
+func TestConsumerCloseContextReturnsAtDeadline(t *testing.T) {
+	consumer, err := NewConsumer(NewDefaultConsumerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	consumer.lifecycleWg.Add(1)
+	go func() {
+		defer consumer.lifecycleWg.Done()
+		<-release
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err = consumer.CloseContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected close deadline, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("CloseContext exceeded bounded shutdown: %v", elapsed)
+	}
+	if consumer.State() != ConsumerStateClosed {
+		t.Fatalf("expected closed state, got %s", consumer.State())
+	}
+	select {
+	case <-consumer.Done():
+	default:
+		t.Fatal("Done remained open after bounded shutdown")
+	}
+	close(release)
+}
+
+func TestConsumerCloseDeadlineDoesNotCloseWorkerOwnedChannels(t *testing.T) {
+	consumer, err := NewConsumer(NewDefaultConsumerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.state.Store(uint32(ConsumerStateRunning))
+	consumer.assignmentGeneration.Store(1)
+	pc := &PartitionConsumer{
+		partitionID:          0,
+		consumer:             consumer,
+		assignmentGeneration: 1,
+		ctx:                  consumer.assignmentContext(),
+		dataCh:               make(chan *messageBatch, 1),
+	}
+	consumer.partitionConsumers[0] = pc
+
+	release := make(chan struct{})
+	consumer.wg.Add(1)
+	go func() {
+		defer consumer.wg.Done()
+		<-release
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err = consumer.CloseContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected close deadline, got %v", err)
+	}
+
+	pc.dataCh <- &messageBatch{messages: []Message{{Offset: 1}}}
+	consumer.commitCh <- commitEntry{partition: 0, offset: 2, assignmentGeneration: 1}
+	close(release)
+	if err := waitGroupContext(context.Background(), &consumer.wg); err != nil {
+		t.Fatal(err)
+	}
+	pc.closeDataCh()
+}
+
+func TestConsumerCloseContextStopsCooperativeWorkers(t *testing.T) {
+	consumer, err := NewConsumer(NewDefaultConsumerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.wg.Add(1)
+	go func() {
+		defer consumer.wg.Done()
+		<-consumer.rootCtx.Done()
+	}()
+	consumer.lifecycleWg.Add(1)
+	go func() {
+		defer consumer.lifecycleWg.Done()
+		<-consumer.rootCtx.Done()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := consumer.CloseContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitGroupContext(context.Background(), &consumer.wg); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitGroupContext(context.Background(), &consumer.lifecycleWg); err != nil {
+		t.Fatal(err)
 	}
 }

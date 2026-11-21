@@ -2,8 +2,7 @@
 
 Measured on 2026-10-23 against the broker-time implementation, based on official
 main `a49138e7922aa66b14cb4482a8b084e5b9c1b8cd`. The comparison and contract are
-in [design](../durable-retention-time-design.md) and
-[operations](../durable-retention-time-operations.md).
+documented in [durable retention operations](../durable-retention-time-operations.md).
 
 ## Baseline versus durable time
 

@@ -10,16 +10,67 @@ import (
 )
 
 var (
-	ErrProducerClosed          = errors.New("producer closed")
-	ErrProducerOutcomeUnknown  = errors.New("producer delivery outcome unknown")
-	ErrRequestOutcomeUnknown   = errors.New("request outcome unknown")
-	ErrConsumerClosed          = errors.New("consumer closed")
-	ErrConsumerRebalancing     = errors.New("consumer assignment is rebalancing")
-	ErrConsumerHandlerRequired = errors.New("consumer message handler is required")
-	ErrTopicNotFound           = errors.New("topic not found")
-	ErrInvalidPartition        = errors.New("invalid partition")
-	ErrNotLeader               = errors.New("not leader")
+	ErrProducerClosed               = errors.New("producer closed")
+	ErrProducerOutcomeUnknown       = errors.New("producer delivery outcome unknown")
+	ErrRequestOutcomeUnknown        = errors.New("request outcome unknown")
+	ErrConsumerClosed               = errors.New("consumer closed")
+	ErrConsumerRebalancing          = errors.New("consumer assignment is rebalancing")
+	ErrConsumerHandlerRequired      = errors.New("consumer message handler is required")
+	ErrConsumerManualCommitRequired = errors.New("consumer batch mode requires auto commit to be disabled")
+	ErrConsumerStaleGeneration      = errors.New("consumer batch generation is stale")
+	ErrConsumerGroupNotFound        = errors.New("consumer group not found")
+	ErrConsumerCatalogMismatch      = errors.New("consumer group catalog does not include configured topic")
+	ErrTopicNotFound                = errors.New("topic not found")
+	ErrInvalidPartition             = errors.New("invalid partition")
+	ErrNotLeader                    = errors.New("not leader")
 )
+
+// ConsumerCommitError reports a manual batch commit rejected before or by the
+// broker. Cause matches a stable sentinel through errors.Is.
+type ConsumerCommitError struct {
+	Partition         int
+	NextOffset        uint64
+	BatchGeneration   int64
+	CurrentGeneration int64
+	Cause             error
+}
+
+func (e *ConsumerCommitError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("consumer batch commit failed for partition %d next offset %d (batch generation=%d current generation=%d): %v",
+		e.Partition, e.NextOffset, e.BatchGeneration, e.CurrentGeneration, e.Cause)
+}
+
+func (e *ConsumerCommitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// ConsumerBatchHandlerError reports a batch handler failure. The batch next
+// offset remains uncommitted.
+type ConsumerBatchHandlerError struct {
+	Partition  int
+	NextOffset uint64
+	Cause      error
+}
+
+func (e *ConsumerBatchHandlerError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("consumer batch handler failed for partition %d next offset %d: %v", e.Partition, e.NextOffset, e.Cause)
+}
+
+func (e *ConsumerBatchHandlerError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
 
 // RequestOutcomeUnknownError means a mutating request was fully written but
 // its response could not be read. Callers must reconcile server state before
@@ -155,6 +206,14 @@ func (e *BrokerError) Is(target error) bool {
 		return strings.EqualFold(e.Code, "invalid_partition") || strings.EqualFold(e.Code, "partition_not_found") || strings.EqualFold(e.Code, "PARTITION_NOT_FOUND")
 	case ErrNotLeader:
 		return e.Code == "NOT_LEADER"
+	case ErrConsumerGroupNotFound:
+		reason := strings.ToLower(e.Message)
+		if e.Fields != nil {
+			reason += " " + strings.ToLower(e.Fields["reason"])
+		}
+		reason = strings.ReplaceAll(reason, "_", " ")
+		return strings.EqualFold(e.Code, "group_not_found") ||
+			(strings.EqualFold(e.Code, "group_status_failed") && strings.Contains(reason, "not found"))
 	default:
 		return false
 	}

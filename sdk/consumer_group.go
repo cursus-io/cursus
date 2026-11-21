@@ -68,6 +68,7 @@ func (c *Consumer) heartbeatLoop(ctx context.Context, assignmentGeneration uint6
 					switch strings.ToUpper(brokerErr.Code) {
 					case "REBALANCE_REQUIRED", "GEN_MISMATCH", "NOT_OWNER", "MEMBER_NOT_FOUND":
 						LogWarn("Heartbeat: rebalance triggered: %v", brokerErr)
+						c.clearMembership()
 						select {
 						case c.rebalanceSig <- struct{}{}:
 						default:
@@ -314,8 +315,8 @@ func (c *Consumer) handleRebalanceSignal() {
 	}
 	defer c.finishRebalance()
 
-	if c.config.EnableMetrics {
-		consumerRebalanceTotal.WithLabelValues(c.config.Topic, c.config.GroupID).Inc()
+	if metrics := c.activeMetrics(); metrics != nil {
+		metrics.consumerRebalanceTotal.WithLabelValues(c.config.Topic, c.config.GroupID).Inc()
 	}
 
 	LogInfo("Rebalance started — stopping existing workers")
@@ -349,19 +350,17 @@ func (c *Consumer) handleRebalanceSignal() {
 		c.setCoordinatorCache(coordAddr, coordinatorRouteCache, coordinatorReasonInitial)
 	}
 
-	gen, mid, assignments, err := c.joinGroupWithRetry()
+	gen, mid, _, err := c.joinGroupWithRetry()
 	if err != nil {
 		LogError("Rebalance join failed: %v", err)
 		c.scheduleRebalanceRetry()
 		return
 	}
-	if len(assignments) == 0 {
-		assignments, err = c.syncGroup(gen, mid)
-		if err != nil {
-			LogError("Rebalance sync failed: %v", err)
-			c.scheduleRebalanceRetry()
-			return
-		}
+	assignments, err := c.syncGroup(gen, mid)
+	if err != nil {
+		LogError("Rebalance sync failed: %v", err)
+		c.scheduleRebalanceRetry()
+		return
 	}
 
 	offsetMap := make(map[int]uint64, len(assignments))
@@ -400,6 +399,7 @@ func (c *Consumer) handleRebalanceSignal() {
 	}
 
 	c.finishRebalance()
+	c.publishMembership(gen, mid, assignmentGeneration, assignments)
 	c.startAssignmentWorkers(assignmentCtx, assignmentGeneration)
 
 	LogInfo("Rebalance completed — consuming %d partitions", len(assignments))
