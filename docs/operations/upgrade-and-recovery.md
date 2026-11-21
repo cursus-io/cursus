@@ -233,9 +233,9 @@ uses fixed remote history and the latest owned commits under a global replay
 gate. Record actual transfer bytes, scan/hash work and elapsed time alongside
 request counts when diagnosing slow recovery.
 
-See the [recovery design](../replica-recovery-design.md) for proof bounds,
-checkpoint invalidation, recovery budgets and regression coverage, and
-[bootstrap storage](../../pkg/disk/BOOTSTRAP.md) for durable installation guarantees.
+Recovery proof and checkpoint failures fail closed without rewriting
+acknowledged log data. See [bootstrap storage](../../pkg/disk/BOOTSTRAP.md) for
+durable installation guarantees.
 
 The same-epoch restart regression commits a replacement on the two surviving
 brokers before restarting a divergent follower, then checks exact raw-record

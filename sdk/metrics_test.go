@@ -74,7 +74,7 @@ func TestNewMetrics_ReusesCollectorsAcrossConsumers(t *testing.T) {
 
 func TestMetricsHandler_SharesApplicationRegistry(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	applicationCollector := prometheus.NewGauge(prometheus.GaugeOpts{Name: "commerce_consumer_ready"})
+	applicationCollector := prometheus.NewGauge(prometheus.GaugeOpts{Name: "application_consumer_ready"})
 	require.NoError(t, registry.Register(applicationCollector))
 	metrics, err := NewMetrics(registry, registry)
 	require.NoError(t, err)
@@ -85,7 +85,7 @@ func TestMetricsHandler_SharesApplicationRegistry(t *testing.T) {
 	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	require.Contains(t, recorder.Body.String(), "commerce_consumer_ready")
+	require.Contains(t, recorder.Body.String(), "application_consumer_ready")
 	require.Contains(t, recorder.Body.String(), "cursus_consumer_messages_received_total")
 }
 

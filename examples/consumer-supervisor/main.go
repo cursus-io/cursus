@@ -22,7 +22,7 @@ func main() {
 
 	registry := prometheus.NewRegistry()
 	applicationBatches := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "commerce_consumer_batches_total",
+		Name: "application_consumer_batches_total",
 		Help: "Application batches durably processed before offset commit.",
 	})
 	registry.MustRegister(applicationBatches)
@@ -33,8 +33,8 @@ func main() {
 	}
 
 	base := sdk.NewDefaultConsumerConfig()
-	base.Topic = "commerce-events"
-	base.GroupID = "commerce-projection"
+	base.Topic = "events"
+	base.GroupID = "projection"
 	base.EnableAutoCommit = false
 	base.RequireExistingCatalog = true
 	base.Metrics = metrics

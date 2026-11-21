@@ -7,8 +7,7 @@ process supervision remain application responsibilities.
 
 The implementation preserves Wire v2 commands, broker behavior, coordinator
 cache and rediscovery behavior, and the existing retry and request-deadline
-budgets. The design and Kafka comparison are recorded in
-[SDK consumer integration contracts](design/2026-11-21-sdk-consumer-integration-contracts.md).
+budgets.
 
 ## Public API
 
