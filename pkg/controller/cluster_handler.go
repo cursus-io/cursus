@@ -943,6 +943,9 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Cont
 	if p.NextOffset() < metadata.CommittedHWM || p.GetHWM() > metadata.CommittedHWM {
 		return fail(fmt.Errorf("partition is behind authoritative committed HWM: leo=%d hwm=%d committed=%d", p.NextOffset(), p.GetHWM(), metadata.CommittedHWM))
 	}
+	// This preparation runs for every leader append, not only when leadership
+	// changes. A steady partition follows the configured ACK sync policy; any
+	// truncation or HWM reconciliation remains an explicit recovery sync point.
 	recoveryFlushRequired := p.NextOffset() != metadata.CommittedHWM || p.GetHWM() != metadata.CommittedHWM
 	if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
 		return fail(fmt.Errorf("partition is not ready for leadership: %w", err))

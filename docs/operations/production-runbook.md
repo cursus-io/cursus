@@ -113,6 +113,17 @@ recovery, stop all members and obtain one consistent immutable backup generation
 of every broker volume and Raft state. Validate writable clones in an isolated
 three-member cluster first.
 
+When `flush_sync_on_ack=false`, a simultaneous power loss can leave every
+replica's LEO below the Raft-committed HWM. This state intentionally remains
+fenced: Cursus never lowers the committed boundary to match incomplete logs.
+Restore a broker volume or backup that contains the complete committed prefix.
+If the whole topic history is being abandoned, an administrator may instead
+issue the revision-fenced `TRUNCATE topic=<name> expected_revision=<N>` command;
+its `TOPIC_TRUNCATE` Raft transition provides the audit trail and resets every
+partition to LEO/HWM zero. This is destructive, may require quiescing active
+groups or transactions, and is not a substitute for editing PVC, checkpoint,
+segment, or Raft files.
+
 Automatic recovery removes the divergent broker from ISR while retaining its
 replica assignment, rejects new writes to the partition, catches the replica up
 to the Raft-committed HWM, and requires a leader/lifecycle/HWM-fenced prefix
