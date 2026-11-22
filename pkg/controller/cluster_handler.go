@@ -943,10 +943,15 @@ func (ch *CommandHandler) preparePartitionLeaderSnapshotContext(ctx context.Cont
 	if p.NextOffset() < metadata.CommittedHWM || p.GetHWM() > metadata.CommittedHWM {
 		return fail(fmt.Errorf("partition is behind authoritative committed HWM: leo=%d hwm=%d committed=%d", p.NextOffset(), p.GetHWM(), metadata.CommittedHWM))
 	}
+	recoveryFlushRequired := p.NextOffset() != metadata.CommittedHWM || p.GetHWM() != metadata.CommittedHWM
 	if err := p.ReconcileCommittedHWM(metadata.CommittedHWM); err != nil {
 		return fail(fmt.Errorf("partition is not ready for leadership: %w", err))
 	}
-	p.FlushDisk()
+	if recoveryFlushRequired {
+		p.FlushDisk()
+	} else {
+		p.FlushOnAck()
+	}
 	releaseMutation := p.BeginReplicationMutation()
 	return release, releaseMutation, snapshot, nil
 }

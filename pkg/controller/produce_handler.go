@@ -670,7 +670,7 @@ func (ch *CommandHandler) handleReplicateMessage(cmd string) string {
 		if err := p.ApplyReplicaHWM(*msgCmd.CommitHWM); err != nil {
 			return fmt.Sprintf("ERROR: invalid_commit_watermark reason=%q", err.Error())
 		}
-		p.FlushDisk()
+		p.FlushOnAck()
 		if t.IsEventSourcing && ch.ESHandler != nil {
 			if err := ch.ESHandler.IndexCommittedToHWM(msgCmd.Topic, msgCmd.Partition, *msgCmd.CommitHWM); err != nil {
 				return fmt.Sprintf("ERROR: replica_index_failed reason=%q", err.Error())

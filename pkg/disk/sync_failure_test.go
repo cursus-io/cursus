@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,6 +131,60 @@ func TestWriteBatchSyncUsesSingleFilesystemSync(t *testing.T) {
 	}
 	if syncCalls != 1 {
 		t.Fatalf("filesystem sync calls = %d, want 1 for the whole batch", syncCalls)
+	}
+}
+
+func TestWriteBatchDefersFilesystemSyncUntilExplicitFlush(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LogDir = t.TempDir()
+	cfg.DiskFlushIntervalMS = 60_000
+	handler, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if handler != nil {
+			_ = handler.Close()
+		}
+	}()
+
+	var syncCalls atomic.Int64
+	handler.syncFileFn = func(file *os.File) error {
+		syncCalls.Add(1)
+		return file.Sync()
+	}
+
+	batch := []types.DiskMessage{
+		{Topic: "orders", Partition: 0, Offset: 0, Payload: "one"},
+		{Topic: "orders", Partition: 0, Offset: 1, Payload: "two"},
+	}
+	if err := handler.WriteBatch(batch); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+	if got := syncCalls.Load(); got != 0 {
+		t.Fatalf("WriteBatch sync calls = %d, want 0", got)
+	}
+
+	handler.Flush()
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("sync calls after explicit flush = %d, want 1", got)
+	}
+	if err := handler.Close(); err != nil {
+		t.Fatalf("close handler: %v", err)
+	}
+	handler = nil
+
+	reopened, err := NewDiskHandler(cfg, "orders", 0)
+	if err != nil {
+		t.Fatalf("reopen handler: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	recovered, err := reopened.ReadMessages(0, len(batch))
+	if err != nil {
+		t.Fatalf("read recovered batch: %v", err)
+	}
+	if len(recovered) != len(batch) {
+		t.Fatalf("recovered records = %d, want %d", len(recovered), len(batch))
 	}
 }
 

@@ -50,6 +50,7 @@ type Config struct {
 	LogDir                    string  `yaml:"log_dir" json:"log.dir"`
 	DiskFlushBatchSize        int     `yaml:"disk_flush_batch_size" json:"disk.flush.batch.size"`
 	DiskFlushIntervalMS       int     `yaml:"disk_flush_interval_ms" json:"disk.flush.interval.ms"`
+	FlushSyncOnAck            bool    `yaml:"flush_sync_on_ack" json:"flush.sync_on_ack"`
 	DiskWriteTimeoutMS        int     `yaml:"disk_write_timeout_ms" json:"disk.write.timeout.ms"`
 	DiskMinFreeBytes          int64   `yaml:"disk_min_free_bytes" json:"disk.min.free.bytes"`
 	DiskMinFreePercent        float64 `yaml:"disk_min_free_percent" json:"disk.min.free.percent"`
@@ -172,6 +173,7 @@ func DefaultConfig() *Config {
 			LogDir:              "broker-logs",
 			DiskFlushBatchSize:  50,
 			DiskFlushIntervalMS: 500,
+			FlushSyncOnAck:      true,
 			DiskWriteTimeoutMS:  10,
 			DiskMinFreeBytes:    256 * 1024 * 1024,
 			DiskMinFreePercent:  5,
@@ -290,6 +292,7 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.LogDir, "log-dir", cfg.LogDir, "Log directory")
 	flag.IntVar(&cfg.DiskFlushBatchSize, "disk-flush-batch", cfg.DiskFlushBatchSize, "Disk flush batch")
 	flag.IntVar(&cfg.DiskFlushIntervalMS, "disk-flush-interval-ms", cfg.DiskFlushIntervalMS, "Disk sync interval in milliseconds")
+	flag.BoolVar(&cfg.FlushSyncOnAck, "flush-sync-on-ack", cfg.FlushSyncOnAck, "Wait for filesystem sync before acknowledging cluster writes")
 	flag.IntVar(&cfg.DiskWriteTimeoutMS, "disk-write-timeout", cfg.DiskWriteTimeoutMS, "Disk write timeout")
 	flag.Int64Var(&cfg.DiskMinFreeBytes, "disk-min-free-bytes", cfg.DiskMinFreeBytes, "Minimum filesystem bytes that must remain after a broker write")
 	flag.Float64Var(&cfg.DiskMinFreePercent, "disk-min-free-percent", cfg.DiskMinFreePercent, "Minimum filesystem percentage that must remain after a broker write")
@@ -485,6 +488,7 @@ func LoadConfig() (*Config, error) {
 
 	overrideEnvInt(&cfg.DiskFlushBatchSize, "DISK_FLUSH_BATCH")
 	overrideEnvInt(&cfg.DiskFlushIntervalMS, "DISK_FLUSH_INTERVAL_MS")
+	overrideEnvBool(&cfg.FlushSyncOnAck, "FLUSH_SYNC_ON_ACK")
 	overrideEnvInt64(&cfg.DiskMinFreeBytes, "DISK_MIN_FREE_BYTES")
 	overrideEnvFloat64(&cfg.DiskMinFreePercent, "DISK_MIN_FREE_PERCENT")
 	overrideEnvInt(&cfg.LingerMS, "LINGER_MS")

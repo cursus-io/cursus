@@ -65,6 +65,7 @@ exporter_port: 9100
 log_dir: "broker-logs"
 compression_type: "lz4"
 disk_flush_batch_size: 500
+flush_sync_on_ack: true
 disk_write_timeout_ms: 200
 linger_ms: 100
 log_segment_roll_ms: 604800000
@@ -95,6 +96,7 @@ The same configuration can be expressed in JSON format:
   "tls.key_path": "certs/server.key",
   "compression.type": "lz4",
   "disk.flush.batch.size": 500,
+  "flush.sync_on_ack": true,
   "linger.ms": 100,
   "channel.buffer.size": 10000,
   "partition.channel.buffer.size": 10000,
@@ -159,6 +161,7 @@ These parameters directly affect the write path performance and batching behavio
 | `channel_buffer_size`   | int  | 1024    | Buffer size for DiskHandler's writeCh channel             |
 | `disk_write_timeout_ms` | int  | 10      | Timeout while enqueueing an asynchronous write (ms)       |
 | `disk_flush_interval_ms`| int  | 500     | Periodic fsync interval (milliseconds)                    |
+| `flush_sync_on_ack`     | bool | true    | In distributed mode, wait for data-log filesystem sync before acknowledging writes |
 | `log_segment_bytes`     | uint64 | 1073741824 | Maximum segment file size (1GB default)                |
 | `log_index_size_bytes`  | uint64 | 10485760   | Maximum index file size (10MB default)                 |
 | `log_index_interval_bytes` | int | 4096    | Index entry interval in bytes                            |
@@ -195,6 +198,7 @@ These values participate in active broker behavior:
 | Parameter | Default | Purpose |
 |---|---:|---|
 | `enabled_distribution` | false | Enable the Raft-backed cluster runtime. |
+| `flush_sync_on_ack` | true | Require leader and replica data logs to cross the filesystem sync boundary before ACK. `false` is accepted only in distributed mode and relies on replication plus periodic sync. |
 | `min_insync_replicas` | 2 | Broker fallback minimum for `acks=all`/`-1` when a topic has no `min_in_sync_replicas` override. |
 | `default_replication_factor` | 3 | Default replica count for new distributed topics. |
 | `internal_broker_port` | 0 | Dedicated broker-to-broker command listener; configure in production clusters. |
@@ -378,6 +382,8 @@ The Config struct uses both YAML and JSON tags to support both formats. Here's h
 | MaxInflightRequests       | `max_inflight_requests`      | `max.inflight.requests`      | --max-inflight-requests      |
 | MaxInflightRequestBytes   | `max_inflight_request_bytes` | `max.inflight.request.bytes` | --max-inflight-request-bytes |
 | DiskFlushBatchSize        | `disk_flush_batch_size`      | `disk.flush.batch.size`       | --disk-flush-batch       |
+| DiskFlushIntervalMS       | `disk_flush_interval_ms`     | `disk.flush.interval.ms`      | --disk-flush-interval-ms |
+| FlushSyncOnAck            | `flush_sync_on_ack`          | `flush.sync_on_ack`           | --flush-sync-on-ack      |
 | DiskMinFreeBytes          | `disk_min_free_bytes`        | `disk.min.free.bytes`         | --disk-min-free-bytes    |
 | DiskMinFreePercent        | `disk_min_free_percent`      | `disk.min.free.percent`       | --disk-min-free-percent  |
 | LingerMS                  | `linger_ms`                  | `linger.ms`                   | --linger-ms              |

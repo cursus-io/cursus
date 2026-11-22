@@ -79,6 +79,7 @@ type Partition struct {
 	replicaWitness             *ReplicaCatchupWitness
 	replicaAttempt             uint64
 	distributed                bool
+	flushSyncOnAck             bool
 	mu                         contextlock.RWMutex
 	reconcileMu                contextlock.RWMutex
 	eventIDGeneration          atomic.Uint64
@@ -198,6 +199,10 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 	// Storage exposes the next assignable offset, not the last record offset.
 	initialOffset := dh.GetLatestOffset()
 
+	flushSyncOnAck := true
+	if cfg != nil && cfg.EnabledDistribution {
+		flushSyncOnAck = cfg.FlushSyncOnAck
+	}
 	p := &Partition{
 		retentionTimeEnabled: cfg != nil && cfg.RetentionTimeEnabled,
 		retentionClockAnchor: time.Now(),
@@ -213,6 +218,7 @@ func NewPartition(id int, topic string, dh types.StorageHandler, sm StreamManage
 		producerStateTTL:     producerStateTTLFromConfig(cfg),
 		hwmAuthoritative:     cfg == nil || !cfg.EnabledDistribution,
 		distributed:          cfg != nil && cfg.EnabledDistribution,
+		flushSyncOnAck:       flushSyncOnAck,
 	}
 
 	p.LEO.Store(initialOffset)
@@ -868,7 +874,7 @@ func (p *Partition) EnqueueBatchLeaderWithMode(msgs []types.Message, forceIdempo
 		return nil
 	}
 
-	if err := writeBatchDurably(p.dh, diskBatch); err != nil {
+	if err := writeBatchForAck(p.dh, diskBatch, p.flushSyncOnAck); err != nil {
 		for _, msg := range pending {
 			msgs[msg.index].Offset = 0
 		}
@@ -957,7 +963,7 @@ func (p *Partition) ReplicaAppendWithMode(msgs []types.Message, forceIdempotent 
 		nextOffset++
 	}
 
-	if err := writeBatchDurably(p.dh, diskBatch); err != nil {
+	if err := writeBatchForAck(p.dh, diskBatch, p.flushSyncOnAck); err != nil {
 		return fmt.Errorf("replica batch append failed: %w", err)
 	}
 	for _, i := range pending {
@@ -1023,6 +1029,16 @@ func writeBatchDurably(storage types.StorageHandler, batch []types.DiskMessage) 
 	}
 	if durable, ok := storage.(types.DurableBatchStorage); ok {
 		return durable.WriteBatchSync(batch)
+	}
+	return storage.WriteBatch(batch)
+}
+
+func writeBatchForAck(storage types.StorageHandler, batch []types.DiskMessage, syncOnAck bool) error {
+	if syncOnAck {
+		return writeBatchDurably(storage, batch)
+	}
+	if len(batch) == 0 {
+		return nil
 	}
 	return storage.WriteBatch(batch)
 }
@@ -1629,6 +1645,16 @@ func (p *Partition) FlushDisk() {
 		util.Warn("failed to persist producer state checkpoint %s during flush: %v", p.producerStatePath, err)
 		p.signalProducerStateCheckpoint()
 	}
+}
+
+// FlushOnAck crosses the filesystem sync boundary only when the configured
+// cluster acknowledgement contract requires it. Explicit recovery, segment,
+// shutdown, and maintenance flushes continue to use FlushDisk directly.
+func (p *Partition) FlushOnAck() {
+	if !p.flushSyncOnAck {
+		return
+	}
+	p.FlushDisk()
 }
 
 func (p *Partition) GetFirstOffset() uint64 {

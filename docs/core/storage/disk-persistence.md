@@ -41,6 +41,21 @@ Defaults are a 1024-record channel, 50-record batch, 50 ms linger, 10 ms enqueue
 
 Idempotent/transactional writes validate producer epoch and sequence before append. Producer sequence checkpoints are synced separately and can be rebuilt from durable log records if a checkpoint is lost.
 
+### Cluster acknowledgement sync policy
+
+`flush_sync_on_ack` controls whether a distributed partition append waits for filesystem sync before its acknowledgement can complete:
+
+- `true` is the compatibility default. Leaders and required replicas finish `fsync` before acknowledging the append or committed HWM.
+- `false` lets leaders and replicas acknowledge after the record bytes reach their operating-system page caches. `syncLoop` crosses the filesystem boundary later at `disk_flush_interval_ms`; explicit recovery, segment roll, shutdown, and Raft stable-store writes remain synchronous.
+
+Standalone brokers always force this setting to `true` because they have no independent replica from which to recover. Disabling it does not make replication asynchronous: `acks=all` still waits for the captured ISR and fenced HWM commit. It only removes each data-log `fsync` from the request path.
+
+This adopts Kafka's default use of the filesystem page cache and replication instead of per-request log flushes ([Kafka 4.3 persistence design](https://kafka.apache.org/43/design/design/), [Kafka 4.3 topic flush configuration](https://kafka.apache.org/43/configuration/topic-configs/), [Kafka 4.3 log flusher implementation](https://github.com/apache/kafka/blob/4.3.0/storage/src/main/java/org/apache/kafka/storage/internals/log/LogManager.java)). Cursus differs in three deliberate ways: the existing default remains synchronous, Raft control-plane storage is unchanged, and destructive recovery/leadership preparation retains an immediate sync boundary.
+
+With `false`, a process failure leaves page-cache data available to the operating system and a single-node power failure can recover from another ISR member. Simultaneous power loss across every ISR member can lose the acknowledged interval. Operators must keep `min_insync_replicas` and independent failure domains; Cursus does not silently degrade this policy when ISR falls below the configured minimum.
+
+Recovery work remains partition-scoped. Its worst-case new exposure is the records and encoded bytes acknowledged since the last successful periodic sync, bounded in time by `disk_flush_interval_ms` during healthy operation. Fault tests and performance runs should report those records and bytes, replica catch-up bytes, and sync calls rather than request counts alone. Transaction-coordinator partition sharding is a separate proposal and is not enabled by this setting.
+
 ## Segment Rolling
 
 A segment rolls before a write when:
@@ -101,6 +116,7 @@ In distributed mode each application-topic partition cleaner is gated on broker 
 | Goal | Relevant settings | Trade-off |
 |---|---|---|
 | Higher throughput | larger channel/batch, modest linger, larger segment | More queued memory and potentially wider unsynced window. |
+| Remove cluster fsync from the ACK path | `flush_sync_on_ack: false`, `acks=all`, sufficient ISR | Higher throughput and lower tail latency; simultaneous ISR power loss can lose the unsynced interval. |
 | Lower latency | smaller batch/linger, shorter sync interval | More syscalls and lower aggregate throughput. |
 | Faster sparse seek | smaller index interval | Larger index files and more index writes. |
 | Shorter recovery | smaller segments/time roll | More files and metadata operations. |
