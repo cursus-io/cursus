@@ -81,6 +81,24 @@ func TestChartSecurityDefaults(t *testing.T) {
 	}
 }
 
+func TestClusterFlushSyncOnAckIsExplicitAndConfigurable(t *testing.T) {
+	output, err := render(t, "helm-cluster")
+	if err != nil {
+		t.Fatalf("render: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "name: FLUSH_SYNC_ON_ACK\n              value: \"true\"") {
+		t.Fatalf("cluster chart must preserve synchronous acknowledgement by default:\n%s", output)
+	}
+
+	output, err = render(t, "helm-cluster", "--set", "storage.flushSyncOnAck=false")
+	if err != nil {
+		t.Fatalf("render deferred sync: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "name: FLUSH_SYNC_ON_ACK\n              value: \"false\"") {
+		t.Fatalf("cluster chart did not render deferred sync opt-in:\n%s", output)
+	}
+}
+
 func TestChartsRejectInvalidValues(t *testing.T) {
 	for _, tc := range []struct {
 		name, chart, flag, value, diagnostic string
@@ -93,6 +111,7 @@ func TestChartsRejectInvalidValues(t *testing.T) {
 		{"cluster-mutable-string", "helm-cluster", "--set-string", "image.allowMutableTag=false", "image.allowMutableTag must be a boolean"},
 		{"cluster-digest", "helm-cluster", "--set-string", "image.digest=invalid", "image.digest"},
 		{"cluster-quorum", "helm-cluster", "--set", "cluster.minInSyncReplicas=1", "cluster.minInSyncReplicas"},
+		{"cluster-flush-string", "helm-cluster", "--set-string", "storage.flushSyncOnAck=false", "storage.flushSyncOnAck must be a boolean"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			output, err := render(t, tc.chart, tc.flag, tc.value)

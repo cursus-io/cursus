@@ -45,6 +45,10 @@ func (cfg *Config) Normalize() {
 		util.Warn("Invalid DiskFlushIntervalMS (%d), defaulting to 1000ms", cfg.DiskFlushIntervalMS)
 		cfg.DiskFlushIntervalMS = 1000
 	}
+	if !cfg.EnabledDistribution && !cfg.FlushSyncOnAck {
+		util.Warn("flush_sync_on_ack=false requires distribution; forcing synchronous acknowledgement")
+		cfg.FlushSyncOnAck = true
+	}
 	if cfg.LingerMS < 0 {
 		cfg.LingerMS = 0
 	}

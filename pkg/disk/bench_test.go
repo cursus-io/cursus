@@ -85,6 +85,38 @@ func BenchmarkWriteBatch_500(b *testing.B) {
 	}
 }
 
+func BenchmarkWriteBatchAckDurability(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		syncOnAck bool
+	}{
+		{name: "background-sync", syncOnAck: false},
+		{name: "sync-on-ack", syncOnAck: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			dh, cleanup := newBenchDiskHandler(b)
+			defer cleanup()
+			msgs := makeBenchMessages(100)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for j := range msgs {
+					msgs[j].Offset = uint64(i*len(msgs) + j)
+				}
+				var err error
+				if tc.syncOnAck {
+					err = dh.WriteBatchSync(msgs)
+				} else {
+					err = dh.WriteBatch(msgs)
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkSerializeDiskMessage(b *testing.B) {
 	msg := types.DiskMessage{
 		Topic:      "bench-topic",

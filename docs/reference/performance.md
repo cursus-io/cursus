@@ -13,6 +13,7 @@ Cursus throughput comes from partition parallelism, buffered batch writes, spars
 | `disk_flush_batch_size` | 50 | Records accumulated before a batch write. |
 | `linger_ms` | 50 | Maximum wait for a partial async batch. |
 | `disk_flush_interval_ms` | 500 | Data/index `Sync` interval. |
+| `flush_sync_on_ack` | true | Distributed data-log ACKs wait for filesystem sync. Standalone mode always enforces this behavior. |
 | `disk_write_timeout_ms` | 10 | Buffered enqueue timeout. |
 | `log_segment_bytes` | 1 GiB | Data segment roll limit. |
 | `log_index_size_bytes` | 10 MiB | Sparse index roll limit. |
@@ -29,6 +30,8 @@ A larger batch or linger can improve sequential write efficiency and throughput.
 ### Sync Interval
 
 The batch writer flushes Go buffers to the file descriptor; the sync loop controls periodic file `Sync`. Shortening the interval reduces the unsynced power-loss window and increases storage pressure. Do not describe a successful async enqueue as durable.
+
+Distributed brokers can set `flush_sync_on_ack: false` to acknowledge after the leader and required replicas have appended to their operating-system page caches, while the existing sync loop persists those bytes later. This removes data-log fsync from the request critical path but does not weaken Raft stable-store sync, recovery/truncation boundaries, segment publication, or shutdown flushes. A simultaneous power loss across every in-sync replica can lose the records and encoded bytes acknowledged since the last successful sync; measure that recovery exposure and replica catch-up bytes, not only request counts. The default remains `true`, and standalone mode forces synchronous acknowledgement.
 
 Publish acknowledgements also depend on the selected `acks` mode, replication quorum, and HWM path. Test broker kill, host restart, and leader failover when changing durability-related settings.
 

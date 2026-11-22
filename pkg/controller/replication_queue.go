@@ -203,7 +203,7 @@ func (e clusterPartitionReplicationExecutor) Commit(task partitionReplicationTas
 	if err := task.partitionRef.ApplyReplicaHWM(task.commitHWM); err != nil {
 		return result, fmt.Errorf("apply local commit watermark: %w", err)
 	}
-	task.partitionRef.FlushDisk()
+	task.partitionRef.FlushOnAck()
 	return result, nil
 }
 

@@ -60,6 +60,9 @@ limits:
 storage:
   minFreeBytes: 268435456
   minFreePercent: 5
+  # true preserves per-ack filesystem sync. Set false only when replicated
+  # page-cache acknowledgements are acceptable for the cluster failure model.
+  flushSyncOnAck: true
 
 internalTLS:
   # The Secret must contain tls.crt, tls.key, and ca.crt. The certificate must

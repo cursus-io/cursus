@@ -1039,6 +1039,75 @@ func TestPartition_ReplicaAppendUsesOneDurableWriteForLargeBatch(t *testing.T) {
 	storage.AssertExpectations(t)
 }
 
+func TestPartition_ClusterReplicaAppendCanDeferSyncUntilBackgroundFlush(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.FlushSyncOnAck = false
+	base := new(MockStorageHandler)
+	base.On("GetLatestOffset").Return(uint64(0)).Once()
+	storage := &durableBatchMockStorage{MockStorageHandler: base}
+	storage.On("WriteBatch", mock.MatchedBy(func(batch []types.DiskMessage) bool {
+		return len(batch) == 2 && batch[0].Offset == 0 && batch[1].Offset == 1
+	})).Return(nil).Once()
+
+	p := NewPartition(0, "orders", storage, nil, cfg)
+	records := []types.Message{{Offset: 0, Payload: "one"}, {Offset: 1, Payload: "two"}}
+	require.NoError(t, p.ReplicaAppend(records))
+	require.Equal(t, uint64(2), p.NextOffset())
+	storage.AssertNumberOfCalls(t, "WriteBatch", 1)
+	storage.AssertNotCalled(t, "WriteBatchSync", mock.Anything)
+	storage.AssertExpectations(t)
+}
+
+func TestPartition_ClusterLeaderAppendCanDeferSyncUntilBackgroundFlush(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	cfg.FlushSyncOnAck = false
+	base := new(MockStorageHandler)
+	base.On("GetLatestOffset").Return(uint64(0)).Once()
+	storage := &durableBatchMockStorage{MockStorageHandler: base}
+	storage.On("WriteBatch", mock.MatchedBy(func(batch []types.DiskMessage) bool {
+		return len(batch) == 2 && batch[0].Offset == 0 && batch[1].Offset == 1
+	})).Return(nil).Once()
+
+	p := NewPartition(0, "orders", storage, nil, cfg)
+	p.hwmAuthoritative = true
+	records := []types.Message{{Payload: "one"}, {Payload: "two"}}
+	require.NoError(t, p.EnqueueBatchLeader(records))
+	require.Equal(t, uint64(2), p.NextOffset())
+	storage.AssertNumberOfCalls(t, "WriteBatch", 1)
+	storage.AssertNotCalled(t, "WriteBatchSync", mock.Anything)
+	storage.AssertExpectations(t)
+}
+
+func TestPartition_FlushOnAckHonorsClusterPolicy(t *testing.T) {
+	t.Run("deferred", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.EnabledDistribution = true
+		cfg.FlushSyncOnAck = false
+		storage := new(MockStorageHandler)
+		storage.On("GetLatestOffset").Return(uint64(0)).Once()
+
+		p := NewPartition(0, "orders", storage, nil, cfg)
+		p.FlushOnAck()
+
+		storage.AssertNotCalled(t, "Flush")
+	})
+
+	t.Run("synchronous", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.EnabledDistribution = true
+		storage := new(MockStorageHandler)
+		storage.On("GetLatestOffset").Return(uint64(0)).Once()
+		storage.On("Flush").Once()
+
+		p := NewPartition(0, "orders", storage, nil, cfg)
+		p.FlushOnAck()
+
+		storage.AssertExpectations(t)
+	})
+}
+
 func TestPartition_ReplicaAppendDoesNotAdvanceStateWhenDurableBatchFails(t *testing.T) {
 	cfg := config.DefaultConfig()
 	base := new(MockStorageHandler)
