@@ -79,7 +79,6 @@ func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientCo
 		if err := ch.materializeAndCheckpointTransactionOffsets(txnID, previousSnap.Offsets); err != nil {
 			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
 		}
-		previousSnap, hadPrevious = ch.TxnManager.Snapshot(txnID)
 	}
 	rollbackGeneration := ch.TxnManager.ReplicatedApplyGeneration(txnID)
 	previousSnap, hadPrevious = ch.TxnManager.Snapshot(txnID)
