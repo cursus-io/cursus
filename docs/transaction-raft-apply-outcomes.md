@@ -37,10 +37,15 @@ protocol.
 - `unknown` preserves the candidate snapshot because Raft or a forwarded leader
   may already have applied it.
 - Rollback is conditional on the current snapshot still matching the complete
-  attempted snapshot. A newer Raft apply or recovery revision is never
-  overwritten by a late failure.
+  attempted snapshot and on no Raft apply having crossed the transaction's
+  shard since the local mutation began. A newer or exact replicated apply is
+  never overwritten by a late failure.
 - Retried `BEGIN_TXN` for the same producer and epoch reuses the existing open
   snapshot without changing its deadline or revision.
+- Retried legacy publishes reuse an identical producer sequence and reject a
+  changed payload instead of consuming capacity or staging a duplicate.
+- In standalone mode, a journal record is treated as applied after its fsync
+  boundary even if the manifest or a later compaction rewrite fails.
 
 This classification improves safety at a small availability cost: an ambiguous
 failure can leave the transaction open until the same request is retried or

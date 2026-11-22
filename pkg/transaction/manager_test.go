@@ -108,6 +108,39 @@ func TestManagerPersistsTransactionalRequestAssignments(t *testing.T) {
 	}
 }
 
+func TestManagerDeduplicatesLegacyMessageByProducerSequence(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxRecords = 1
+	m := NewManagerWithLimits(time.Hour, 1, limits)
+	producer, epoch := beginInitialized(t, m, "legacy-retry")
+	op := MessageOperation{
+		Topic:     "orders",
+		Partition: 0,
+		Message: types.Message{
+			Payload:    "created",
+			ProducerID: producer,
+			Epoch:      epoch,
+			SeqNum:     1,
+		},
+	}
+	if err := m.AddMessage("legacy-retry", producer, epoch, op); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := m.Snapshot("legacy-retry")
+	if err := m.AddMessage("legacy-retry", producer, epoch, op); err != nil {
+		t.Fatal(err)
+	}
+	retried, _ := m.Snapshot("legacy-retry")
+	if !reflect.DeepEqual(first, retried) || len(retried.Messages) != 1 {
+		t.Fatalf("identical retry changed staged messages: first=%+v retry=%+v", first, retried)
+	}
+	changed := op
+	changed.Message.Payload = "changed"
+	if err := m.AddMessage("legacy-retry", producer, epoch, changed); err == nil || !strings.Contains(err.Error(), "conflicts with existing producer sequence") {
+		t.Fatalf("changed retry error = %v", err)
+	}
+}
+
 func TestRestoreSnapshotIfCurrentDoesNotOverwriteNewerState(t *testing.T) {
 	m := NewManager()
 	producer, epoch, err := m.InitProducerWithMode("guarded-rollback", ModeProcessingV1)
@@ -118,6 +151,7 @@ func TestRestoreSnapshotIfCurrentDoesNotOverwriteNewerState(t *testing.T) {
 	if !ok {
 		t.Fatal("missing initialized snapshot")
 	}
+	generation := m.ReplicatedApplyGeneration("guarded-rollback")
 	if err := m.Begin("guarded-rollback", producer, epoch); err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +159,13 @@ func TestRestoreSnapshotIfCurrentDoesNotOverwriteNewerState(t *testing.T) {
 	if !ok {
 		t.Fatal("missing speculative snapshot")
 	}
+	if err := m.ApplyReplicatedSnapshot(expected); err != nil {
+		t.Fatal(err)
+	}
+	if m.RestoreSnapshotIfCurrent(expected, previous, generation) {
+		t.Fatal("rollback overwrote an exact snapshot observed from Raft")
+	}
+	generation = m.ReplicatedApplyGeneration("guarded-rollback")
 	if _, _, err := m.ResolveRequestAssignment("guarded-rollback", producer, epoch, "orders", -1, 1, 0, "request"); err != nil {
 		t.Fatal(err)
 	}
@@ -133,14 +174,14 @@ func TestRestoreSnapshotIfCurrentDoesNotOverwriteNewerState(t *testing.T) {
 		t.Fatal("missing newer snapshot")
 	}
 
-	if m.RestoreSnapshotIfCurrent(expected, previous) {
+	if m.RestoreSnapshotIfCurrent(expected, previous, generation) {
 		t.Fatal("stale rollback overwrote a newer transaction snapshot")
 	}
 	current, _ := m.Snapshot("guarded-rollback")
 	if !reflect.DeepEqual(newer, current) {
 		t.Fatalf("newer snapshot changed after stale rollback: got=%+v want=%+v", current, newer)
 	}
-	if !m.RestoreSnapshotIfCurrent(newer, previous) {
+	if !m.RestoreSnapshotIfCurrent(newer, previous, generation) {
 		t.Fatal("exact speculative snapshot was not restored")
 	}
 	restored, _ := m.Snapshot("guarded-rollback")

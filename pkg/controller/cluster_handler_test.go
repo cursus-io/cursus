@@ -183,11 +183,12 @@ func TestTransactionSyncRollbackDependsOnRaftOutcome(t *testing.T) {
 
 		producer, epoch, err := ch.TxnManager.InitProducer("not-accepted")
 		require.NoError(t, err)
+		generation := ch.TxnManager.ReplicatedApplyGeneration("not-accepted")
 		previous, ok := ch.TxnManager.Snapshot("not-accepted")
 		require.True(t, ok)
 		require.NoError(t, ch.TxnManager.Begin("not-accepted", producer, epoch))
 
-		err = ch.syncTransactionMutation("not-accepted", previous, true)
+		err = ch.syncTransactionMutation("not-accepted", previous, true, generation)
 		require.ErrorIs(t, err, raft.ErrNotLeader)
 		current, ok := ch.TxnManager.Snapshot("not-accepted")
 		require.True(t, ok)
@@ -210,13 +211,14 @@ func TestTransactionSyncRollbackDependsOnRaftOutcome(t *testing.T) {
 
 		producer, epoch, err := ch.TxnManager.InitProducer("unknown")
 		require.NoError(t, err)
+		generation := ch.TxnManager.ReplicatedApplyGeneration("unknown")
 		previous, ok := ch.TxnManager.Snapshot("unknown")
 		require.True(t, ok)
 		require.NoError(t, ch.TxnManager.Begin("unknown", producer, epoch))
 		candidate, ok := ch.TxnManager.Snapshot("unknown")
 		require.True(t, ok)
 
-		err = ch.syncTransactionMutation("unknown", previous, true)
+		err = ch.syncTransactionMutation("unknown", previous, true, generation)
 		require.ErrorContains(t, err, "lost raft response")
 		current, ok := ch.TxnManager.Snapshot("unknown")
 		require.True(t, ok)

@@ -62,6 +62,27 @@ func TestJournalLoadsLatestSnapshotPerTransactionalID(t *testing.T) {
 	}
 }
 
+func TestJournalAppendReportsDurableRecordWhenManifestWriteFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transactions.journal")
+	journal, err := OpenJournal(path)
+	require.NoError(t, err)
+	manifestPath := strings.TrimSuffix(path, filepath.Ext(path)) + ".manifest"
+	require.NoError(t, os.Remove(manifestPath))
+	require.NoError(t, os.Mkdir(manifestPath, 0o700))
+
+	snapshot := testJournalSnapshot("durable-manifest-failure", 1, StateOpen)
+	durable, err := journal.AppendWithDurability(snapshot)
+	require.Error(t, err)
+	require.True(t, durable, "the fsynced record must not be reported as rollback-safe")
+
+	require.NoError(t, os.Remove(manifestPath))
+	reopened, err := OpenJournal(path)
+	require.NoError(t, err)
+	state, err := reopened.Load()
+	require.NoError(t, err)
+	require.Equal(t, snapshot, state[snapshot.ID])
+}
+
 func TestJournalDeltaBoundsGrowingTransactionWriteAmplification(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "transactions.journal")
 	journal, err := OpenJournal(path)

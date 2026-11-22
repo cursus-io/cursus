@@ -95,7 +95,7 @@ func (ch *CommandHandler) syncTransactionState(txnID string) error {
 	return err
 }
 
-func (ch *CommandHandler) syncTransactionMutation(txnID string, previous *transaction.Snapshot, hadPrevious bool) error {
+func (ch *CommandHandler) syncTransactionMutation(txnID string, previous *transaction.Snapshot, hadPrevious bool, replicatedGeneration uint64) error {
 	expected, ok := ch.TxnManager.Snapshot(txnID)
 	if !ok {
 		return fmt.Errorf("transaction %s not found", txnID)
@@ -105,7 +105,7 @@ func (ch *CommandHandler) syncTransactionMutation(txnID string, previous *transa
 		if !hadPrevious {
 			previous = nil
 		}
-		ch.TxnManager.RestoreSnapshotIfCurrent(expected, previous)
+		ch.TxnManager.RestoreSnapshotIfCurrent(expected, previous, replicatedGeneration)
 	}
 	return err
 }
@@ -125,12 +125,16 @@ func (ch *CommandHandler) syncTransactionStateWithOutcome(txnID string) (raftApp
 		if ch.txnJournal == nil {
 			return raftApplyApplied, nil
 		}
-		if err := ch.txnJournal.Append(snapshot); err != nil {
+		durable, err := ch.txnJournal.AppendWithDurability(snapshot)
+		if err != nil {
+			if durable {
+				return raftApplyApplied, err
+			}
 			return raftApplyNotAccepted, err
 		}
 		if ch.TxnManager.PruneExpired(time.Now()) > 0 {
 			if err := ch.txnJournal.Rewrite(ch.TxnManager.ExportState()); err != nil {
-				return raftApplyNotAccepted, err
+				return raftApplyApplied, err
 			}
 		}
 		return raftApplyApplied, nil

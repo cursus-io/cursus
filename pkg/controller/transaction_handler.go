@@ -81,6 +81,8 @@ func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientCo
 		}
 		previousSnap, hadPrevious = ch.TxnManager.Snapshot(txnID)
 	}
+	rollbackGeneration := ch.TxnManager.ReplicatedApplyGeneration(txnID)
+	previousSnap, hadPrevious = ch.TxnManager.Snapshot(txnID)
 	mode := transaction.ModeProcessingV1
 	producerID, epoch, err := ch.TxnManager.InitProducerWithMode(txnID, mode)
 	if err != nil {
@@ -97,7 +99,7 @@ func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientCo
 			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
 		}
 	}
-	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious, rollbackGeneration); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s producerId=%s epoch=%d", txnID, producerID, epoch)
@@ -125,6 +127,7 @@ func (ch *CommandHandler) handleBeginTxn(cmd string, contexts ...*ClientContext)
 	if err != nil {
 		return fmt.Sprintf("ERROR: invalid_epoch reason=%q", err.Error())
 	}
+	rollbackGeneration := ch.TxnManager.ReplicatedApplyGeneration(txnID)
 	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if resp := ch.requireTransactionMode(txnID, ctx); resp != "" {
 		return resp
@@ -147,7 +150,7 @@ func (ch *CommandHandler) handleBeginTxn(cmd string, contexts ...*ClientContext)
 		}
 		return fmt.Sprintf("ERROR: transaction_begin_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious, rollbackGeneration); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s state=open producerId=%s epoch=%d", txnID, producerID, epoch)
@@ -219,6 +222,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if resp := ch.requireTransactionMode(txnID, clientCtx); resp != "" {
 		return resp
 	}
+	rollbackGeneration := ch.TxnManager.ReplicatedApplyGeneration(txnID)
 	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	current, statusErr := ch.TxnManager.Status(txnID)
 	if statusErr != nil {
@@ -250,7 +254,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, participant, time.Time{}); err != nil {
 			return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
 		}
-		if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
+		if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious, rollbackGeneration); err != nil {
 			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 		}
 		if err := ch.publishCommittedTransactionMessage(transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
@@ -261,7 +265,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if err := ch.TxnManager.AddMessage(txnID, producerID, epoch, transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
 		return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious, rollbackGeneration); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_messages=1 topic=%s partition=%d", txnID, topicName, partition)
@@ -390,6 +394,7 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 	if expectedVersion != currentVersion+1 {
 		return fmt.Sprintf("ERROR: stream_version_conflict expected=%d current=%d", expectedVersion, currentVersion)
 	}
+	rollbackGeneration := ch.TxnManager.ReplicatedApplyGeneration(txnID)
 	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	assignment, _, err := ch.TxnManager.ResolveRequestAssignment(
 		txnID,
@@ -428,7 +433,7 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
 		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious, rollbackGeneration); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	if err := ch.publishCommittedTransactionMessage(transaction.MessageOperation{Topic: topicName, Partition: partition, Message: message}); err != nil {
@@ -524,11 +529,12 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 		}
 		ops = append(ops, op)
 	}
+	rollbackGeneration := ch.TxnManager.ReplicatedApplyGeneration(txnID)
 	previousSnap, hadPrevious := ch.snapshotTransaction(txnID)
 	if err := ch.TxnManager.AddOffsets(txnID, producerID, epoch, ops); err != nil {
 		return fmt.Sprintf("ERROR: transaction_offsets_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious, rollbackGeneration); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_offsets=%d", txnID, len(ops))
