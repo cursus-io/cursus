@@ -91,31 +91,60 @@ func advanceRecoveredProducerEpoch(current uint64, producerEpoch int64) (uint64,
 }
 
 func (ch *CommandHandler) syncTransactionState(txnID string) error {
-	if ch.transactionStateSyncHook != nil {
-		return ch.transactionStateSyncHook(txnID)
-	}
-	snapshot, ok := ch.TxnManager.Snapshot(txnID)
+	_, err := ch.syncTransactionStateWithOutcome(txnID)
+	return err
+}
+
+func (ch *CommandHandler) syncTransactionMutation(txnID string, previous *transaction.Snapshot, hadPrevious bool, replicatedGeneration uint64) error {
+	expected, ok := ch.TxnManager.Snapshot(txnID)
 	if !ok {
 		return fmt.Errorf("transaction %s not found", txnID)
 	}
+	outcome, err := ch.syncTransactionStateWithOutcome(txnID)
+	if err != nil && outcome.rollbackSafe() {
+		if !hadPrevious {
+			previous = nil
+		}
+		ch.TxnManager.RestoreSnapshotIfCurrent(expected, previous, replicatedGeneration)
+	}
+	return err
+}
+
+func (ch *CommandHandler) syncTransactionStateWithOutcome(txnID string) (raftApplyOutcome, error) {
+	if ch.transactionStateSyncHook != nil {
+		if err := ch.transactionStateSyncHook(txnID); err != nil {
+			return raftApplyNotAccepted, err
+		}
+		return raftApplyApplied, nil
+	}
+	snapshot, ok := ch.TxnManager.Snapshot(txnID)
+	if !ok {
+		return raftApplyNotAccepted, fmt.Errorf("transaction %s not found", txnID)
+	}
 	if !ch.isDistributed() {
 		if ch.txnJournal == nil {
-			return nil
+			return raftApplyApplied, nil
 		}
-		if err := ch.txnJournal.Append(snapshot); err != nil {
-			return err
+		durable, err := ch.txnJournal.AppendWithDurability(snapshot)
+		if err != nil {
+			if durable {
+				return raftApplyApplied, err
+			}
+			return raftApplyNotAccepted, err
 		}
 		if ch.TxnManager.PruneExpired(time.Now()) > 0 {
-			return ch.txnJournal.Rewrite(ch.TxnManager.ExportState())
+			if err := ch.txnJournal.Rewrite(ch.TxnManager.ExportState()); err != nil {
+				return raftApplyApplied, err
+			}
 		}
-		return nil
+		return raftApplyApplied, nil
 	}
 	payload, err := ch.transactionSyncPayload(snapshot)
 	if err != nil {
-		return err
+		return raftApplyNotAccepted, err
 	}
-	_, err = ch.applyViaLeader("TXN_SYNC", payload)
-	return err
+	_, outcome, err := ch.applyViaLeaderWithOutcome("TXN_SYNC", payload)
+	return outcome, err
 }
 
 func (ch *CommandHandler) commitTransactionDecision(txnID string) error {

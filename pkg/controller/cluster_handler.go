@@ -21,10 +21,37 @@ import (
 	"github.com/cursus-io/cursus/util"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/raft"
 )
 
 const DefaultFSMApplyTimeout = 5 * time.Second
 const groupRecoveryMonitorInterval = 500 * time.Millisecond
+
+type raftApplyOutcome uint8
+
+const (
+	raftApplyNotAccepted raftApplyOutcome = iota
+	raftApplyRejected
+	raftApplyApplied
+	raftApplyUnknown
+)
+
+func (outcome raftApplyOutcome) rollbackSafe() bool {
+	return outcome == raftApplyNotAccepted || outcome == raftApplyRejected
+}
+
+func (outcome raftApplyOutcome) wireValue() string {
+	switch outcome {
+	case raftApplyNotAccepted:
+		return "not_accepted"
+	case raftApplyRejected:
+		return "rejected"
+	case raftApplyApplied:
+		return "applied"
+	default:
+		return "unknown"
+	}
+}
 
 type partitionLeadershipFence struct {
 	leader string
@@ -693,19 +720,15 @@ func (ch *CommandHandler) handleRaftApply(cmd string, clientCtx *ClientContext) 
 		return fmt.Sprintf("ERROR: invalid_payload_json reason=%q", err.Error())
 	}
 
-	_, accepted, err := ch.applyAndWaitContextWithAcceptance(requestCtx, cmdType, payload)
+	_, outcome, err := ch.applyAndWaitContextWithOutcome(requestCtx, cmdType, payload)
 	if err != nil {
 		if requestCtx.Err() != nil {
-			outcome := "not_accepted"
-			if accepted {
-				outcome = "unknown"
-			}
-			return requestTimeoutOutcome(requestCtx, outcome)
+			return requestTimeoutOutcome(requestCtx, outcome.wireValue())
 		}
 		if errors.Is(err, replicationFSM.ErrPartitionCommitFenced) {
-			return "ERROR: PARTITION_LEADER_FENCED"
+			return "ERROR: PARTITION_LEADER_FENCED outcome=rejected"
 		}
-		return formatReplicatedGroupError(err, "raft_apply_failed")
+		return fmt.Sprintf("%s outcome=%s", formatReplicatedGroupError(err, "raft_apply_failed"), outcome.wireValue())
 	}
 	return "OK"
 }
@@ -716,40 +739,62 @@ func (ch *CommandHandler) applyViaLeader(cmdType string, payload map[string]inte
 }
 
 func (ch *CommandHandler) applyViaLeaderContext(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, error) {
+	result, _, err := ch.applyViaLeaderContextWithOutcome(ctx, cmdType, payload)
+	return result, err
+}
+
+func (ch *CommandHandler) applyViaLeaderWithOutcome(cmdType string, payload map[string]interface{}) (interface{}, raftApplyOutcome, error) {
+	return ch.applyViaLeaderContextWithOutcome(context.Background(), cmdType, payload)
+}
+
+func (ch *CommandHandler) applyViaLeaderContextWithOutcome(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, raftApplyOutcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result, err := ch.applyAndWaitContext(ctx, cmdType, payload)
+	result, localOutcome, err := ch.applyAndWaitContextWithOutcome(ctx, cmdType, payload)
 	if err == nil {
-		return result, nil
+		return result, raftApplyApplied, nil
 	}
 
 	if !ch.isDistributed() || ch.Cluster.Router == nil {
-		return nil, err
+		return nil, localOutcome, err
 	}
 
 	data, jsonErr := json.Marshal(payload)
 	if jsonErr != nil {
-		return nil, fmt.Errorf("marshal payload: %w", jsonErr)
+		return nil, localOutcome, fmt.Errorf("marshal payload: %w", jsonErr)
 	}
 
 	forwardCmd := fmt.Sprintf("RAFT_APPLY %stype=%s payload=%s", ch.internalAuthPrefix(), cmdType, string(data))
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, localOutcome, ctx.Err()
 	default:
 	}
 	resp, fwdErr := ch.Cluster.Router.ForwardToLeader(forwardCmd)
 	if fwdErr != nil {
-		return nil, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
+		return nil, raftApplyUnknown, fmt.Errorf("forward raft apply to leader: %w", fwdErr)
 	}
-	if code, isError := protocol.ErrorCode(resp); isError {
-		if strings.EqualFold(code, "PARTITION_LEADER_FENCED") {
-			return nil, fmt.Errorf("%w: remote partition commit rejected", clusterController.ErrPartitionLeaderFenced)
+	if parsed, isError := protocol.ParseErrorResponse(resp); isError {
+		remoteOutcome := raftApplyUnknown
+		switch parsed.Fields["outcome"] {
+		case "not_accepted":
+			remoteOutcome = raftApplyNotAccepted
+		case "rejected":
+			remoteOutcome = raftApplyRejected
+		case "applied":
+			remoteOutcome = raftApplyApplied
 		}
-		return nil, fmt.Errorf("leader raft apply: %s", resp)
+		if localOutcome == raftApplyUnknown && remoteOutcome != raftApplyApplied {
+			remoteOutcome = raftApplyUnknown
+		}
+		code := parsed.Code
+		if strings.EqualFold(code, "PARTITION_LEADER_FENCED") {
+			return nil, remoteOutcome, fmt.Errorf("%w: remote partition commit rejected", clusterController.ErrPartitionLeaderFenced)
+		}
+		return nil, remoteOutcome, fmt.Errorf("leader raft apply: %s", resp)
 	}
-	return resp, nil
+	return resp, raftApplyApplied, nil
 }
 
 func wireErrorCode(response string) string {
@@ -761,28 +806,28 @@ func wireErrorCode(response string) string {
 }
 
 func (ch *CommandHandler) applyAndWaitContext(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, error) {
-	result, _, err := ch.applyAndWaitContextWithAcceptance(ctx, cmdType, payload)
+	result, _, err := ch.applyAndWaitContextWithOutcome(ctx, cmdType, payload)
 	return result, err
 }
 
-func (ch *CommandHandler) applyAndWaitContextWithAcceptance(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, bool, error) {
+func (ch *CommandHandler) applyAndWaitContextWithOutcome(ctx context.Context, cmdType string, payload map[string]interface{}) (interface{}, raftApplyOutcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	select {
 	case <-ctx.Done():
-		return nil, false, ctx.Err()
+		return nil, raftApplyNotAccepted, ctx.Err()
 	default:
 	}
 	if ch.Cluster == nil {
-		return nil, false, fmt.Errorf("cluster controller is not initialized")
+		return nil, raftApplyNotAccepted, fmt.Errorf("cluster controller is not initialized")
 	}
 	if ch.Cluster.RaftManager == nil {
-		return nil, false, fmt.Errorf("raft manager not available")
+		return nil, raftApplyNotAccepted, fmt.Errorf("raft manager not available")
 	}
 	fsm := ch.Cluster.RaftManager.GetFSM()
 	if fsm == nil {
-		return nil, false, fmt.Errorf("fsm not available")
+		return nil, raftApplyNotAccepted, fmt.Errorf("fsm not available")
 	}
 
 	reqID := uuid.New().String()
@@ -790,7 +835,7 @@ func (ch *CommandHandler) applyAndWaitContextWithAcceptance(ctx context.Context,
 
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to marshal payload: %w", err)
+		return nil, raftApplyNotAccepted, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
 	respChan := fsm.RegisterNotifier(reqID)
@@ -798,9 +843,21 @@ func (ch *CommandHandler) applyAndWaitContextWithAcceptance(ctx context.Context,
 
 	err = ch.Cluster.RaftManager.ApplyCommand(cmdType, data)
 	if err != nil {
-		// ApplyCommand may return an error after Raft accepted the entry, so
-		// callers must treat cancellation from this point as an unknown outcome.
-		return nil, true, fmt.Errorf("raft apply failed: %w", err)
+		// A synchronous FSM response proves whether the accepted command was
+		// applied or rejected. Without one, only ErrNotLeader proves that this
+		// manager did not accept the command; every other failure is ambiguous.
+		select {
+		case res := <-respChan:
+			if applyErr, ok := res.(error); ok && applyErr != nil {
+				return nil, raftApplyRejected, applyErr
+			}
+			return res, raftApplyApplied, nil
+		default:
+		}
+		if errors.Is(err, raft.ErrNotLeader) {
+			return nil, raftApplyNotAccepted, fmt.Errorf("raft apply failed: %w", err)
+		}
+		return nil, raftApplyUnknown, fmt.Errorf("raft apply failed: %w", err)
 	}
 
 	timer := time.NewTimer(DefaultFSMApplyTimeout)
@@ -809,13 +866,13 @@ func (ch *CommandHandler) applyAndWaitContextWithAcceptance(ctx context.Context,
 	select {
 	case res := <-respChan:
 		if err, ok := res.(error); ok && err != nil {
-			return nil, true, err
+			return nil, raftApplyRejected, err
 		}
-		return res, true, nil
+		return res, raftApplyApplied, nil
 	case <-ctx.Done():
-		return nil, true, ctx.Err()
+		return nil, raftApplyUnknown, ctx.Err()
 	case <-timer.C:
-		return nil, true, fmt.Errorf("timeout waiting for FSM")
+		return nil, raftApplyUnknown, fmt.Errorf("timeout waiting for FSM")
 	}
 }
 

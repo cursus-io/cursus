@@ -548,6 +548,18 @@ func (m *Manager) AddMessage(id, producer string, epoch int64, op MessageOperati
 	if err := validateOwner(tx, producer, epoch); err != nil {
 		return err
 	}
+	if op.Message.ProducerID != "" && op.Message.SeqNum > 0 {
+		for _, existing := range tx.Messages {
+			if existing.Topic != op.Topic || existing.Partition != op.Partition ||
+				existing.Message.ProducerID != op.Message.ProducerID || existing.Message.Epoch != op.Message.Epoch || existing.Message.SeqNum != op.Message.SeqNum {
+				continue
+			}
+			if reflect.DeepEqual(existing, op) {
+				return nil
+			}
+			return fmt.Errorf("transaction request conflicts with existing producer sequence topic=%s partition=%d seq_num=%d", op.Topic, op.Partition, op.Message.SeqNum)
+		}
+	}
 	if transactionRecordCount(len(tx.Messages)+1, len(tx.Streams), len(tx.RequestAssignments)) > m.limits.MaxRecords {
 		return fmt.Errorf("transaction capacity exceeded: records=%d max_transaction_records=%d", transactionRecordCount(len(tx.Messages)+1, len(tx.Streams), len(tx.RequestAssignments)), m.limits.MaxRecords)
 	}
@@ -1171,6 +1183,7 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 		if current != nil {
 			m.releaseStreamReservationsLocked(current)
 		}
+		s.replicatedGeneration++
 		tx := transactionFromSnapshot(snap)
 		m.observeProducerEpoch(snap.Epoch)
 		s.put(tx)
@@ -1181,6 +1194,7 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 		return nil
 	}
 	if snapshotsEqual(current, snap) {
+		s.replicatedGeneration++
 		return nil
 	}
 	// A retried coordinator must re-propose its durable committing snapshot
@@ -1188,6 +1202,7 @@ func (m *Manager) ApplyReplicatedSnapshot(snap *Snapshot) error {
 	// successor committed decision, the predecessor is an idempotent no-op;
 	// it must never regress the terminal state.
 	if committedSnapshotSucceeds(current, snap) {
+		s.replicatedGeneration++
 		return nil
 	}
 	return fmt.Errorf("stale transaction snapshot transactional_id=%s current_epoch=%d current_revision=%d incoming_epoch=%d incoming_revision=%d", snap.ID, current.Epoch, current.Revision, snap.Epoch, snap.Revision)
@@ -1304,7 +1319,53 @@ func snapshotsEqual(current *Transaction, incoming *Snapshot) bool {
 		reflect.DeepEqual(current.Streams, incoming.Streams) &&
 		reflect.DeepEqual(current.Offsets, incoming.Offsets) &&
 		reflect.DeepEqual(current.Participants, incoming.Participants) &&
+		maps.Equal(current.SequenceByPartition, incoming.SequenceByPartition) &&
+		maps.Equal(current.RequestAssignments, incoming.RequestAssignments) &&
 		current.Deadline.Equal(incoming.Deadline)
+}
+
+// ReplicatedApplyGeneration returns the shard-local Raft application fence.
+func (m *Manager) ReplicatedApplyGeneration(id string) uint64 {
+	s := m.shardForID(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replicatedGeneration
+}
+
+// RestoreSnapshotIfCurrent atomically rolls back one speculative local
+// mutation. The snapshot and Raft generation guards prevent a late failure
+// from overwriting a replicated application or a concurrent recovery step.
+func (m *Manager) RestoreSnapshotIfCurrent(expected, previous *Snapshot, replicatedGeneration uint64) bool {
+	if expected == nil || expected.ID == "" || previous != nil && previous.ID != expected.ID {
+		return false
+	}
+	s := m.shardForID(expected.ID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, expected.ID, transactionDecisionTuple(s.txns[expected.ID]))
+	if s.replicatedGeneration != replicatedGeneration {
+		return false
+	}
+
+	current := s.txns[expected.ID]
+	if current == nil || !snapshotsEqual(current, expected) {
+		return false
+	}
+	m.releaseStreamReservationsLocked(current)
+	if previous == nil {
+		s.remove(expected.ID)
+		m.releaseTransactionSlot()
+		return true
+	}
+
+	tx := transactionFromSnapshot(previous)
+	m.observeProducerEpoch(previous.Epoch)
+	s.put(tx)
+	m.reserveStreamsLocked(tx)
+	if previous.State == StateCommitted {
+		m.indexCommittedOffsets(previous.Offsets)
+	}
+	return true
 }
 
 func (m *Manager) Delete(id string) {

@@ -42,15 +42,16 @@ func (q *deadlineQueue) Pop() interface{} {
 }
 
 type managerShard struct {
-	mu           sync.Mutex
-	txns         map[string]*Transaction
-	prepared     map[string]struct{}
-	nonTerminal  map[string]struct{}
-	deadlines    deadlineQueue
-	deadlineByID map[string]*deadlineItem
-	expirations  deadlineQueue
-	expiryByID   map[string]*deadlineItem
-	expiration   time.Duration
+	mu                   sync.Mutex
+	txns                 map[string]*Transaction
+	prepared             map[string]struct{}
+	nonTerminal          map[string]struct{}
+	deadlines            deadlineQueue
+	deadlineByID         map[string]*deadlineItem
+	expirations          deadlineQueue
+	expiryByID           map[string]*deadlineItem
+	expiration           time.Duration
+	replicatedGeneration uint64
 }
 
 func newManagerShard(expiration time.Duration) managerShard {

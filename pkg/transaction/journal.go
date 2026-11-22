@@ -272,28 +272,36 @@ func InspectJournalManifest(journalPath string, journal JournalInspection) (Jour
 	return JournalManifestInspection{Present: true, State: manifest.State}, nil
 }
 
-func (j *Journal) Append(snap *Snapshot) (err error) {
+func (j *Journal) Append(snap *Snapshot) error {
+	_, err := j.AppendWithDurability(snap)
+	return err
+}
+
+// AppendWithDurability reports whether the complete record reached the fsync
+// boundary. Manifest maintenance can fail after that point without making the
+// transaction snapshot safe to roll back in memory.
+func (j *Journal) AppendWithDurability(snap *Snapshot) (durable bool, err error) {
 	if snap == nil || snap.ID == "" {
-		return fmt.Errorf("invalid transaction snapshot")
+		return false, fmt.Errorf("invalid transaction snapshot")
 	}
 	if snap.Epoch < 0 {
-		return fmt.Errorf("invalid producer epoch %d", snap.Epoch)
+		return false, fmt.Errorf("invalid producer epoch %d", snap.Epoch)
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.loaded {
 		if _, err := j.loadLocked(); err != nil {
-			return fmt.Errorf("recover transaction journal before append: %w", err)
+			return false, fmt.Errorf("recover transaction journal before append: %w", err)
 		}
 	}
 	if j.shouldCompactLocked() {
 		if err := j.compactLocked(); err != nil {
-			return fmt.Errorf("compact transaction journal: %w", err)
+			return false, fmt.Errorf("compact transaction journal: %w", err)
 		}
 	}
 	payload, delta, err := j.encodeAppendRecordLocked(snap)
 	if err != nil {
-		return err
+		return false, err
 	}
 	payloadLen := len(payload)
 	var header [4]byte
@@ -304,36 +312,36 @@ func (j *Journal) Append(snap *Snapshot) (err error) {
 
 	file, err := os.OpenFile(j.path, os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("open transaction journal for append: %w", err)
+		return false, fmt.Errorf("open transaction journal for append: %w", err)
 	}
 	defer func() {
 		err = errors.Join(err, file.Close())
 	}()
 
 	if err := file.Truncate(j.validEnd); err != nil {
-		return fmt.Errorf("truncate unacknowledged transaction journal tail: %w", err)
+		return false, fmt.Errorf("truncate unacknowledged transaction journal tail: %w", err)
 	}
 	if _, err := file.Seek(j.validEnd, io.SeekStart); err != nil {
-		return fmt.Errorf("seek transaction journal append position: %w", err)
+		return false, fmt.Errorf("seek transaction journal append position: %w", err)
 	}
 	if err := writeFull(file, header[:]); err != nil {
-		return fmt.Errorf("append transaction journal header: %w", err)
+		return false, fmt.Errorf("append transaction journal header: %w", err)
 	}
 	if err := writeFull(file, payload); err != nil {
-		return fmt.Errorf("append transaction journal payload: %w", err)
+		return false, fmt.Errorf("append transaction journal payload: %w", err)
 	}
 	if err := writeFull(file, checksum[:]); err != nil {
-		return fmt.Errorf("append transaction journal checksum: %w", err)
+		return false, fmt.Errorf("append transaction journal checksum: %w", err)
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync transaction journal: %w", err)
+		return false, fmt.Errorf("sync transaction journal: %w", err)
 	}
 	recordBytes := journalRecordSize(payloadLen)
 	j.validEnd += recordBytes
 	j.replaceLatestLocked(snap, recordBytes, delta)
 	j.nextProducerEpoch = max(j.nextProducerEpoch, uint64(snap.Epoch)+1)
 	j.records++
-	return j.writeManifestLocked()
+	return true, j.writeManifestLocked()
 }
 
 func (j *Journal) encodeAppendRecordLocked(snap *Snapshot) ([]byte, bool, error) {
