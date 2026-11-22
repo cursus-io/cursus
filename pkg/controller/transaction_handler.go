@@ -97,12 +97,7 @@ func (ch *CommandHandler) handleInitProducerID(cmd string, contexts ...*ClientCo
 			return fmt.Sprintf("ERROR: init_producer_failed reason=%q", err.Error())
 		}
 	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		if hadPrevious {
-			ch.TxnManager.ApplySnapshot(previousSnap)
-		} else {
-			ch.TxnManager.Delete(txnID)
-		}
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s producerId=%s epoch=%d", txnID, producerID, epoch)
@@ -134,6 +129,14 @@ func (ch *CommandHandler) handleBeginTxn(cmd string, contexts ...*ClientContext)
 	if resp := ch.requireTransactionMode(txnID, ctx); resp != "" {
 		return resp
 	}
+	if hadPrevious && previousSnap.State == transaction.StateOpen && previousSnap.Producer == producerID && previousSnap.Epoch == epoch {
+		// The first BEGIN_TXN acknowledgement may have been lost after the
+		// snapshot became durable. Re-sync the exact open revision on retry.
+		if err := ch.syncTransactionState(txnID); err != nil {
+			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
+		}
+		return fmt.Sprintf("OK transactional_id=%s state=open producerId=%s epoch=%d", txnID, producerID, epoch)
+	}
 	deadline := time.Time{}
 	if current, statusErr := ch.TxnManager.Status(txnID); statusErr == nil && current.Mode == transaction.ModeProcessingV1 {
 		deadline = time.Now().Add(transactionTimeout(ch.Config))
@@ -144,8 +147,7 @@ func (ch *CommandHandler) handleBeginTxn(cmd string, contexts ...*ClientContext)
 		}
 		return fmt.Sprintf("ERROR: transaction_begin_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s state=open producerId=%s epoch=%d", txnID, producerID, epoch)
@@ -248,8 +250,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 		if err := ch.TxnManager.AddParticipant(txnID, producerID, epoch, participant, time.Time{}); err != nil {
 			return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
 		}
-		if err := ch.syncTransactionState(txnID); err != nil {
-			ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+		if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
 			return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 		}
 		if err := ch.publishCommittedTransactionMessage(transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
@@ -260,8 +261,7 @@ func (ch *CommandHandler) handleTxnPublish(cmd string, ctx ...*ClientContext) st
 	if err := ch.TxnManager.AddMessage(txnID, producerID, epoch, transaction.MessageOperation{Topic: topicName, Partition: partition, Message: msg}); err != nil {
 		return fmt.Sprintf("ERROR: transaction_publish_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_messages=1 topic=%s partition=%d", txnID, topicName, partition)
@@ -428,8 +428,7 @@ func (ch *CommandHandler) handleTxnAppendStreamLocked(cmd string, contexts ...*C
 		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
 		return fmt.Sprintf("ERROR: transaction_stream_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	if err := ch.publishCommittedTransactionMessage(transaction.MessageOperation{Topic: topicName, Partition: partition, Message: message}); err != nil {
@@ -529,8 +528,7 @@ func (ch *CommandHandler) handleSendOffsetsToTxn(cmd string, contexts ...*Client
 	if err := ch.TxnManager.AddOffsets(txnID, producerID, epoch, ops); err != nil {
 		return fmt.Sprintf("ERROR: transaction_offsets_failed reason=%q", err.Error())
 	}
-	if err := ch.syncTransactionState(txnID); err != nil {
-		ch.restoreTransaction(txnID, previousSnap, hadPrevious)
+	if err := ch.syncTransactionMutation(txnID, previousSnap, hadPrevious); err != nil {
 		return fmt.Sprintf("ERROR: transaction_sync_failed reason=%q", err.Error())
 	}
 	return fmt.Sprintf("OK transactional_id=%s staged_offsets=%d", txnID, len(ops))

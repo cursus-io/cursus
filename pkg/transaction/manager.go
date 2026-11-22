@@ -1304,7 +1304,42 @@ func snapshotsEqual(current *Transaction, incoming *Snapshot) bool {
 		reflect.DeepEqual(current.Streams, incoming.Streams) &&
 		reflect.DeepEqual(current.Offsets, incoming.Offsets) &&
 		reflect.DeepEqual(current.Participants, incoming.Participants) &&
+		maps.Equal(current.SequenceByPartition, incoming.SequenceByPartition) &&
+		maps.Equal(current.RequestAssignments, incoming.RequestAssignments) &&
 		current.Deadline.Equal(incoming.Deadline)
+}
+
+// RestoreSnapshotIfCurrent atomically rolls back one speculative local
+// mutation. The expected snapshot guard prevents a late failure from
+// overwriting a newer Raft application or a concurrent recovery step.
+func (m *Manager) RestoreSnapshotIfCurrent(expected, previous *Snapshot) bool {
+	if expected == nil || expected.ID == "" || previous != nil && previous.ID != expected.ID {
+		return false
+	}
+	s := m.shardForID(expected.ID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer m.recordDecisionChangeLocked(s, expected.ID, transactionDecisionTuple(s.txns[expected.ID]))
+
+	current := s.txns[expected.ID]
+	if current == nil || !snapshotsEqual(current, expected) {
+		return false
+	}
+	m.releaseStreamReservationsLocked(current)
+	if previous == nil {
+		s.remove(expected.ID)
+		m.releaseTransactionSlot()
+		return true
+	}
+
+	tx := transactionFromSnapshot(previous)
+	m.observeProducerEpoch(previous.Epoch)
+	s.put(tx)
+	m.reserveStreamsLocked(tx)
+	if previous.State == StateCommitted {
+		m.indexCommittedOffsets(previous.Offsets)
+	}
+	return true
 }
 
 func (m *Manager) Delete(id string) {

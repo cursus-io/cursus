@@ -2,6 +2,7 @@ package transaction
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +105,47 @@ func TestManagerPersistsTransactionalRequestAssignments(t *testing.T) {
 	restored := transactionFromSnapshot(snapshot(tx))
 	if restored.SequenceByPartition["history:1"] != 1 || restored.RequestAssignments[transactionRequestKey("history", -1, 1)] != first {
 		t.Fatalf("transaction snapshot lost request assignment state: sequences=%+v assignments=%+v", restored.SequenceByPartition, restored.RequestAssignments)
+	}
+}
+
+func TestRestoreSnapshotIfCurrentDoesNotOverwriteNewerState(t *testing.T) {
+	m := NewManager()
+	producer, epoch, err := m.InitProducerWithMode("guarded-rollback", ModeProcessingV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, ok := m.Snapshot("guarded-rollback")
+	if !ok {
+		t.Fatal("missing initialized snapshot")
+	}
+	if err := m.Begin("guarded-rollback", producer, epoch); err != nil {
+		t.Fatal(err)
+	}
+	expected, ok := m.Snapshot("guarded-rollback")
+	if !ok {
+		t.Fatal("missing speculative snapshot")
+	}
+	if _, _, err := m.ResolveRequestAssignment("guarded-rollback", producer, epoch, "orders", -1, 1, 0, "request"); err != nil {
+		t.Fatal(err)
+	}
+	newer, ok := m.Snapshot("guarded-rollback")
+	if !ok {
+		t.Fatal("missing newer snapshot")
+	}
+
+	if m.RestoreSnapshotIfCurrent(expected, previous) {
+		t.Fatal("stale rollback overwrote a newer transaction snapshot")
+	}
+	current, _ := m.Snapshot("guarded-rollback")
+	if !reflect.DeepEqual(newer, current) {
+		t.Fatalf("newer snapshot changed after stale rollback: got=%+v want=%+v", current, newer)
+	}
+	if !m.RestoreSnapshotIfCurrent(newer, previous) {
+		t.Fatal("exact speculative snapshot was not restored")
+	}
+	restored, _ := m.Snapshot("guarded-rollback")
+	if !reflect.DeepEqual(previous, restored) {
+		t.Fatalf("unexpected restored snapshot: got=%+v want=%+v", restored, previous)
 	}
 }
 

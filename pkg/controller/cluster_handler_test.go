@@ -1,6 +1,9 @@
 package controller
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,16 +14,30 @@ import (
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/topic"
+	"github.com/cursus-io/cursus/pkg/transaction"
 	"github.com/cursus-io/cursus/pkg/types"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
 
 type MockRaftManagerForForward struct {
 	isLeader      bool
 	leaderAddress atomic.Value
 	state         *fsm.BrokerFSM
+	applyState    *fsm.BrokerFSM
+	preApplyErr   error
+	applyErr      error
 	raftStatus    replication.RaftStatus
 	raftStatusErr error
+}
+
+func requireTransactionSnapshotsEqual(t *testing.T, expected, actual *transaction.Snapshot) {
+	t.Helper()
+	expectedJSON, err := json.Marshal(expected)
+	require.NoError(t, err)
+	actualJSON, err := json.Marshal(actual)
+	require.NoError(t, err)
+	require.JSONEq(t, string(expectedJSON), string(actualJSON))
 }
 
 func (m *MockRaftManagerForForward) IsLeader() bool { return m.isLeader }
@@ -32,14 +49,21 @@ func (m *MockRaftManagerForForward) GetLeaderAddress() string {
 	return addr.(string)
 }
 func (m *MockRaftManagerForForward) ApplyCommand(prefix string, data []byte) error {
-	if m.state == nil {
+	if m.preApplyErr != nil {
+		return m.preApplyErr
+	}
+	state := m.state
+	if m.applyState != nil {
+		state = m.applyState
+	}
+	if state == nil {
 		return nil
 	}
-	result := m.state.Apply(&raft.Log{Data: append([]byte(prefix+":"), data...)})
+	result := state.Apply(&raft.Log{Data: append([]byte(prefix+":"), data...)})
 	if err, ok := result.(error); ok {
 		return err
 	}
-	return nil
+	return m.applyErr
 }
 func (m *MockRaftManagerForForward) LeaderCh() <-chan bool  { return nil }
 func (m *MockRaftManagerForForward) GetFSM() *fsm.BrokerFSM { return m.state }
@@ -97,4 +121,117 @@ func TestWireErrorCodeRequiresExactErrorToken(t *testing.T) {
 	if got := wireErrorCode("ERROR: raft_apply_failed reason=PARTITION_LEADER_FENCED"); got != "RAFT_APPLY_FAILED" {
 		t.Fatalf("wireErrorCode() matched an embedded reason: %q", got)
 	}
+}
+
+func TestApplyAndWaitClassifiesDurableApplyWithLostResponseAsUnknown(t *testing.T) {
+	localFSM := fsm.NewBrokerFSM(nil, nil)
+	localFSM.SetTransactionManager(transaction.NewManager())
+	remoteManager := transaction.NewManager()
+	remoteFSM := fsm.NewBrokerFSM(nil, nil)
+	remoteFSM.SetTransactionManager(remoteManager)
+	raftManager := &MockRaftManagerForForward{
+		state:      localFSM,
+		applyState: remoteFSM,
+		applyErr:   errors.New("lost raft response"),
+	}
+	ch := NewCommandHandler(nil, &config.Config{EnabledDistribution: true}, nil, nil, &controller.ClusterController{RaftManager: raftManager})
+	t.Cleanup(func() { _ = ch.Close() })
+
+	producer, epoch, err := ch.TxnManager.InitProducer("lost-response")
+	require.NoError(t, err)
+	require.NoError(t, ch.TxnManager.Begin("lost-response", producer, epoch))
+	snapshot, ok := ch.TxnManager.Snapshot("lost-response")
+	require.True(t, ok)
+	payload, err := ch.transactionSyncPayload(snapshot)
+	require.NoError(t, err)
+
+	_, outcome, err := ch.applyViaLeaderWithOutcome("TXN_SYNC", payload)
+	require.ErrorContains(t, err, "lost raft response")
+	require.Equal(t, raftApplyUnknown, outcome)
+	remoteSnapshot, ok := remoteManager.Snapshot("lost-response")
+	require.True(t, ok)
+	requireTransactionSnapshotsEqual(t, snapshot, remoteSnapshot)
+}
+
+func TestApplyAndWaitClassifiesFSMRejection(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	state.SetTransactionManager(transaction.NewManager())
+	raftManager := &MockRaftManagerForForward{state: state}
+	ch := NewCommandHandler(nil, &config.Config{EnabledDistribution: true}, nil, nil, &controller.ClusterController{RaftManager: raftManager})
+	t.Cleanup(func() { _ = ch.Close() })
+
+	producer, epoch, err := ch.TxnManager.InitProducer("rejected")
+	require.NoError(t, err)
+	stale, ok := ch.TxnManager.Snapshot("rejected")
+	require.True(t, ok)
+	require.NoError(t, ch.TxnManager.Begin("rejected", producer, epoch))
+	payload, err := ch.transactionSyncPayload(stale)
+	require.NoError(t, err)
+
+	_, outcome, err := ch.applyViaLeaderWithOutcome("TXN_SYNC", payload)
+	require.ErrorContains(t, err, "stale transaction snapshot")
+	require.Equal(t, raftApplyRejected, outcome)
+}
+
+func TestTransactionSyncRollbackDependsOnRaftOutcome(t *testing.T) {
+	t.Run("not accepted restores previous snapshot", func(t *testing.T) {
+		localFSM := fsm.NewBrokerFSM(nil, nil)
+		localFSM.SetTransactionManager(transaction.NewManager())
+		raftManager := &MockRaftManagerForForward{state: localFSM, preApplyErr: raft.ErrNotLeader}
+		ch := NewCommandHandler(nil, &config.Config{EnabledDistribution: true}, nil, nil, &controller.ClusterController{RaftManager: raftManager})
+		t.Cleanup(func() { _ = ch.Close() })
+
+		producer, epoch, err := ch.TxnManager.InitProducer("not-accepted")
+		require.NoError(t, err)
+		previous, ok := ch.TxnManager.Snapshot("not-accepted")
+		require.True(t, ok)
+		require.NoError(t, ch.TxnManager.Begin("not-accepted", producer, epoch))
+
+		err = ch.syncTransactionMutation("not-accepted", previous, true)
+		require.ErrorIs(t, err, raft.ErrNotLeader)
+		current, ok := ch.TxnManager.Snapshot("not-accepted")
+		require.True(t, ok)
+		require.Equal(t, previous, current)
+	})
+
+	t.Run("durable apply with lost response preserves retryable snapshot", func(t *testing.T) {
+		localFSM := fsm.NewBrokerFSM(nil, nil)
+		localFSM.SetTransactionManager(transaction.NewManager())
+		remoteManager := transaction.NewManager()
+		remoteFSM := fsm.NewBrokerFSM(nil, nil)
+		remoteFSM.SetTransactionManager(remoteManager)
+		raftManager := &MockRaftManagerForForward{
+			state:      localFSM,
+			applyState: remoteFSM,
+			applyErr:   errors.New("lost raft response"),
+		}
+		ch := NewCommandHandler(nil, &config.Config{EnabledDistribution: true}, nil, nil, &controller.ClusterController{RaftManager: raftManager})
+		t.Cleanup(func() { _ = ch.Close() })
+
+		producer, epoch, err := ch.TxnManager.InitProducer("unknown")
+		require.NoError(t, err)
+		previous, ok := ch.TxnManager.Snapshot("unknown")
+		require.True(t, ok)
+		require.NoError(t, ch.TxnManager.Begin("unknown", producer, epoch))
+		candidate, ok := ch.TxnManager.Snapshot("unknown")
+		require.True(t, ok)
+
+		err = ch.syncTransactionMutation("unknown", previous, true)
+		require.ErrorContains(t, err, "lost raft response")
+		current, ok := ch.TxnManager.Snapshot("unknown")
+		require.True(t, ok)
+		require.Equal(t, candidate, current)
+		remote, ok := remoteManager.Snapshot("unknown")
+		require.True(t, ok)
+		requireTransactionSnapshotsEqual(t, candidate, remote)
+
+		// Re-syncing the same client operation is idempotent and reuses the
+		// exact durable open state.
+		ch.Config.EnabledDistribution = false
+		response := ch.handleBeginTxn(fmt.Sprintf("BEGIN_TXN transactional_id=unknown producerId=%s epoch=%d", producer, epoch))
+		require.Contains(t, response, "OK ")
+		retried, ok := ch.TxnManager.Snapshot("unknown")
+		require.True(t, ok)
+		require.Equal(t, candidate, retried)
+	})
 }
