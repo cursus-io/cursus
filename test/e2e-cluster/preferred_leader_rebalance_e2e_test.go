@@ -62,9 +62,10 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 		}
 	}
 	producer := e2e.NewBrokerClient(survivors)
-	for sequence := uint64(0); sequence < 16; sequence++ {
+	producerEpoch := time.Now().UnixNano()
+	for sequence := uint64(1); sequence <= 16; sequence++ {
 		require.NoError(t, eventually(t, fmt.Sprintf("idempotent publish after failover sequence %d", sequence), clusterReadyTimeout, func() (bool, string, error) {
-			err := producer.PublishIdempotentToPartition(ctx.GetTopic(), "preferred-leader-e2e", 0, sequence, 0, fmt.Sprintf("event-%d", sequence), "all", true)
+			err := producer.PublishIdempotentToPartition(ctx.GetTopic(), "preferred-leader-e2e", 0, sequence, producerEpoch, fmt.Sprintf("event-%d", sequence), "all", true)
 			return err == nil, fmt.Sprintf("sequence=%d err=%v", sequence, err), nil
 		}))
 	}
