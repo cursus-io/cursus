@@ -3,15 +3,18 @@ package fsm
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
 type LeaderElectionCommand struct {
-	ReqID               string `json:"req_id,omitempty"`
-	Topic               string `json:"topic"`
-	Partition           int    `json:"partition"`
-	Broker              string `json:"broker"`
-	ExpectedLeaderEpoch int    `json:"expected_leader_epoch"`
+	ReqID                  string   `json:"req_id,omitempty"`
+	Topic                  string   `json:"topic"`
+	Partition              int      `json:"partition"`
+	Broker                 string   `json:"broker"`
+	ExpectedLeaderEpoch    int      `json:"expected_leader_epoch"`
+	ExpectedLifecycleEpoch uint64   `json:"expected_lifecycle_epoch"`
+	ExpectedReplicas       []string `json:"expected_replicas"`
 }
 
 type LeaderElectionResult struct {
@@ -37,6 +40,12 @@ func (f *BrokerFSM) applyLeaderElectionCommand(jsonData string) interface{} {
 	if strings.TrimSpace(cmd.Broker) == "" {
 		return fmt.Errorf("leader election broker is required")
 	}
+	if cmd.ExpectedLifecycleEpoch == 0 {
+		return fmt.Errorf("leader election expected lifecycle epoch is required")
+	}
+	if len(cmd.ExpectedReplicas) == 0 {
+		return fmt.Errorf("leader election expected replicas are required")
+	}
 
 	key := fmt.Sprintf("%s-%d", cmd.Topic, cmd.Partition)
 	f.mu.Lock()
@@ -45,6 +54,19 @@ func (f *BrokerFSM) applyLeaderElectionCommand(jsonData string) interface{} {
 	metadata := f.partitionMetadata[key]
 	if metadata == nil {
 		return fmt.Errorf("partition metadata %s not found", key)
+	}
+	definition := f.topicState[cmd.Topic]
+	if definition == nil {
+		return fmt.Errorf("topic definition %s not found", cmd.Topic)
+	}
+	if definition.LifecycleEpoch != cmd.ExpectedLifecycleEpoch || metadata.LifecycleEpoch != cmd.ExpectedLifecycleEpoch {
+		return fmt.Errorf(
+			"stale lifecycle epoch for %s: topic=%d partition=%d expected=%d",
+			key, definition.LifecycleEpoch, metadata.LifecycleEpoch, cmd.ExpectedLifecycleEpoch,
+		)
+	}
+	if !slices.Equal(metadata.Replicas, cmd.ExpectedReplicas) {
+		return fmt.Errorf("stale replica assignment for %s: current=%v expected=%v", key, metadata.Replicas, cmd.ExpectedReplicas)
 	}
 	broker := f.brokers[cmd.Broker]
 	if broker == nil {

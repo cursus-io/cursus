@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	clusterController "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
 	"github.com/cursus-io/cursus/pkg/config"
 	"github.com/cursus-io/cursus/pkg/coordinator"
@@ -14,6 +15,42 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
+
+func TestElectLeaderPopulatesTopologyFences(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	for _, broker := range []fsm.BrokerInfo{
+		{ID: "broker-1", Addr: "broker-1:9001", Status: "active"},
+		{ID: "broker-2", Addr: "broker-2:9001", Status: "active"},
+	} {
+		encoded, err := json.Marshal(broker)
+		require.NoError(t, err)
+		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), encoded...)}))
+	}
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.ReplicationFactor = 2
+	encoded, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), encoded...)}))
+	metadata := fsm.PartitionMetadata{
+		Leader: "broker-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		PartitionCount: 1, Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"},
+	}
+	encoded, err = json.Marshal(metadata)
+	require.NoError(t, err)
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(encoded))}))
+
+	raftManager := &MockRaftManagerForForward{isLeader: true, state: state}
+	raftManager.leaderAddress.Store("broker-1:9001")
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := NewCommandHandler(nil, cfg, nil, nil, &clusterController.ClusterController{RaftManager: raftManager})
+	t.Cleanup(func() { require.NoError(t, handler.Close()) })
+
+	response := handler.handleElectLeader("ELECT_LEADER topic=orders partition=0 broker=broker-2")
+	require.Contains(t, response, "OK topic=orders partition=0")
+	require.Contains(t, response, "leader=broker-2")
+	require.Equal(t, 5, state.GetPartitionMetadata("orders-0").LeaderEpoch)
+}
 
 func TestClusterStatusExposesCommittedCleanupPendingOnWire(t *testing.T) {
 	cfg := config.DefaultConfig()

@@ -212,10 +212,12 @@ func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) s
 	}
 
 	result, err := ch.applyAndWaitContext(requestCtx, "LEADER_ELECTION", map[string]interface{}{
-		"topic":                 topicName,
-		"partition":             partition,
-		"broker":                brokerID,
-		"expected_leader_epoch": metadata.LeaderEpoch,
+		"topic":                    topicName,
+		"partition":                partition,
+		"broker":                   brokerID,
+		"expected_leader_epoch":    metadata.LeaderEpoch,
+		"expected_lifecycle_epoch": metadata.LifecycleEpoch,
+		"expected_replicas":        append([]string(nil), metadata.Replicas...),
 	})
 	if err != nil {
 		return fmt.Sprintf("ERROR: leader_election_rejected topic=%s partition=%d broker=%s reason=%q", topicName, partition, brokerID, err.Error())
