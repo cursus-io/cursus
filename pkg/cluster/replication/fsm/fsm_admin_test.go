@@ -62,8 +62,10 @@ func adminTestFSM(t *testing.T, broker2Status string) *BrokerFSM {
 func validLeaderElectionCommand() LeaderElectionCommand {
 	return LeaderElectionCommand{
 		Topic: "orders", Partition: 0, Broker: "broker-2", ExpectedLeaderEpoch: 7,
-		ExpectedLifecycleEpoch: topic.InitialLifecycleEpoch,
-		ExpectedReplicas:       []string{"broker-1", "broker-2", "broker-3"},
+		TopologyFenceVersion:       LeaderElectionTopologyFenceVersionCurrent,
+		ExpectedLifecycleEpoch:     topic.InitialLifecycleEpoch,
+		ExpectedDefinitionRevision: topic.InitialDefinitionRevision,
+		ExpectedReplicas:           []string{"broker-1", "broker-2", "broker-3"},
 	}
 }
 
@@ -110,6 +112,51 @@ func TestLeaderElectionRetryIsIdempotent(t *testing.T) {
 	}
 	if metadata := state.GetPartitionMetadata("orders-0"); metadata.LeaderEpoch != 8 {
 		t.Fatalf("retry advanced leader epoch: %+v", metadata)
+	}
+}
+
+func TestLeaderElectionReplaysLegacyCommandWithoutTopologyFields(t *testing.T) {
+	state := adminTestFSM(t, "active")
+	legacy := []byte(`{"topic":"orders","partition":0,"broker":"broker-2","expected_leader_epoch":7}`)
+	result := state.Apply(&raft.Log{Data: append([]byte("LEADER_ELECTION:"), legacy...)})
+	election, ok := result.(LeaderElectionResult)
+	if !ok || !election.Changed || election.Leader != "broker-2" || election.LeaderEpoch != 8 {
+		t.Fatalf("legacy leader election did not replay: %T %+v", result, result)
+	}
+}
+
+func TestLeaderElectionRejectsInvalidTopologyFenceEncoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*LeaderElectionCommand)
+		message string
+	}{
+		{
+			name: "unversioned command with fence fields",
+			mutate: func(command *LeaderElectionCommand) {
+				command.TopologyFenceVersion = 0
+			},
+			message: "unversioned leader election contains topology fence fields",
+		},
+		{
+			name: "unsupported fence version",
+			mutate: func(command *LeaderElectionCommand) {
+				command.TopologyFenceVersion++
+			},
+			message: "unsupported leader election topology fence version",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := adminTestFSM(t, "active")
+			command := validLeaderElectionCommand()
+			test.mutate(&command)
+			result := applyLeaderElection(t, state, command)
+			err, ok := result.(error)
+			if !ok || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("expected %q, got %T %v", test.message, result, result)
+			}
+		})
 	}
 }
 
@@ -187,6 +234,27 @@ func TestLeaderElectionRejectsStaleTopologyBeforeIdempotentSuccess(t *testing.T)
 			},
 			want: "stale replica assignment",
 		},
+		{
+			name: "topic definition changed",
+			mutate: func(state *BrokerFSM) {
+				state.topicState["orders"].Revision++
+			},
+			want: "stale definition revision",
+		},
+		{
+			name: "replication factor changed",
+			mutate: func(state *BrokerFSM) {
+				state.topicState["orders"].ReplicationFactor--
+			},
+			want: "stale replication factor",
+		},
+		{
+			name: "replica recovery started",
+			mutate: func(state *BrokerFSM) {
+				state.partitionMetadata["orders-0"].RecoveryReplicas = []string{"broker-3"}
+			},
+			want: "replica recovery pending",
+		},
 	}
 
 	for _, test := range tests {
@@ -214,8 +282,10 @@ func TestLeaderElectionRejectsMissingPartition(t *testing.T) {
 	state := adminTestFSM(t, "active")
 	result := applyLeaderElection(t, state, LeaderElectionCommand{
 		Topic: "missing", Partition: 1, Broker: "broker-2", ExpectedLeaderEpoch: 1,
-		ExpectedLifecycleEpoch: topic.InitialLifecycleEpoch,
-		ExpectedReplicas:       []string{"broker-1", "broker-2"},
+		TopologyFenceVersion:       LeaderElectionTopologyFenceVersionCurrent,
+		ExpectedLifecycleEpoch:     topic.InitialLifecycleEpoch,
+		ExpectedDefinitionRevision: topic.InitialDefinitionRevision,
+		ExpectedReplicas:           []string{"broker-1", "broker-2"},
 	})
 	err, ok := result.(error)
 	if !ok || !strings.Contains(err.Error(), fmt.Sprintf("%s-%d", "missing", 1)) {

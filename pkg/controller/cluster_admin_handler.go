@@ -210,14 +210,20 @@ func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) s
 	if metadata == nil {
 		return fmt.Sprintf("ERROR: partition_not_found topic=%s partition=%d", topicName, partition)
 	}
+	definition, found := state.GetTopicDefinition(topicName)
+	if !found {
+		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
+	}
 
 	result, err := ch.applyAndWaitContext(requestCtx, "LEADER_ELECTION", map[string]interface{}{
-		"topic":                    topicName,
-		"partition":                partition,
-		"broker":                   brokerID,
-		"expected_leader_epoch":    metadata.LeaderEpoch,
-		"expected_lifecycle_epoch": metadata.LifecycleEpoch,
-		"expected_replicas":        append([]string(nil), metadata.Replicas...),
+		"topic":                        topicName,
+		"partition":                    partition,
+		"broker":                       brokerID,
+		"expected_leader_epoch":        metadata.LeaderEpoch,
+		"topology_fence_version":       fsm.LeaderElectionTopologyFenceVersionCurrent,
+		"expected_lifecycle_epoch":     metadata.LifecycleEpoch,
+		"expected_definition_revision": definition.Revision,
+		"expected_replicas":            append([]string(nil), metadata.Replicas...),
 	})
 	if err != nil {
 		return fmt.Sprintf("ERROR: leader_election_rejected topic=%s partition=%d broker=%s reason=%q", topicName, partition, brokerID, err.Error())
