@@ -1,0 +1,13 @@
+services:
+  broker-1:
+    environment:
+      LEADER_REBALANCE_INTERVAL_MS: "60000"
+      LEADER_REBALANCE_MAX_MOVES_PER_CYCLE: "8"
+  broker-2:
+    environment:
+      LEADER_REBALANCE_INTERVAL_MS: "60000"
+      LEADER_REBALANCE_MAX_MOVES_PER_CYCLE: "8"
+  broker-3:
+    environment:
+      LEADER_REBALANCE_INTERVAL_MS: "60000"
+      LEADER_REBALANCE_MAX_MOVES_PER_CYCLE: "8"

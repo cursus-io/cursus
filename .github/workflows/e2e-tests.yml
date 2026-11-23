@@ -648,6 +648,12 @@ jobs:
         run: |
           go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestGroupCoordinatorFailoverUsesDurableMembership$' -count=1
 
+      - name: Run preferred leader recovery E2E
+        env:
+          RUN_E2E_LEADER_REBALANCE: "1"
+        run: |
+          go test -v -timeout 20m ./test/e2e-cluster/... -run '^TestPreferredLeaderReturnsWithoutReplicaRecovery$' -count=1
+
       - name: Show cluster logs on failure
         if: failure()
         working-directory: test/e2e-cluster
