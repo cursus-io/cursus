@@ -17,6 +17,9 @@ func init() {
 	prometheus.MustRegister(MessagesProcessed, MessagesPerSec, LatencyHist, QueueSize, CleanupCount, SeqNumGapTotal, SeqNumDuplicateTotal)
 	prometheus.MustRegister(ClientConnectionsTotal, ClientConnectionsActive, ClientResponseWriteFailures, StreamTransientOffsetFences, StreamTransientOffsetFenceRechecks, StreamTransientOffsetFenceDuration, RequestsInflight, RequestBytesInflight, RequestAdmissionWaiters, RequestAdmissionRejections, CommandsTotal, CommandDuration, CommandErrors, PublishAcknowledgements, AsyncReplicationFailures, ReplicationRetries, LogCompactionRuns)
 	prometheus.MustRegister(ClusterReplicationLag)
+	for _, collector := range preferredLeaderRebalanceMetrics.collectors() {
+		prometheus.MustRegister(collector)
+	}
 	prometheus.MustRegister(ConsumerCleanupReplayRecords, ConsumerCleanupReplayBytes, ConsumerCleanupReplayReads, ConsumerCleanupReplayInvalidations)
 	prometheus.MustRegister(ConsumerSnapshotBusy, ConsumerSnapshotBusyConsecutive)
 }

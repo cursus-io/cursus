@@ -27,12 +27,13 @@ func TestElectLeaderPopulatesTopologyFences(t *testing.T) {
 		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), encoded...)}))
 	}
 	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
 	definition.ReplicationFactor = 2
 	encoded, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 	require.NoError(t, err)
 	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), encoded...)}))
 	metadata := fsm.PartitionMetadata{
-		Leader: "broker-1", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
+		Leader: "broker-2", LeaderEpoch: 4, LifecycleEpoch: definition.LifecycleEpoch,
 		PartitionCount: 1, Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1", "broker-2"},
 	}
 	encoded, err = json.Marshal(metadata)
@@ -40,15 +41,23 @@ func TestElectLeaderPopulatesTopologyFences(t *testing.T) {
 	require.Nil(t, state.Apply(&raft.Log{Data: []byte("PARTITION:orders-0:" + string(encoded))}))
 
 	raftManager := &MockRaftManagerForForward{isLeader: true, state: state}
-	raftManager.leaderAddress.Store("broker-1:9001")
+	raftManager.leaderAddress.Store("broker-2:9001")
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
 	handler := NewCommandHandler(nil, cfg, nil, nil, &clusterController.ClusterController{RaftManager: raftManager})
 	t.Cleanup(func() { require.NoError(t, handler.Close()) })
+	status := buildClusterStatus(state, "broker-2:9001", 1)
+	require.Equal(t, 1, status.LeaderRebalanceImbalanced)
+	require.Equal(t, 1, status.LeaderRebalanceEligible)
+	require.Equal(t, 1, status.LeaderRebalanceSelected)
+	require.Len(t, status.Partitions, 1)
+	require.Equal(t, "broker-1", status.Partitions[0].PreferredLeader)
+	require.True(t, status.Partitions[0].LeaderRebalanceEligible)
+	require.Empty(t, status.Partitions[0].LeaderRebalanceExclusionReason)
 
-	response := handler.handleElectLeader("ELECT_LEADER topic=orders partition=0 broker=broker-2")
+	response := handler.handleElectLeader("ELECT_LEADER topic=orders partition=0 broker=broker-1")
 	require.Contains(t, response, "OK topic=orders partition=0")
-	require.Contains(t, response, "leader=broker-2")
+	require.Contains(t, response, "leader=broker-1")
 	require.Equal(t, 5, state.GetPartitionMetadata("orders-0").LeaderEpoch)
 }
 

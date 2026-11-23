@@ -73,23 +73,24 @@ type RaftManager interface {
 }
 
 type ClusterController struct {
-	RaftManager      RaftManager
-	Discovery        ServiceDiscovery
-	Election         *ControllerElection
-	Router           *ClusterRouter
-	Config           *config.Config
-	brokerID         string
-	snapshotCatchup  func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
-	snapshotStep     ReplicaSnapshotStep
-	snapshotPending  map[fsm.ReplicaCatchupCandidate]*replicaSnapshotContinuation
-	proofSubmitter   func(context.Context, fsm.ISRCatchupProof) error
-	replicaBootstrap ReplicaBootstrapRecovery
-	catchupMu        sync.Mutex
-	catchupRunMu     sync.Mutex
-	catchupCancel    context.CancelFunc
-	catchupDone      chan struct{}
-	catchupStopped   bool
-	recoveryBudget   *recovery.Budget
+	RaftManager         RaftManager
+	Discovery           ServiceDiscovery
+	Election            *ControllerElection
+	Router              *ClusterRouter
+	Config              *config.Config
+	brokerID            string
+	snapshotCatchup     func(context.Context, fsm.ReplicaCatchupRequest, *topicpkg.ReplicaCatchupWitness) error
+	snapshotStep        ReplicaSnapshotStep
+	snapshotPending     map[fsm.ReplicaCatchupCandidate]*replicaSnapshotContinuation
+	proofSubmitter      func(context.Context, fsm.ISRCatchupProof) error
+	replicaBootstrap    ReplicaBootstrapRecovery
+	catchupMu           sync.Mutex
+	catchupRunMu        sync.Mutex
+	catchupCancel       context.CancelFunc
+	catchupDone         chan struct{}
+	catchupStopped      bool
+	recoveryBudget      *recovery.Budget
+	leaderRebalanceWait func(context.Context, time.Duration) bool
 }
 
 // SetRecoveryBudget binds the process-wide budget before background work starts.

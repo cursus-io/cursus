@@ -21,6 +21,11 @@ var (
 	defaultOnce   sync.Once
 )
 
+const (
+	DefaultLeaderRebalanceIntervalMS       = 30000
+	DefaultLeaderRebalanceMaxMovesPerCycle = 8
+)
+
 type SASLUser struct {
 	Principal   string   `yaml:"principal" json:"principal"`
 	Token       string   `yaml:"token" json:"token"`
@@ -77,20 +82,23 @@ type Config struct {
 	BroadcastChannelBufferSize int `yaml:"broadcast_channel_buffer_size" json:"broadcast.channel.buffer.size"`
 
 	// distributed cluster
-	EnabledDistribution    bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
-	InternalAuthToken      string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
-	InternalAuthTokenNext  string   `yaml:"internal_auth_token_next" json:"distribution.internal_auth_token_next"`
-	InternalAuthGeneration string   `yaml:"internal_auth_generation" json:"distribution.internal_auth_generation"`
-	InternalBrokerPort     int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
-	RaftPort               int      `yaml:"raft_port" json:"distribution.raft.port"`
-	RaftSnapshotIntervalMS int      `yaml:"raft_snapshot_interval_ms" json:"distribution.raft.snapshot.interval.ms"`
-	RaftSnapshotThreshold  uint64   `yaml:"raft_snapshot_threshold" json:"distribution.raft.snapshot.threshold"`
-	RaftTrailingLogs       uint64   `yaml:"raft_trailing_logs" json:"distribution.raft.trailing.logs"`
-	DiscoveryPort          int      `yaml:"discovery_port" json:"distribution.discovery.port"`
-	RaftPeers              []string `yaml:"raft_peers" json:"distribution.raft.peers"`
-	StaticClusterMembers   []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
-	BootstrapCluster       bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
-	BootstrapSoleVoter     bool     `yaml:"bootstrap_sole_voter" json:"distribution.bootstrap_sole_voter"`
+	EnabledDistribution             bool     `yaml:"enabled_distribution" json:"distribution.enabled"`
+	InternalAuthToken               string   `yaml:"internal_auth_token" json:"distribution.internal_auth_token"`
+	InternalAuthTokenNext           string   `yaml:"internal_auth_token_next" json:"distribution.internal_auth_token_next"`
+	InternalAuthGeneration          string   `yaml:"internal_auth_generation" json:"distribution.internal_auth_generation"`
+	InternalBrokerPort              int      `yaml:"internal_broker_port" json:"distribution.internal_broker_port"`
+	RaftPort                        int      `yaml:"raft_port" json:"distribution.raft.port"`
+	RaftSnapshotIntervalMS          int      `yaml:"raft_snapshot_interval_ms" json:"distribution.raft.snapshot.interval.ms"`
+	RaftSnapshotThreshold           uint64   `yaml:"raft_snapshot_threshold" json:"distribution.raft.snapshot.threshold"`
+	RaftTrailingLogs                uint64   `yaml:"raft_trailing_logs" json:"distribution.raft.trailing.logs"`
+	DiscoveryPort                   int      `yaml:"discovery_port" json:"distribution.discovery.port"`
+	RaftPeers                       []string `yaml:"raft_peers" json:"distribution.raft.peers"`
+	StaticClusterMembers            []string `yaml:"static_cluster_members" json:"distribution.static_cluster_members"`
+	BootstrapCluster                bool     `yaml:"bootstrap_cluster" json:"distribution.bootstrap"`
+	BootstrapSoleVoter              bool     `yaml:"bootstrap_sole_voter" json:"distribution.bootstrap_sole_voter"`
+	LeaderRebalanceEnabled          bool     `yaml:"leader_rebalance_enabled" json:"leader.rebalance.enabled"`
+	LeaderRebalanceIntervalMS       int      `yaml:"leader_rebalance_interval_ms" json:"leader.rebalance.interval.ms"`
+	LeaderRebalanceMaxMovesPerCycle int      `yaml:"leader_rebalance_max_moves_per_cycle" json:"leader.rebalance.max.moves.per.cycle"`
 
 	AdvertisedHost           string `yaml:"advertised_host" json:"distribution.advertised_host"`
 	AdvertisedBrokerPort     int    `yaml:"advertised_broker_port" json:"distribution.advertised_broker_port"`
@@ -200,27 +208,30 @@ func DefaultConfig() *Config {
 			BroadcastChannelBufferSize: 10000,
 
 			// distributed cluster
-			EnabledDistribution:      false,
-			InternalAuthToken:        "",
-			InternalAuthTokenNext:    "",
-			InternalAuthGeneration:   "",
-			InternalBrokerPort:       0,
-			RaftPort:                 9001,
-			RaftSnapshotIntervalMS:   120000,
-			RaftSnapshotThreshold:    8192,
-			RaftTrailingLogs:         10240,
-			DiscoveryPort:            8000,
-			RaftPeers:                []string{},
-			StaticClusterMembers:     []string{},
-			BootstrapCluster:         false,
-			BootstrapSoleVoter:       false,
-			AdvertisedHost:           "localhost",
-			AdvertisedBrokerPort:     0,
-			MinInSyncReplicas:        2,
-			DefaultReplicationFactor: 3,
-			MaxTopics:                10000,
-			MaxPartitionsPerTopic:    1024,
-			MaxPartitions:            100000,
+			EnabledDistribution:             false,
+			InternalAuthToken:               "",
+			InternalAuthTokenNext:           "",
+			InternalAuthGeneration:          "",
+			InternalBrokerPort:              0,
+			RaftPort:                        9001,
+			RaftSnapshotIntervalMS:          120000,
+			RaftSnapshotThreshold:           8192,
+			RaftTrailingLogs:                10240,
+			DiscoveryPort:                   8000,
+			RaftPeers:                       []string{},
+			StaticClusterMembers:            []string{},
+			BootstrapCluster:                false,
+			BootstrapSoleVoter:              false,
+			LeaderRebalanceEnabled:          true,
+			LeaderRebalanceIntervalMS:       DefaultLeaderRebalanceIntervalMS,
+			LeaderRebalanceMaxMovesPerCycle: DefaultLeaderRebalanceMaxMovesPerCycle,
+			AdvertisedHost:                  "localhost",
+			AdvertisedBrokerPort:            0,
+			MinInSyncReplicas:               2,
+			DefaultReplicationFactor:        3,
+			MaxTopics:                       10000,
+			MaxPartitionsPerTopic:           1024,
+			MaxPartitions:                   100000,
 
 			// idempotency
 			EnableIdempotence:            false,
@@ -341,6 +352,9 @@ func LoadConfig() (*Config, error) {
 	raftPeersFlag := flag.String("raft-peers", "", "Raft peer addresses (comma-separated)")
 	flag.BoolVar(&cfg.BootstrapCluster, "bootstrap-cluster", cfg.BootstrapCluster, "Bootstrap Raft cluster")
 	flag.BoolVar(&cfg.BootstrapSoleVoter, "bootstrap-sole-voter", cfg.BootstrapSoleVoter, "Bootstrap this broker as the sole initial Raft voter")
+	flag.BoolVar(&cfg.LeaderRebalanceEnabled, "leader-rebalance-enabled", cfg.LeaderRebalanceEnabled, "Enable automatic preferred leader rebalancing")
+	flag.IntVar(&cfg.LeaderRebalanceIntervalMS, "leader-rebalance-interval-ms", cfg.LeaderRebalanceIntervalMS, "Preferred leader rebalance interval in milliseconds")
+	flag.IntVar(&cfg.LeaderRebalanceMaxMovesPerCycle, "leader-rebalance-max-moves-per-cycle", cfg.LeaderRebalanceMaxMovesPerCycle, "Maximum preferred leader moves per rebalance cycle")
 	flag.StringVar(&cfg.AdvertisedHost, "advertised-host", cfg.AdvertisedHost, "Advertised host for discovery")
 	flag.IntVar(&cfg.MinInSyncReplicas, "min-insync-replicas", cfg.MinInSyncReplicas, "Minimum in-sync replicas for writes")
 	flag.IntVar(&cfg.DefaultReplicationFactor, "default-replication-factor", cfg.DefaultReplicationFactor, "Default replication factor for new topics")
@@ -531,6 +545,9 @@ func LoadConfig() (*Config, error) {
 	overrideEnvStringSlice(&cfg.StaticClusterMembers, "STATIC_CLUSTER_MEMBERS")
 	overrideEnvBool(&cfg.BootstrapCluster, "BOOTSTRAP_CLUSTER")
 	overrideEnvBool(&cfg.BootstrapSoleVoter, "BOOTSTRAP_SOLE_VOTER")
+	overrideEnvBool(&cfg.LeaderRebalanceEnabled, "LEADER_REBALANCE_ENABLED")
+	overrideEnvInt(&cfg.LeaderRebalanceIntervalMS, "LEADER_REBALANCE_INTERVAL_MS")
+	overrideEnvInt(&cfg.LeaderRebalanceMaxMovesPerCycle, "LEADER_REBALANCE_MAX_MOVES_PER_CYCLE")
 	overrideEnvInt(&cfg.MinInSyncReplicas, "MIN_INSYNC_REPLICAS")
 	overrideEnvInt(&cfg.DefaultReplicationFactor, "DEFAULT_REPLICATION_FACTOR")
 	overrideEnvInt(&cfg.MaxTopics, "MAX_TOPICS")

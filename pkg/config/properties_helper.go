@@ -139,6 +139,12 @@ func (cfg *Config) Normalize() {
 	if cfg.MaxPartitions <= 0 {
 		cfg.MaxPartitions = 100000
 	}
+	if cfg.LeaderRebalanceIntervalMS <= 0 {
+		cfg.LeaderRebalanceIntervalMS = DefaultLeaderRebalanceIntervalMS
+	}
+	if cfg.LeaderRebalanceMaxMovesPerCycle <= 0 {
+		cfg.LeaderRebalanceMaxMovesPerCycle = DefaultLeaderRebalanceMaxMovesPerCycle
+	}
 
 	if cfg.ProducerStateTTLMS <= 0 {
 		cfg.ProducerStateTTLMS = 30 * 60 * 1000
