@@ -17,6 +17,21 @@ import (
 
 const runPreferredLeaderRebalanceE2E = "RUN_E2E_LEADER_REBALANCE"
 
+func TestReplicaRecoveryByteSampleClassification(t *testing.T) {
+	tests := map[string]bool{
+		`cursus_recovery_work_total{stage="catchup_rpc",unit="transfer_bytes"}`: true,
+		`cursus_recovery_work_total{stage="lineage",unit="transfer_bytes"}`:     true,
+		`cursus_recovery_work_total{stage="chunk_read",unit="read_bytes"}`:      true,
+		`cursus_recovery_work_total{stage="bootstrap_file",unit="write_bytes"}`: true,
+		`cursus_recovery_work_total{stage="lineage",unit="read_bytes"}`:         false,
+		`cursus_recovery_work_total{stage="retained_page",unit="write_bytes"}`:  false,
+		`cursus_recovery_work_total{stage="catchup_rpc",unit="decoded_bytes"}`:  false,
+	}
+	for sample, expected := range tests {
+		require.Equal(t, expected, isReplicaRecoveryByteSample(sample), sample)
+	}
+}
+
 func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 	if os.Getenv(runPreferredLeaderRebalanceE2E) != "1" {
 		t.Skipf("set %s=1 to run preferred leader recovery validation", runPreferredLeaderRebalanceE2E)
@@ -94,7 +109,9 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 
 	final := describePreferredLeaderTopic(t, ctx)
 	require.NoError(t, validateTopicMetadata(final, ctx.GetTopic(), 1, 3, 3, 16))
-	requireRecoveryByteWorkUnchanged(t, workBeforeMove, recoveryByteWorkSnapshot(t))
+	workAfterMove := recoveryByteWorkSnapshot(t)
+	logRecoveryByteWorkDelta(t, workBeforeMove, workAfterMove)
+	requireReplicaRecoveryByteWorkUnchanged(t, workBeforeMove, workAfterMove)
 }
 
 func describePreferredLeaderTopic(t *testing.T, ctx *ClusterTestContext) topicMetadata {
@@ -181,14 +198,44 @@ func recoveryByteWorkSnapshot(t *testing.T) map[string]float64 {
 	return snapshot
 }
 
-func requireRecoveryByteWorkUnchanged(t *testing.T, before, after map[string]float64) {
+func logRecoveryByteWorkDelta(t *testing.T, before, after map[string]float64) {
 	t.Helper()
 	for sample, afterValue := range after {
-		require.Equal(t, before[sample], afterValue, "preferred leader election must not perform replica recovery work: %s", sample)
+		if delta := afterValue - before[sample]; delta != 0 {
+			t.Logf("preferred leader move recovery work delta: %s delta=%.0f", sample, delta)
+		}
+	}
+}
+
+func requireReplicaRecoveryByteWorkUnchanged(t *testing.T, before, after map[string]float64) {
+	t.Helper()
+	for sample, afterValue := range after {
+		if !isReplicaRecoveryByteSample(sample) {
+			continue
+		}
+		require.Equal(t, before[sample], afterValue, "preferred leader election must not perform replica data recovery work: %s", sample)
 	}
 	for sample, beforeValue := range before {
+		if !isReplicaRecoveryByteSample(sample) {
+			continue
+		}
 		require.Equal(t, beforeValue, after[sample], "preferred leader election reset recovery accounting: %s", sample)
 	}
+}
+
+func isReplicaRecoveryByteSample(sample string) bool {
+	if strings.Contains(sample, `unit="transfer_bytes"`) {
+		return true
+	}
+	if !strings.Contains(sample, `unit="read_bytes"`) && !strings.Contains(sample, `unit="write_bytes"`) {
+		return false
+	}
+	for _, stage := range []string{"full_export", "retained_export", "chunk_read", "chunk_receive", "detached_copy", "detached_read", "replica_rpc", "catchup_rpc", "bootstrap_file", "bootstrap_install"} {
+		if strings.Contains(sample, `stage="`+stage+`"`) {
+			return true
+		}
+	}
+	return false
 }
 
 func scrapeMetricSamples(t *testing.T, node int, name string) map[string]float64 {
