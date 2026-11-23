@@ -223,7 +223,7 @@ func TestValidateNameUsesPortableDiskContract(t *testing.T) {
 	for _, name := range []string{"orders", "orders.v2", "orders-v2", "__consumer_offsets", "exactly-once-acks=all_broker_failure"} {
 		require.NoError(t, ValidateName(name))
 	}
-	for _, name := range []string{"", ".", "..", "orders/2026", `orders\\2026`, "orders 2026", "한글"} {
+	for _, name := range []string{"", ".", "..", "orders/2026", `orders\\2026`, "orders 2026", "café"} {
 		require.Error(t, ValidateName(name), name)
 	}
 }
