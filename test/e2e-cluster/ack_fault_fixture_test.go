@@ -213,9 +213,12 @@ func newAckFaultClusterSource(t *testing.T, topic string, hooks bool, source str
 	text = strings.Replace(text, "- BOOTSTRAP_CLUSTER=false", "- BOOTSTRAP_CLUSTER=true", 1)
 	text = strings.ReplaceAll(text, "../cluster/config.yaml", filepath.ToSlash(config))
 	text = strings.ReplaceAll(text, "dockerfile: Dockerfile", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults")
+	// These fixtures capture leader epochs to inspect recovery boundaries.
+	// Isolate them from the independent periodic preferred-leader scheduler.
+	text = strings.ReplaceAll(text, "- CONFIG_PATH=/app/config.yaml", "- CONFIG_PATH=/app/config.yaml\n      - LEADER_REBALANCE_ENABLED=false")
 	if hooks {
 		text = strings.ReplaceAll(text, "dockerfile: test/e2e-cluster/Dockerfile.ack-faults", "dockerfile: test/e2e-cluster/Dockerfile.ack-faults\n      args:\n        E2E_BUILD_TAGS: e2e_faults")
-		text = strings.ReplaceAll(text, "- CONFIG_PATH=/app/config.yaml", "- CONFIG_PATH=/app/config.yaml\n      - CURSUS_E2E_FAULTS=1")
+		text = strings.ReplaceAll(text, "- LEADER_REBALANCE_ENABLED=false", "- LEADER_REBALANCE_ENABLED=false\n      - CURSUS_E2E_FAULTS=1")
 	}
 	text = strings.ReplaceAll(text, "name: cluster_network", "name: "+ackFaultProject)
 	for node := 1; node <= 3; node++ {
