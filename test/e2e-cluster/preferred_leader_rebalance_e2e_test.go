@@ -76,24 +76,25 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 	beforeReturn := describePreferredLeaderTopic(t, ctx)
 	require.NotEqual(t, preferredNode, leaderNode(t, beforeReturn.Partitions[0].Leader), "leader returned before the post-recovery work baseline")
 
-	workBefore := recoveryByteWorkSnapshot(t)
+	workBeforeMove := recoveryByteWorkSnapshot(t)
 	movesBefore := preferredLeaderAppliedMoves(t)
-	require.NoError(t, eventually(t, "automatic return to preferred leader", 75*time.Second, func() (bool, string, error) {
+	require.NoError(t, eventually(t, "automatic return to preferred leader and move metric", 75*time.Second, func() (bool, string, error) {
 		metadata, err := describePreferredLeaderTopicE(ctx)
 		if err != nil {
 			return false, "DESCRIBE failed", err
 		}
 		current := leaderNodeE(metadata.Partitions[0].Leader)
-		return current == preferredNode, fmt.Sprintf("leader=broker-%d preferred=broker-%d", current, preferredNode), nil
+		if current != preferredNode {
+			workBeforeMove = recoveryByteWorkSnapshot(t)
+			return false, fmt.Sprintf("leader=broker-%d preferred=broker-%d", current, preferredNode), nil
+		}
+		moves := preferredLeaderAppliedMoves(t)
+		return moves >= movesBefore+1, fmt.Sprintf("leader=broker-%d preferred=broker-%d moves=%.0f before=%.0f", current, preferredNode, moves, movesBefore), nil
 	}))
 
 	final := describePreferredLeaderTopic(t, ctx)
 	require.NoError(t, validateTopicMetadata(final, ctx.GetTopic(), 1, 3, 3, 16))
-	require.NoError(t, eventually(t, "preferred leader move metric", 10*time.Second, func() (bool, string, error) {
-		moves := preferredLeaderAppliedMoves(t)
-		return moves >= movesBefore+1, fmt.Sprintf("moves=%.0f before=%.0f", moves, movesBefore), nil
-	}))
-	requireRecoveryByteWorkUnchanged(t, workBefore, recoveryByteWorkSnapshot(t))
+	requireRecoveryByteWorkUnchanged(t, workBeforeMove, recoveryByteWorkSnapshot(t))
 }
 
 func describePreferredLeaderTopic(t *testing.T, ctx *ClusterTestContext) topicMetadata {
@@ -172,7 +173,7 @@ func recoveryByteWorkSnapshot(t *testing.T) map[string]float64 {
 	snapshot := make(map[string]float64)
 	for node := 1; node <= 3; node++ {
 		for sample, value := range scrapeMetricSamples(t, node, "cursus_recovery_work_total") {
-			if strings.Contains(sample, `_bytes"}`) || strings.Contains(sample, `_bytes",`) {
+			if strings.Contains(sample, `unit="read_bytes"`) || strings.Contains(sample, `unit="write_bytes"`) || strings.Contains(sample, `unit="transfer_bytes"`) {
 				snapshot[fmt.Sprintf("broker-%d %s", node, sample)] = value
 			}
 		}
