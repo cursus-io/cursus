@@ -89,7 +89,10 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 
 	final := describePreferredLeaderTopic(t, ctx)
 	require.NoError(t, validateTopicMetadata(final, ctx.GetTopic(), 1, 3, 3, 16))
-	require.GreaterOrEqual(t, preferredLeaderAppliedMoves(t), movesBefore+1)
+	require.NoError(t, eventually(t, "preferred leader move metric", 10*time.Second, func() (bool, string, error) {
+		moves := preferredLeaderAppliedMoves(t)
+		return moves >= movesBefore+1, fmt.Sprintf("moves=%.0f before=%.0f", moves, movesBefore), nil
+	}))
 	requireRecoveryByteWorkUnchanged(t, workBefore, recoveryByteWorkSnapshot(t))
 }
 
