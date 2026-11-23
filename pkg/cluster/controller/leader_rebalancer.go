@@ -33,17 +33,18 @@ const (
 )
 
 type LeaderRebalancePartition struct {
-	Key              string
-	Topic            string
-	Partition        int
-	CurrentLeader    string
-	PreferredLeader  string
-	LeaderEpoch      int
-	LifecycleEpoch   uint64
-	ExpectedReplicas []string
-	Internal         bool
-	Eligible         bool
-	Reason           LeaderRebalanceReason
+	Key                string
+	Topic              string
+	Partition          int
+	CurrentLeader      string
+	PreferredLeader    string
+	LeaderEpoch        int
+	LifecycleEpoch     uint64
+	DefinitionRevision uint64
+	ExpectedReplicas   []string
+	Internal           bool
+	Eligible           bool
+	Reason             LeaderRebalanceReason
 }
 
 type LeaderRebalancePlan struct {
@@ -136,6 +137,7 @@ func assessLeaderRebalancePartition(key, topicName string, partition int, defini
 	assessment.PreferredLeader = metadata.Replicas[0]
 	assessment.LeaderEpoch = metadata.LeaderEpoch
 	assessment.LifecycleEpoch = metadata.LifecycleEpoch
+	assessment.DefinitionRevision = definition.Revision
 	assessment.ExpectedReplicas = append([]string(nil), metadata.Replicas...)
 	if definition.LifecycleEpoch == 0 || metadata.LifecycleEpoch != definition.LifecycleEpoch || metadata.PartitionCount != definition.Partitions || !validLeaderRebalanceAssignment(metadata) || !leaderRebalanceReplicasKnown(metadata.Replicas, snapshot.Brokers) {
 		assessment.Reason = LeaderRebalanceInvalidMetadata
@@ -269,7 +271,8 @@ func (cc *ClusterController) RunLeaderRebalanceOnce(ctx context.Context) (result
 		}
 		command := fsm.LeaderElectionCommand{
 			Topic: candidate.Topic, Partition: candidate.Partition, Broker: candidate.PreferredLeader,
-			ExpectedLeaderEpoch: candidate.LeaderEpoch, ExpectedLifecycleEpoch: candidate.LifecycleEpoch,
+			ExpectedLeaderEpoch: candidate.LeaderEpoch, TopologyFenceVersion: fsm.LeaderElectionTopologyFenceVersionCurrent,
+			ExpectedLifecycleEpoch: candidate.LifecycleEpoch, ExpectedDefinitionRevision: candidate.DefinitionRevision,
 			ExpectedReplicas: append([]string(nil), candidate.ExpectedReplicas...),
 		}
 		payload, err := json.Marshal(command)

@@ -152,6 +152,7 @@ type leaderRebalanceRaftManager struct {
 	failPartition map[int]error
 	loseAfter     int
 	applied       chan struct{}
+	beforeApply   func(*fsm.BrokerFSM, fsm.LeaderElectionCommand)
 }
 
 func (manager *leaderRebalanceRaftManager) ApplyCommand(prefix string, data []byte) error {
@@ -169,9 +170,13 @@ func (manager *leaderRebalanceRaftManager) ApplyCommand(prefix string, data []by
 	if manager.loseAfter > 0 && count >= manager.loseAfter {
 		manager.isLeader = false
 	}
+	beforeApply := manager.beforeApply
 	manager.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	if beforeApply != nil {
+		beforeApply(manager.mockFSM, command)
 	}
 	result := manager.mockFSM.Apply(&raft.Log{Data: append([]byte(prefix+":"), data...)})
 	if applyErr, ok := result.(error); ok {
@@ -236,6 +241,60 @@ func TestRunLeaderRebalanceOnceContinuesAfterPartitionFailure(t *testing.T) {
 	require.Equal(t, "n2", state.GetPartitionMetadata("orders-0").Leader)
 	require.Equal(t, "n1", state.GetPartitionMetadata("orders-1").Leader)
 	require.Equal(t, "n2", state.GetPartitionMetadata("orders-2").Leader)
+	require.Len(t, manager.commands, 2)
+	require.Equal(t, fsm.LeaderElectionTopologyFenceVersionCurrent, manager.commands[1].TopologyFenceVersion)
+	require.Equal(t, uint64(topic.InitialDefinitionRevision), manager.commands[1].ExpectedDefinitionRevision)
+}
+
+func TestRunLeaderRebalanceOnceRejectsStateChangesAfterPlanning(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *fsm.BrokerFSM)
+		want   string
+	}{
+		{
+			name: "topic definition revision",
+			mutate: func(t *testing.T, state *fsm.BrokerFSM) {
+				minISR := 2
+				payload, err := json.Marshal(fsm.TopicConfigCommand{Name: "orders", MinInSyncReplicas: &minISR})
+				require.NoError(t, err)
+				require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC_CONFIG:"), payload...)}))
+			},
+			want: "stale definition revision",
+		},
+		{
+			name: "replica recovery",
+			mutate: func(t *testing.T, state *fsm.BrokerFSM) {
+				metadata := state.GetPartitionMetadata("orders-0")
+				require.NotNil(t, metadata)
+				metadata.RecoveryReplicas = []string{"n3"}
+				payload, err := json.Marshal(metadata)
+				require.NoError(t, err)
+				require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("PARTITION:orders-0:"), payload...)}))
+			},
+			want: "replica recovery pending",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := leaderRebalanceRunnerState(t, 1)
+			manager := &leaderRebalanceRaftManager{
+				MockRaftManager: &MockRaftManager{isLeader: true, mockFSM: state},
+				beforeApply: func(state *fsm.BrokerFSM, _ fsm.LeaderElectionCommand) {
+					test.mutate(t, state)
+				},
+			}
+			cfg := config.DefaultConfig()
+			cfg.EnabledDistribution = true
+			cfg.LeaderRebalanceMaxMovesPerCycle = 1
+
+			result := (&ClusterController{RaftManager: manager, Config: cfg}).RunLeaderRebalanceOnce(context.Background())
+			require.Len(t, result.Moves, 1)
+			require.Equal(t, "failure", result.Moves[0].Result)
+			require.ErrorContains(t, result.Moves[0].Err, test.want)
+			require.Equal(t, "n2", state.GetPartitionMetadata("orders-0").Leader)
+		})
+	}
 }
 
 func TestRunLeaderRebalanceOnceStopsAfterLeadershipLoss(t *testing.T) {

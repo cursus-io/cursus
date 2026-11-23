@@ -50,15 +50,6 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 	preferredNode := replicaNode(t, initial.Partitions[0].Replicas[0])
 	require.Equal(t, preferredNode, leaderNode(t, initial.Partitions[0].Leader), "new assignment must begin on its preferred leader")
 
-	// Synchronize with the controller's periodic loop. The 60-second test
-	// interval then leaves a full cycle for failover, catch-up, and baselining.
-	controllerNode := waitForSingleRaftLeader(t, []int{1, 2, 3}, 0)
-	cycleBefore := requireMetric(t, controllerNode, "cursus_leader_rebalance_cycle_duration_seconds_count")
-	require.NoError(t, eventually(t, "preferred leader controller cycle", 75*time.Second, func() (bool, string, error) {
-		value, err := fetchMetric(controllerNode, "cursus_leader_rebalance_cycle_duration_seconds_count")
-		return err == nil && value > cycleBefore, fmt.Sprintf("cycles=%.0f before=%.0f", value, cycleBefore), err
-	}))
-
 	actions.StopBroker(preferredNode)
 	waitForBrokerEvictedFromISR(t, ctx, preferredNode)
 	require.NoError(t, eventually(t, "failover away from preferred leader", clusterReadyTimeout, func() (bool, string, error) {
@@ -71,9 +62,11 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 	}))
 
 	survivors := make([]string, 0, 2)
+	survivorNodes := make([]int, 0, 2)
 	for node, addr := range ctx.GetBrokerAddrs() {
 		if node+1 != preferredNode {
 			survivors = append(survivors, addr)
+			survivorNodes = append(survivorNodes, node+1)
 		}
 	}
 	producer := e2e.NewBrokerClient(survivors)
@@ -86,21 +79,36 @@ func TestPreferredLeaderReturnsWithoutReplicaRecovery(t *testing.T) {
 	}
 	producer.Close()
 
+	// Synchronize while the preferred broker is ineligible. The current Raft
+	// leader cannot move the partition during this cycle, and the next 120-second
+	// interval starts before recovery and the fixed work baseline.
+	controllerNode := waitForSingleRaftLeader(t, survivorNodes, 0)
+	cycleBefore := requireMetric(t, controllerNode, "cursus_leader_rebalance_cycle_duration_seconds_count")
+	cycleBoundary := cycleBefore
+	require.NoError(t, eventually(t, "preferred leader controller cycle", 135*time.Second, func() (bool, string, error) {
+		value, err := fetchMetric(controllerNode, "cursus_leader_rebalance_cycle_duration_seconds_count")
+		if err == nil && value > cycleBefore {
+			cycleBoundary = value
+		}
+		return err == nil && value > cycleBefore, fmt.Sprintf("cycles=%.0f before=%.0f", value, cycleBefore), err
+	}))
+
 	actions.StartBroker(preferredNode)
 	waitForStableFullISRAndZeroUnderReplicated(t, ctx, "preferred replica catch-up")
+	require.Equal(t, controllerNode, waitForSingleRaftLeader(t, []int{1, 2, 3}, 0), "Raft leadership changed before the recovery baseline")
+	require.Equal(t, cycleBoundary, requireMetric(t, controllerNode, "cursus_leader_rebalance_cycle_duration_seconds_count"), "rebalance cycle ran before the recovery baseline")
 	beforeReturn := describePreferredLeaderTopic(t, ctx)
 	require.NotEqual(t, preferredNode, leaderNode(t, beforeReturn.Partitions[0].Leader), "leader returned before the post-recovery work baseline")
 
 	workBeforeMove := recoveryByteWorkSnapshot(t)
 	movesBefore := preferredLeaderAppliedMoves(t)
-	require.NoError(t, eventually(t, "automatic return to preferred leader and move metric", 75*time.Second, func() (bool, string, error) {
+	require.NoError(t, eventually(t, "automatic return to preferred leader and move metric", 135*time.Second, func() (bool, string, error) {
 		metadata, err := describePreferredLeaderTopicE(ctx)
 		if err != nil {
 			return false, "DESCRIBE failed", err
 		}
 		current := leaderNodeE(metadata.Partitions[0].Leader)
 		if current != preferredNode {
-			workBeforeMove = recoveryByteWorkSnapshot(t)
 			return false, fmt.Sprintf("leader=broker-%d preferred=broker-%d", current, preferredNode), nil
 		}
 		moves := preferredLeaderAppliedMoves(t)
