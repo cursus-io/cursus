@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/cursus-io/cursus/pkg/topic"
 )
 
-const LeaderElectionTopologyFenceVersionCurrent = 1
+const (
+	leaderElectionTopologyFenceVersionV1      = 1
+	LeaderElectionTopologyFenceVersionCurrent = 2
+)
 
 type LeaderElectionCommand struct {
 	ReqID                      string   `json:"req_id,omitempty"`
@@ -19,6 +24,17 @@ type LeaderElectionCommand struct {
 	ExpectedLifecycleEpoch     uint64   `json:"expected_lifecycle_epoch,omitempty"`
 	ExpectedDefinitionRevision uint64   `json:"expected_definition_revision,omitempty"`
 	ExpectedReplicas           []string `json:"expected_replicas,omitempty"`
+	// A non-nil pointer may hold an empty ID for an unbound legacy topic.
+	ExpectedTopicInstanceID *string `json:"expected_topic_instance_id,omitempty"`
+	RequireStableAssignment bool    `json:"require_stable_assignment,omitempty"`
+}
+
+// GetLeaderElectionState captures the topic identity and the partition metadata under one read lock.
+func (f *BrokerFSM) GetLeaderElectionState(name string, partition int) (*PartitionMetadata, *topic.Definition) {
+	key := fmt.Sprintf("%s-%d", name, partition)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.getPartitionMetadataLocked(key), copyTopicDefinition(f.topicState[name])
 }
 
 type LeaderElectionResult struct {
@@ -45,15 +61,23 @@ func (f *BrokerFSM) applyLeaderElectionCommand(jsonData string) interface{} {
 		return fmt.Errorf("leader election broker is required")
 	}
 	fenced := false
+	requireStableAssignment := cmd.RequireStableAssignment
 	switch cmd.TopologyFenceVersion {
 	case 0:
 		// Version zero is reserved for committed entries written before topology
 		// fencing existed. Replay their original leader-epoch-only contract.
-		if cmd.ExpectedLifecycleEpoch != 0 || cmd.ExpectedDefinitionRevision != 0 || len(cmd.ExpectedReplicas) != 0 {
+		if cmd.ExpectedLifecycleEpoch != 0 || cmd.ExpectedDefinitionRevision != 0 || len(cmd.ExpectedReplicas) != 0 ||
+			cmd.ExpectedTopicInstanceID != nil || cmd.RequireStableAssignment {
 			return fmt.Errorf("unversioned leader election contains topology fence fields")
 		}
-	case LeaderElectionTopologyFenceVersionCurrent:
+	case leaderElectionTopologyFenceVersionV1, LeaderElectionTopologyFenceVersionCurrent:
 		fenced = true
+		if cmd.TopologyFenceVersion == leaderElectionTopologyFenceVersionV1 {
+			// Preserve the original v1 apply decision for committed Raft entries.
+			requireStableAssignment = true
+		} else if cmd.ExpectedTopicInstanceID == nil {
+			return fmt.Errorf("leader election expected topic instance ID is required")
+		}
 		if cmd.ExpectedLifecycleEpoch == 0 {
 			return fmt.Errorf("leader election expected lifecycle epoch is required")
 		}
@@ -80,6 +104,9 @@ func (f *BrokerFSM) applyLeaderElectionCommand(jsonData string) interface{} {
 		if definition == nil {
 			return fmt.Errorf("topic definition %s not found", cmd.Topic)
 		}
+		if cmd.TopologyFenceVersion == LeaderElectionTopologyFenceVersionCurrent && definition.InstanceID != *cmd.ExpectedTopicInstanceID {
+			return fmt.Errorf("stale topic instance for %s: current=%q expected=%q", key, definition.InstanceID, *cmd.ExpectedTopicInstanceID)
+		}
 		if definition.LifecycleEpoch != cmd.ExpectedLifecycleEpoch || metadata.LifecycleEpoch != cmd.ExpectedLifecycleEpoch {
 			return fmt.Errorf(
 				"stale lifecycle epoch for %s: topic=%d partition=%d expected=%d",
@@ -89,7 +116,7 @@ func (f *BrokerFSM) applyLeaderElectionCommand(jsonData string) interface{} {
 		if definition.Revision != cmd.ExpectedDefinitionRevision {
 			return fmt.Errorf("stale definition revision for %s: current=%d expected=%d", key, definition.Revision, cmd.ExpectedDefinitionRevision)
 		}
-		if definition.ReplicationFactor != len(cmd.ExpectedReplicas) {
+		if requireStableAssignment && definition.ReplicationFactor != len(cmd.ExpectedReplicas) {
 			return fmt.Errorf("stale replication factor for %s: current=%d expected_replicas=%d", key, definition.ReplicationFactor, len(cmd.ExpectedReplicas))
 		}
 		if !slices.Equal(metadata.Replicas, cmd.ExpectedReplicas) {

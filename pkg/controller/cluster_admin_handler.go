@@ -237,13 +237,11 @@ func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) s
 	if state == nil {
 		return "ERROR: fsm_not_available command=ELECT_LEADER"
 	}
-	key := fmt.Sprintf("%s-%d", topicName, partition)
-	metadata := state.GetPartitionMetadata(key)
+	metadata, definition := state.GetLeaderElectionState(topicName, partition)
 	if metadata == nil {
 		return fmt.Sprintf("ERROR: partition_not_found topic=%s partition=%d", topicName, partition)
 	}
-	definition, found := state.GetTopicDefinition(topicName)
-	if !found {
+	if definition == nil {
 		return fmt.Sprintf("ERROR: topic_not_found topic=%s", topicName)
 	}
 
@@ -256,6 +254,7 @@ func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) s
 		"expected_lifecycle_epoch":     metadata.LifecycleEpoch,
 		"expected_definition_revision": definition.Revision,
 		"expected_replicas":            append([]string(nil), metadata.Replicas...),
+		"expected_topic_instance_id":   definition.InstanceID,
 	})
 	if err != nil {
 		return fmt.Sprintf("ERROR: leader_election_rejected topic=%s partition=%d broker=%s reason=%q", topicName, partition, brokerID, err.Error())
@@ -263,8 +262,8 @@ func (ch *CommandHandler) handleElectLeader(cmd string, ctx ...*ClientContext) s
 
 	election, ok := result.(fsm.LeaderElectionResult)
 	if !ok {
-		updated := state.GetPartitionMetadata(key)
-		if updated == nil || updated.Leader != brokerID {
+		updated, current := state.GetLeaderElectionState(topicName, partition)
+		if updated == nil || current == nil || current.InstanceID != definition.InstanceID || updated.Leader != brokerID {
 			return fmt.Sprintf("ERROR: leader_election_result_unavailable topic=%s partition=%d", topicName, partition)
 		}
 		election = fsm.LeaderElectionResult{
@@ -305,13 +304,19 @@ func (ch *CommandHandler) handleReassignPartition(cmd string, ctx ...*ClientCont
 	if metadata == nil {
 		return fmt.Sprintf("ERROR: partition_not_found topic=%s partition=%d", topicName, partition)
 	}
-	_, err = ch.applyAndWaitContext(requestCtx, "REPLICA_REASSIGN", map[string]interface{}{
-		"topic": topicName, "partition": partition,
-		"lifecycle_epoch": metadata.LifecycleEpoch,
-		"leader":          metadata.Leader, "leader_epoch": metadata.LeaderEpoch,
-		"expected_replicas": append([]string(nil), metadata.Replicas...),
-		"target_replicas":   target,
+	// The durable command uses strict decoding and has no request ID. ApplyCommand
+	// already waits for the FSM and returns any rejection.
+	payload, err := json.Marshal(fsm.ReplicaReassignmentCommand{
+		Topic: topicName, Partition: partition, LifecycleEpoch: metadata.LifecycleEpoch,
+		Leader: metadata.Leader, LeaderEpoch: metadata.LeaderEpoch,
+		ExpectedReplicas: metadata.Replicas, TargetReplicas: target,
 	})
+	if err == nil {
+		err = requestCtx.Err()
+	}
+	if err == nil {
+		err = ch.Cluster.RaftManager.ApplyCommand("REPLICA_REASSIGN", payload)
+	}
 	if err != nil {
 		return fmt.Sprintf("ERROR: replica_reassignment_rejected topic=%s partition=%d reason=%q", topicName, partition, err.Error())
 	}

@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
+	"github.com/stretchr/testify/require"
 )
 
 func adminTestFSM(t *testing.T, broker2Status string) *BrokerFSM {
@@ -66,6 +68,8 @@ func validLeaderElectionCommand() LeaderElectionCommand {
 		ExpectedLifecycleEpoch:     topic.InitialLifecycleEpoch,
 		ExpectedDefinitionRevision: topic.InitialDefinitionRevision,
 		ExpectedReplicas:           []string{"broker-1", "broker-2", "broker-3"},
+		ExpectedTopicInstanceID:    new(string),
+		RequireStableAssignment:    true,
 	}
 }
 
@@ -125,6 +129,66 @@ func TestLeaderElectionReplaysLegacyCommandWithoutTopologyFields(t *testing.T) {
 	}
 }
 
+func TestLeaderElectionReplaysV1WithOriginalStableAssignmentRule(t *testing.T) {
+	const entry = `LEADER_ELECTION:{"topic":"orders","partition":0,"broker":"broker-2","expected_leader_epoch":7,"topology_fence_version":1,"expected_lifecycle_epoch":1,"expected_definition_revision":1,"expected_replicas":["broker-1","broker-2","broker-3"]}`
+	state := adminTestFSM(t, "active")
+	state.topicState["orders"].ReplicationFactor = 2
+	err, ok := state.Apply(&raft.Log{Data: []byte(entry)}).(error)
+	require.True(t, ok)
+	require.ErrorContains(t, err, "stale replication factor")
+	require.Equal(t, "broker-1", state.GetPartitionMetadata("orders-0").Leader)
+
+	state.topicState["orders"].ReplicationFactor = 3
+	election, ok := state.Apply(&raft.Log{Data: []byte(entry)}).(LeaderElectionResult)
+	require.True(t, ok)
+	require.True(t, election.Changed)
+	require.Equal(t, "broker-2", election.Leader)
+	require.Equal(t, 8, election.LeaderEpoch)
+}
+
+func TestLeaderElectionRejectsCommandForDeletedTopicInstance(t *testing.T) {
+	state, _ := legacyUnderfilledReplicaState(t)
+	definition := topic.DefaultDefinition("recreated-orders", nil)
+	definition.Partitions = 1
+	definition.InstanceID = rand.Text()
+	create := func() {
+		payload, err := json.Marshal(TopicCommand{Definition: &definition})
+		require.NoError(t, err)
+		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), payload...)}))
+	}
+	create()
+	initial, original := state.GetLeaderElectionState(definition.Name, 0)
+	require.NotNil(t, original)
+	require.Len(t, initial.Replicas, 3)
+	command := LeaderElectionCommand{
+		Topic: definition.Name, Broker: initial.Replicas[1],
+		ExpectedLeaderEpoch: initial.LeaderEpoch, TopologyFenceVersion: LeaderElectionTopologyFenceVersionCurrent,
+		ExpectedLifecycleEpoch: initial.LifecycleEpoch, ExpectedDefinitionRevision: original.Revision,
+		ExpectedReplicas: initial.Replicas, ExpectedTopicInstanceID: &original.InstanceID,
+	}
+
+	require.Nil(t, state.Apply(&raft.Log{Data: []byte(`TOPIC_DELETE:{"topic":"recreated-orders"}`)}))
+	require.Nil(t, state.GetPartitionMetadata("recreated-orders-0"))
+	definition.InstanceID = rand.Text()
+	create()
+	recreated, current := state.GetLeaderElectionState(definition.Name, 0)
+	require.NotNil(t, current)
+	require.NotEqual(t, original.InstanceID, current.InstanceID)
+	require.Equal(t, original.Revision, current.Revision)
+	require.Equal(t, initial, recreated)
+
+	err, ok := applyLeaderElection(t, state, command).(error)
+	require.True(t, ok, "a stale election must fail even when all other fences match")
+	require.ErrorContains(t, err, "stale topic instance")
+	require.Equal(t, recreated, state.GetPartitionMetadata("recreated-orders-0"))
+
+	command.ExpectedTopicInstanceID = &current.InstanceID
+	election, ok := applyLeaderElection(t, state, command).(LeaderElectionResult)
+	require.True(t, ok)
+	require.True(t, election.Changed)
+	require.Equal(t, command.Broker, election.Leader)
+}
+
 func TestLeaderElectionRejectsInvalidTopologyFenceEncoding(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -137,6 +201,13 @@ func TestLeaderElectionRejectsInvalidTopologyFenceEncoding(t *testing.T) {
 				command.TopologyFenceVersion = 0
 			},
 			message: "unversioned leader election contains topology fence fields",
+		},
+		{
+			name: "missing topic instance field",
+			mutate: func(command *LeaderElectionCommand) {
+				command.ExpectedTopicInstanceID = nil
+			},
+			message: "expected topic instance ID is required",
 		},
 		{
 			name: "unsupported fence version",
@@ -286,6 +357,7 @@ func TestLeaderElectionRejectsMissingPartition(t *testing.T) {
 		ExpectedLifecycleEpoch:     topic.InitialLifecycleEpoch,
 		ExpectedDefinitionRevision: topic.InitialDefinitionRevision,
 		ExpectedReplicas:           []string{"broker-1", "broker-2"},
+		ExpectedTopicInstanceID:    new(string),
 	})
 	err, ok := result.(error)
 	if !ok || !strings.Contains(err.Error(), fmt.Sprintf("%s-%d", "missing", 1)) {

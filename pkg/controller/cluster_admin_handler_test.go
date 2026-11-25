@@ -2,7 +2,10 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/cursus-io/cursus/pkg/disk"
 	"github.com/cursus-io/cursus/pkg/topic"
 	"github.com/hashicorp/raft"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,6 +63,78 @@ func TestElectLeaderPopulatesTopologyFences(t *testing.T) {
 	require.Contains(t, response, "OK topic=orders partition=0")
 	require.Contains(t, response, "leader=broker-1")
 	require.Equal(t, 5, state.GetPartitionMetadata("orders-0").LeaderEpoch)
+}
+
+func TestElectLeaderAllowsRemovingTheOldLeaderAfterReplicaCatchup(t *testing.T) {
+	state := fsm.NewBrokerFSM(nil, nil)
+	apply := func(prefix string, value any) {
+		t.Helper()
+		payload, err := json.Marshal(value)
+		require.NoError(t, err)
+		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte(prefix+":"), payload...)}))
+	}
+	for _, id := range []string{"broker-1", "broker-2", "broker-3"} {
+		apply("REGISTER", fsm.BrokerInfo{
+			ID: id, Addr: id + ":9001", Status: "active", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent,
+		})
+	}
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 2
+	definition.InstanceID = rand.Text()
+	apply("TOPIC", fsm.TopicCommand{Definition: &definition})
+
+	initial := state.GetPartitionMetadata("orders-0")
+	require.Len(t, initial.Replicas, 2)
+	replacement := ""
+	for _, id := range []string{"broker-1", "broker-2", "broker-3"} {
+		if !slices.Contains(initial.Replicas, id) {
+			replacement = id
+			break
+		}
+	}
+	require.NotEmpty(t, replacement)
+	manager := &MockRaftManagerForForward{isLeader: true, state: state}
+	manager.leaderAddress.Store(initial.Leader + ":9001")
+	cfg := config.DefaultConfig()
+	cfg.EnabledDistribution = true
+	handler := NewCommandHandler(nil, cfg, nil, nil, &clusterController.ClusterController{RaftManager: manager})
+	t.Cleanup(func() { require.NoError(t, handler.Close()) })
+
+	expandedReplicas := append(slices.Clone(initial.Replicas), replacement)
+	reassign := func(replicas []string) string {
+		return handler.handleReassignPartition("REASSIGN_PARTITION topic=orders partition=0 replicas=" + strings.Join(replicas, ","))
+	}
+	require.Contains(t, reassign(expandedReplicas), "OK topic=orders")
+	elect := "ELECT_LEADER topic=orders partition=0 broker=" + replacement
+	require.Contains(t, handler.handleElectLeader(elect), "not in the ISR")
+
+	caughtUp := state.GetPartitionMetadata("orders-0")
+	caughtUp.ISR = slices.Clone(expandedReplicas)
+	apply("PARTITION:orders-0", caughtUp)
+	recoveryWork := func() string {
+		families, err := prometheus.DefaultGatherer.Gather()
+		require.NoError(t, err)
+		for _, family := range families {
+			if family.GetName() == "cursus_recovery_work_total" {
+				return family.String()
+			}
+		}
+		return ""
+	}
+	workBefore := recoveryWork()
+	response := handler.handleElectLeader(elect)
+	require.Contains(t, response, fmt.Sprintf(" leader=%s leader_epoch=%d changed=true", replacement, initial.LeaderEpoch+1))
+	caughtUp.Leader = replacement
+	caughtUp.LeaderEpoch++
+	require.Equal(t, caughtUp, state.GetPartitionMetadata("orders-0"))
+	require.Equal(t, workBefore, recoveryWork(), "leader election must not add recovery work or bytes")
+
+	finalReplicas := slices.DeleteFunc(slices.Clone(expandedReplicas), func(id string) bool { return id == initial.Leader })
+	response = reassign(finalReplicas)
+	require.Contains(t, response, "OK topic=orders")
+	require.Equal(t, finalReplicas, state.GetPartitionMetadata("orders-0").Replicas)
+	require.Equal(t, replacement, state.GetPartitionMetadata("orders-0").Leader)
 }
 
 func TestClusterStatusExposesCommittedCleanupPendingOnWire(t *testing.T) {
