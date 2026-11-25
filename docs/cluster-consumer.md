@@ -1,6 +1,6 @@
 # Cluster Consumer Architecture
 
-Consumer가 클러스터 환경에서 메시지를 소비하기 위한 FindCoordinator 기반 라우팅 아키텍처.
+FindCoordinator-based routing architecture for consumers reading messages in a cluster.
 
 ## Overview
 

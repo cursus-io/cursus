@@ -76,7 +76,7 @@ func TestBuildCreateTopicCommandUsesPortableTopicNameContract(t *testing.T) {
 		"orders/2026",
 		"orders\\2026",
 		"orders 2026",
-		"한글",
+		"café",
 		strings.Repeat("a", 250),
 	} {
 		if _, err := buildCreateTopicCommand(name, TopicOptions{Partitions: 1}, false); err == nil {

@@ -120,7 +120,7 @@ func buildFixture() ([]byte, error) {
 	encodedBatch := mustHex(wire.EncodeBatch(wire.Batch{
 		Topic: "events", Partition: 2, Acks: "all", IsIdempotent: true,
 		Messages: []wire.Message{{
-			Offset: 7, Payload: "  opaque\x00한글\tpayload  ", Timestamp: -123,
+			Offset: 7, Payload: "  opaque\x00café\tpayload  ", Timestamp: -123,
 			ProducerID: "producer-1", SeqNum: 9, Epoch: -2, Key: "aggregate-7",
 			EventType: "Updated", SchemaVersion: 2, AggregateVersion: 3,
 			Metadata: `{"trace":"a b"}`, TransactionalID: "txn-1",
