@@ -127,6 +127,7 @@ func TestClassifyFencingAndAvailability(t *testing.T) {
 		{"missing_leader_fence", ErrorClassValidation, false},
 		{"leader_election_rejected", ErrorClassConflict, false},
 		{"leader_election_result_unavailable", ErrorClassAvailability, true},
+		{"replica_reassignment_outcome_unknown", ErrorClassAvailability, false},
 		{"marshal_cluster_status_failed", ErrorClassInternal, false},
 		{"missing_broker", ErrorClassValidation, false},
 		{"duplicate_partition", ErrorClassValidation, false},

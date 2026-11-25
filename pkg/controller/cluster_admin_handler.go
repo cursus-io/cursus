@@ -311,7 +311,7 @@ func (ch *CommandHandler) handleReassignPartition(cmd string, ctx ...*ClientCont
 		ApplyCommandContext(context.Context, string, []byte) error
 	})
 	if !ok {
-		return "ERROR: raft_apply_unavailable command=REASSIGN_PARTITION"
+		return "ERROR: raft_apply_failed command=REASSIGN_PARTITION reason=context_apply_unavailable"
 	}
 	payload, err := json.Marshal(fsm.ReplicaReassignmentCommand{
 		Topic: topicName, Partition: partition, LifecycleEpoch: metadata.LifecycleEpoch,

@@ -72,6 +72,9 @@ func buildErrorRegistry() map[string]ErrorClassification {
 		"transaction_abort_marker_failed", "transaction_commit_failed", "transaction_manager_not_available", "transaction_sync_failed",
 		"snapshot_catalog_revision_changed", "transaction_offset_materialization_failed", "transaction_offset_prepare_failed", "unstable_offset_commit",
 	)
+	register(ErrorClassAvailability, false,
+		"replica_reassignment_outcome_unknown",
+	)
 	register(ErrorClassFencing, false,
 		"consumer_route_fenced",
 		"snapshot_lifecycle_changed",
