@@ -15,7 +15,7 @@ func adminTestFSM(t *testing.T, broker2Status string) *BrokerFSM {
 	state := newTestFSM()
 	for _, broker := range []BrokerInfo{
 		{ID: "broker-1", Addr: "broker-1:9001", Status: "active"},
-		{ID: "broker-2", Addr: "broker-2:9001", Status: broker2Status},
+		{ID: "broker-2", Addr: "broker-2:9001", Status: "active"},
 		{ID: "broker-3", Addr: "broker-3:9001", Status: "active"},
 	} {
 		data, err := json.Marshal(broker)
@@ -26,6 +26,18 @@ func adminTestFSM(t *testing.T, broker2Status string) *BrokerFSM {
 			if applyErr, ok := result.(error); ok {
 				t.Fatal(applyErr)
 			}
+		}
+	}
+	definition := topic.DefaultDefinition("orders", nil)
+	definition.Partitions = 1
+	definition.ReplicationFactor = 3
+	command, err := json.Marshal(TopicCommand{Definition: &definition})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), command...)}); result != nil {
+		if applyErr, ok := result.(error); ok {
+			t.Fatal(applyErr)
 		}
 	}
 	metadata := PartitionMetadata{
@@ -41,7 +53,20 @@ func adminTestFSM(t *testing.T, broker2Status string) *BrokerFSM {
 	if applyErr, ok := result.(error); ok && applyErr != nil {
 		t.Fatal(applyErr)
 	}
+	state.mu.Lock()
+	state.brokers["broker-2"].Status = broker2Status
+	state.mu.Unlock()
 	return state
+}
+
+func validLeaderElectionCommand() LeaderElectionCommand {
+	return LeaderElectionCommand{
+		Topic: "orders", Partition: 0, Broker: "broker-2", ExpectedLeaderEpoch: 7,
+		TopologyFenceVersion:       LeaderElectionTopologyFenceVersionCurrent,
+		ExpectedLifecycleEpoch:     topic.InitialLifecycleEpoch,
+		ExpectedDefinitionRevision: topic.InitialDefinitionRevision,
+		ExpectedReplicas:           []string{"broker-1", "broker-2", "broker-3"},
+	}
 }
 
 func applyLeaderElection(t *testing.T, state *BrokerFSM, command LeaderElectionCommand) interface{} {
@@ -55,9 +80,7 @@ func applyLeaderElection(t *testing.T, state *BrokerFSM, command LeaderElectionC
 
 func TestLeaderElectionAdvancesEpochAndPreservesReplicationState(t *testing.T) {
 	state := adminTestFSM(t, "active")
-	result := applyLeaderElection(t, state, LeaderElectionCommand{
-		Topic: "orders", Partition: 0, Broker: "broker-2", ExpectedLeaderEpoch: 7,
-	})
+	result := applyLeaderElection(t, state, validLeaderElectionCommand())
 	election, ok := result.(LeaderElectionResult)
 	if !ok {
 		t.Fatalf("unexpected result %T: %v", result, result)
@@ -78,7 +101,7 @@ func TestLeaderElectionAdvancesEpochAndPreservesReplicationState(t *testing.T) {
 
 func TestLeaderElectionRetryIsIdempotent(t *testing.T) {
 	state := adminTestFSM(t, "active")
-	command := LeaderElectionCommand{Topic: "orders", Partition: 0, Broker: "broker-2", ExpectedLeaderEpoch: 7}
+	command := validLeaderElectionCommand()
 	if result := applyLeaderElection(t, state, command); result == nil {
 		t.Fatal("initial election returned nil")
 	}
@@ -92,6 +115,51 @@ func TestLeaderElectionRetryIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLeaderElectionReplaysLegacyCommandWithoutTopologyFields(t *testing.T) {
+	state := adminTestFSM(t, "active")
+	legacy := []byte(`{"topic":"orders","partition":0,"broker":"broker-2","expected_leader_epoch":7}`)
+	result := state.Apply(&raft.Log{Data: append([]byte("LEADER_ELECTION:"), legacy...)})
+	election, ok := result.(LeaderElectionResult)
+	if !ok || !election.Changed || election.Leader != "broker-2" || election.LeaderEpoch != 8 {
+		t.Fatalf("legacy leader election did not replay: %T %+v", result, result)
+	}
+}
+
+func TestLeaderElectionRejectsInvalidTopologyFenceEncoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*LeaderElectionCommand)
+		message string
+	}{
+		{
+			name: "unversioned command with fence fields",
+			mutate: func(command *LeaderElectionCommand) {
+				command.TopologyFenceVersion = 0
+			},
+			message: "unversioned leader election contains topology fence fields",
+		},
+		{
+			name: "unsupported fence version",
+			mutate: func(command *LeaderElectionCommand) {
+				command.TopologyFenceVersion++
+			},
+			message: "unsupported leader election topology fence version",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := adminTestFSM(t, "active")
+			command := validLeaderElectionCommand()
+			test.mutate(&command)
+			result := applyLeaderElection(t, state, command)
+			err, ok := result.(error)
+			if !ok || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("expected %q, got %T %v", test.message, result, result)
+			}
+		})
+	}
+}
+
 func TestLeaderElectionRejectsUnsafeTargetsAndStaleEpoch(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -101,18 +169,26 @@ func TestLeaderElectionRejectsUnsafeTargetsAndStaleEpoch(t *testing.T) {
 	}{
 		{
 			name: "inactive broker", broker2Status: "inactive",
-			command: LeaderElectionCommand{Topic: "orders", Partition: 0, Broker: "broker-2", ExpectedLeaderEpoch: 7},
+			command: validLeaderElectionCommand(),
 			want:    "not active",
 		},
 		{
 			name: "outside ISR", broker2Status: "active",
-			command: LeaderElectionCommand{Topic: "orders", Partition: 0, Broker: "broker-3", ExpectedLeaderEpoch: 7},
-			want:    "not in the ISR",
+			command: func() LeaderElectionCommand {
+				command := validLeaderElectionCommand()
+				command.Broker = "broker-3"
+				return command
+			}(),
+			want: "not in the ISR",
 		},
 		{
 			name: "stale epoch", broker2Status: "active",
-			command: LeaderElectionCommand{Topic: "orders", Partition: 0, Broker: "broker-2", ExpectedLeaderEpoch: 6},
-			want:    "stale leader epoch",
+			command: func() LeaderElectionCommand {
+				command := validLeaderElectionCommand()
+				command.ExpectedLeaderEpoch = 6
+				return command
+			}(),
+			want: "stale leader epoch",
 		},
 	}
 	for _, test := range tests {
@@ -131,10 +207,85 @@ func TestLeaderElectionRejectsUnsafeTargetsAndStaleEpoch(t *testing.T) {
 	}
 }
 
+func TestLeaderElectionRejectsStaleTopologyBeforeIdempotentSuccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*BrokerFSM)
+		want   string
+	}{
+		{
+			name: "topic lifecycle changed",
+			mutate: func(state *BrokerFSM) {
+				state.topicState["orders"].LifecycleEpoch++
+			},
+			want: "stale lifecycle epoch",
+		},
+		{
+			name: "partition lifecycle changed",
+			mutate: func(state *BrokerFSM) {
+				state.partitionMetadata["orders-0"].LifecycleEpoch++
+			},
+			want: "stale lifecycle epoch",
+		},
+		{
+			name: "replica order changed",
+			mutate: func(state *BrokerFSM) {
+				state.partitionMetadata["orders-0"].Replicas = []string{"broker-2", "broker-1", "broker-3"}
+			},
+			want: "stale replica assignment",
+		},
+		{
+			name: "topic definition changed",
+			mutate: func(state *BrokerFSM) {
+				state.topicState["orders"].Revision++
+			},
+			want: "stale definition revision",
+		},
+		{
+			name: "replication factor changed",
+			mutate: func(state *BrokerFSM) {
+				state.topicState["orders"].ReplicationFactor--
+			},
+			want: "stale replication factor",
+		},
+		{
+			name: "replica recovery started",
+			mutate: func(state *BrokerFSM) {
+				state.partitionMetadata["orders-0"].RecoveryReplicas = []string{"broker-3"}
+			},
+			want: "replica recovery pending",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := adminTestFSM(t, "active")
+			command := validLeaderElectionCommand()
+			if result := applyLeaderElection(t, state, command); result == nil {
+				t.Fatal("initial election returned nil")
+			}
+
+			state.mu.Lock()
+			test.mutate(state)
+			state.mu.Unlock()
+
+			result := applyLeaderElection(t, state, command)
+			err, ok := result.(error)
+			if !ok || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected %q, got %T %v", test.want, result, result)
+			}
+		})
+	}
+}
+
 func TestLeaderElectionRejectsMissingPartition(t *testing.T) {
 	state := adminTestFSM(t, "active")
 	result := applyLeaderElection(t, state, LeaderElectionCommand{
 		Topic: "missing", Partition: 1, Broker: "broker-2", ExpectedLeaderEpoch: 1,
+		TopologyFenceVersion:       LeaderElectionTopologyFenceVersionCurrent,
+		ExpectedLifecycleEpoch:     topic.InitialLifecycleEpoch,
+		ExpectedDefinitionRevision: topic.InitialDefinitionRevision,
+		ExpectedReplicas:           []string{"broker-1", "broker-2"},
 	})
 	err, ok := result.(error)
 	if !ok || !strings.Contains(err.Error(), fmt.Sprintf("%s-%d", "missing", 1)) {
