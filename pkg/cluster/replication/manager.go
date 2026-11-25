@@ -633,6 +633,27 @@ func (rm *RaftReplicationManager) ApplyCommand(prefix string, data []byte) error
 	} else {
 		err = future.Error()
 	}
+	return applyCommandResult(future, err)
+}
+
+// ApplyCommandContext waits for an FSM decision on a raw command without
+// changing its payload. Canceling the wait does not revoke an admitted entry.
+func (rm *RaftReplicationManager) ApplyCommandContext(ctx context.Context, prefix string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeout := raftApplyTimeoutForCommand(prefix)
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = min(timeout, time.Until(deadline))
+		if timeout <= 0 {
+			return context.DeadlineExceeded
+		}
+	}
+	future := rm.raft.Apply([]byte(prefix+":"+string(data)), timeout)
+	return applyCommandResult(future, waitForApplyFutureContext(ctx, future))
+}
+
+func applyCommandResult(future raft.ApplyFuture, err error) error {
 	if err != nil {
 		return err
 	}
@@ -654,21 +675,24 @@ func isTopicLifecycleCommand(prefix string) bool {
 }
 
 func waitForApplyFuture(future raft.ApplyFuture, timeout time.Duration) error {
-	if timeout <= 0 {
-		return context.DeadlineExceeded
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return waitForApplyFutureContext(ctx, future)
+}
 
+func waitForApplyFutureContext(ctx context.Context, future raft.ApplyFuture) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	result := make(chan error, 1)
 	go func() {
 		result <- future.Error()
 	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 	select {
 	case err := <-result:
 		return err
-	case <-timer.C:
-		return context.DeadlineExceeded
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

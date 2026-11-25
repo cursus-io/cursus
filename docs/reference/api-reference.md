@@ -593,6 +593,8 @@ This command does not add replicas, expand ISR, or perform data movement.
 
 `REASSIGN_PARTITION topic=<name> partition=<N> replicas=<broker-a,broker-b,...>` changes one partition's replica set through the Raft metadata log. Expansion may add one replica beyond the configured replication factor so that the destination can catch up. Removal is accepted only when every target replica is already in ISR, the current leader remains, and the result has exactly the configured replication factor. Add the destination and wait until it enters ISR. If the replica being removed is the leader, use `ELECT_LEADER` to transfer leadership to an in-sync replica in the final set. Then submit the final replica set without the source.
 
+If the apply wait ends with `replica_reassignment_outcome_unknown`, check the current assignment before retrying. An admitted Raft entry may still apply after the wait ends.
+
 ### RAFT_APPLY
 
 Internal replication command used by distributed brokers. In distributed mode this command requires `internal_token=<shared-token>` before `type=`. External clients and SDKs must not call it directly.

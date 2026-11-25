@@ -65,6 +65,17 @@ func TestElectLeaderPopulatesTopologyFences(t *testing.T) {
 	require.Equal(t, 5, state.GetPartitionMetadata("orders-0").LeaderEpoch)
 }
 
+type contextualAdminRaftManager struct {
+	*MockRaftManagerForForward
+}
+
+func (m contextualAdminRaftManager) ApplyCommandContext(ctx context.Context, command string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.ApplyCommand(command, data)
+}
+
 func TestElectLeaderAllowsRemovingTheOldLeaderAfterReplicaCatchup(t *testing.T) {
 	state := fsm.NewBrokerFSM(nil, nil)
 	apply := func(prefix string, value any) {
@@ -98,7 +109,9 @@ func TestElectLeaderAllowsRemovingTheOldLeaderAfterReplicaCatchup(t *testing.T) 
 	manager.leaderAddress.Store(initial.Leader + ":9001")
 	cfg := config.DefaultConfig()
 	cfg.EnabledDistribution = true
-	handler := NewCommandHandler(nil, cfg, nil, nil, &clusterController.ClusterController{RaftManager: manager})
+	handler := NewCommandHandler(nil, cfg, nil, nil, &clusterController.ClusterController{
+		RaftManager: contextualAdminRaftManager{MockRaftManagerForForward: manager},
+	})
 	t.Cleanup(func() { require.NoError(t, handler.Close()) })
 
 	expandedReplicas := append(slices.Clone(initial.Replicas), replacement)

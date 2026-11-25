@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -304,18 +306,25 @@ func (ch *CommandHandler) handleReassignPartition(cmd string, ctx ...*ClientCont
 	if metadata == nil {
 		return fmt.Sprintf("ERROR: partition_not_found topic=%s partition=%d", topicName, partition)
 	}
-	// The durable command uses strict decoding and has no request ID. ApplyCommand
-	// already waits for the FSM and returns any rejection.
+	// The durable command uses strict decoding and has no request ID.
+	applier, ok := ch.Cluster.RaftManager.(interface {
+		ApplyCommandContext(context.Context, string, []byte) error
+	})
+	if !ok {
+		return "ERROR: raft_apply_unavailable command=REASSIGN_PARTITION"
+	}
 	payload, err := json.Marshal(fsm.ReplicaReassignmentCommand{
 		Topic: topicName, Partition: partition, LifecycleEpoch: metadata.LifecycleEpoch,
 		Leader: metadata.Leader, LeaderEpoch: metadata.LeaderEpoch,
 		ExpectedReplicas: metadata.Replicas, TargetReplicas: target,
 	})
 	if err == nil {
-		err = requestCtx.Err()
+		applyCtx, cancel := context.WithTimeout(requestCtx, DefaultFSMApplyTimeout)
+		defer cancel()
+		err = applier.ApplyCommandContext(applyCtx, "REPLICA_REASSIGN", payload)
 	}
-	if err == nil {
-		err = ch.Cluster.RaftManager.ApplyCommand("REPLICA_REASSIGN", payload)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("ERROR: replica_reassignment_outcome_unknown topic=%s partition=%d reason=%q", topicName, partition, err.Error())
 	}
 	if err != nil {
 		return fmt.Sprintf("ERROR: replica_reassignment_rejected topic=%s partition=%d reason=%q", topicName, partition, err.Error())

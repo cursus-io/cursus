@@ -650,6 +650,42 @@ func TestWaitForApplyFutureTimesOut(t *testing.T) {
 	fut.AssertExpectations(t)
 }
 
+func TestApplyCommandContextCancelsWaitAfterAdmission(t *testing.T) {
+	mr := new(MockRaft)
+	rm := &RaftReplicationManager{raft: mr}
+	future := new(MockApplyFuture)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	future.On("Error").Run(func(mock.Arguments) {
+		close(started)
+		<-release
+	}).Return(nil).Once()
+	payload := []byte(`{"topic":"orders","partition":0}`)
+	mr.On("Apply", append([]byte("REPLICA_REASSIGN:"), payload...), defaultRaftApplyTimeout).Return(future).Once()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- rm.ApplyCommandContext(ctx, "REPLICA_REASSIGN", payload)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("command was not admitted")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("apply wait did not return on cancellation")
+	}
+	mr.AssertExpectations(t)
+	future.AssertExpectations(t)
+}
+
 func TestRaftReplicationManager_ApplyCommandReturnsFSMError(t *testing.T) {
 	mr := new(MockRaft)
 	rm := &RaftReplicationManager{raft: mr}
