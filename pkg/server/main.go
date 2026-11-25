@@ -364,6 +364,7 @@ func RunServerContext(ctx context.Context, cfg *config.Config, tm *topic.TopicMa
 		cc.SetRecoveryBudget(recoveryBudget)
 		cc.SetReplicaSnapshotCatchupStep(globalCH.CatchupReplicaSnapshotPage)
 		runtimeStops = append(runtimeStops, cc.StartTopologyReconciler(ctx))
+		runtimeStops = append(runtimeStops, cc.StartLeaderRebalancer(ctx))
 		cc.StartReplicaCatchupVerified(ctx, clusterClient, globalCH.ApplyReplicaCatchupVerified)
 	}
 	if cfg.EnabledDistribution && cfg.InternalBrokerPort > 0 {

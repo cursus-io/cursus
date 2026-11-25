@@ -31,6 +31,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.BootstrapSoleVoter {
 		t.Error("Expected BootstrapSoleVoter to default to false")
 	}
+	if !cfg.LeaderRebalanceEnabled || cfg.LeaderRebalanceIntervalMS != 30000 || cfg.LeaderRebalanceMaxMovesPerCycle != 8 {
+		t.Errorf("unexpected leader rebalance defaults: enabled=%t interval=%d max_moves=%d", cfg.LeaderRebalanceEnabled, cfg.LeaderRebalanceIntervalMS, cfg.LeaderRebalanceMaxMovesPerCycle)
+	}
 	if cfg.TransactionCoordinatorShards != 50 {
 		t.Errorf("Expected default TransactionCoordinatorShards 50, got %d", cfg.TransactionCoordinatorShards)
 	}
@@ -69,6 +72,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("RAFT_SNAPSHOT_THRESHOLD", "16")
 	t.Setenv("RAFT_TRAILING_LOGS", "0")
 	t.Setenv("BOOTSTRAP_SOLE_VOTER", "true")
+	t.Setenv("LEADER_REBALANCE_ENABLED", "false")
+	t.Setenv("LEADER_REBALANCE_INTERVAL_MS", "1234")
+	t.Setenv("LEADER_REBALANCE_MAX_MOVES_PER_CYCLE", "5")
 	t.Setenv("TRANSACTION_COORDINATOR_SHARDS", "17")
 	t.Setenv("TRANSACTION_RECOVERY_BATCH_SIZE", "19")
 	t.Setenv("CLIENT_REQUEST_TIMEOUT_MS", "45000")
@@ -111,6 +117,9 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	if !cfg.BootstrapSoleVoter {
 		t.Error("Expected BootstrapSoleVoter true from env")
 	}
+	if cfg.LeaderRebalanceEnabled || cfg.LeaderRebalanceIntervalMS != 1234 || cfg.LeaderRebalanceMaxMovesPerCycle != 5 {
+		t.Errorf("unexpected leader rebalance env values: enabled=%t interval=%d max_moves=%d", cfg.LeaderRebalanceEnabled, cfg.LeaderRebalanceIntervalMS, cfg.LeaderRebalanceMaxMovesPerCycle)
+	}
 	if cfg.TransactionCoordinatorShards != 17 {
 		t.Errorf("Expected TransactionCoordinatorShards 17 from env, got %d", cfg.TransactionCoordinatorShards)
 	}
@@ -147,19 +156,19 @@ func TestLoadConfig_ExplicitFlagOverridesFile(t *testing.T) {
 	if os.Getenv("CURSUS_CONFIG_FLAG_HELPER") == "1" {
 		configPath := os.Getenv("CURSUS_CONFIG_FLAG_PATH")
 		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-		os.Args = []string{os.Args[0], "--config", configPath, "--port", "9123", "--log-level", "error"}
+		os.Args = []string{os.Args[0], "--config", configPath, "--port", "9123", "--log-level", "error", "--leader-rebalance-enabled=true", "--leader-rebalance-interval-ms", "222", "--leader-rebalance-max-moves-per-cycle", "3"}
 		cfg, err := config.LoadConfig()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.BrokerPort != 9123 || cfg.LogLevel != util.LogLevelError || cfg.DiskFlushBatchSize != 7 {
-			t.Fatalf("unexpected precedence result: port=%d log=%v batch=%d", cfg.BrokerPort, cfg.LogLevel, cfg.DiskFlushBatchSize)
+		if cfg.BrokerPort != 9123 || cfg.LogLevel != util.LogLevelError || cfg.DiskFlushBatchSize != 7 || !cfg.LeaderRebalanceEnabled || cfg.LeaderRebalanceIntervalMS != 222 || cfg.LeaderRebalanceMaxMovesPerCycle != 3 {
+			t.Fatalf("unexpected precedence result: port=%d log=%v batch=%d leader_rebalance=%t interval=%d max_moves=%d", cfg.BrokerPort, cfg.LogLevel, cfg.DiskFlushBatchSize, cfg.LeaderRebalanceEnabled, cfg.LeaderRebalanceIntervalMS, cfg.LeaderRebalanceMaxMovesPerCycle)
 		}
 		return
 	}
 
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(configPath, []byte("broker_port: 9001\nlog_level: 1\ndisk_flush_batch_size: 7\n"), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte("broker_port: 9001\nlog_level: 1\ndisk_flush_batch_size: 7\nleader_rebalance_enabled: false\nleader_rebalance_interval_ms: 111\nleader_rebalance_max_moves_per_cycle: 2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLoadConfig_ExplicitFlagOverridesFile$")
@@ -216,6 +225,21 @@ func TestConfig_Normalize(t *testing.T) {
 	}
 	if cfg.MaxInflightRequests != 256 || cfg.MaxInflightRequestBytes != 256*1024*1024 {
 		t.Errorf("Normalize should restore request limits, got requests=%d bytes=%d", cfg.MaxInflightRequests, cfg.MaxInflightRequestBytes)
+	}
+	if cfg.LeaderRebalanceIntervalMS != 30000 || cfg.LeaderRebalanceMaxMovesPerCycle != 8 {
+		t.Errorf("Normalize should restore leader rebalance limits, got interval=%d max_moves=%d", cfg.LeaderRebalanceIntervalMS, cfg.LeaderRebalanceMaxMovesPerCycle)
+	}
+}
+
+func TestConfigNormalizeLeaderRebalanceLimits(t *testing.T) {
+	for _, values := range [][2]int{{0, 0}, {-1, -1}} {
+		cfg := config.DefaultConfig()
+		cfg.LeaderRebalanceIntervalMS = values[0]
+		cfg.LeaderRebalanceMaxMovesPerCycle = values[1]
+		cfg.Normalize()
+		if cfg.LeaderRebalanceIntervalMS != 30000 || cfg.LeaderRebalanceMaxMovesPerCycle != 8 {
+			t.Fatalf("normalized interval=%d max_moves=%d", cfg.LeaderRebalanceIntervalMS, cfg.LeaderRebalanceMaxMovesPerCycle)
+		}
 	}
 }
 

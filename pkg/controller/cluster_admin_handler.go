@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"strings"
 
+	clustercontroller "github.com/cursus-io/cursus/pkg/cluster/controller"
 	"github.com/cursus-io/cursus/pkg/cluster/replication"
 	"github.com/cursus-io/cursus/pkg/cluster/replication/fsm"
+	"github.com/cursus-io/cursus/pkg/config"
 )
 
 type clusterBrokerStatus struct {
@@ -19,27 +21,30 @@ type clusterBrokerStatus struct {
 }
 
 type clusterPartitionStatus struct {
-	Key                string   `json:"key"`
-	Topic              string   `json:"topic"`
-	Partition          int      `json:"partition"`
-	Leader             string   `json:"leader"`
-	LeaderEpoch        int      `json:"leader_epoch"`
-	Replicas           []string `json:"replicas"`
-	ISR                []string `json:"isr"`
-	RecoveryReplicas   []string `json:"recovery_replicas,omitempty"`
-	CommittedHWM       uint64   `json:"committed_hwm"`
-	ExpectedReplicas   int      `json:"expected_replicas"`
-	ActiveReplicas     int      `json:"active_replicas"`
-	InactiveReplicas   int      `json:"inactive_replicas"`
-	InSyncReplicas     int      `json:"in_sync_replicas"`
-	MinInSyncReplicas  int      `json:"min_in_sync_replicas"`
-	LeaderAvailable    bool     `json:"leader_available"`
-	AssignmentComplete bool     `json:"assignment_complete"`
-	UnderReplicated    bool     `json:"under_replicated"`
-	MinISRUnsatisfied  bool     `json:"min_isr_unsatisfied"`
-	RecoveryPending    bool     `json:"recovery_pending"`
-	Healthy            bool     `json:"healthy"`
-	Reasons            []string `json:"reasons,omitempty"`
+	Key                            string   `json:"key"`
+	Topic                          string   `json:"topic"`
+	Partition                      int      `json:"partition"`
+	Leader                         string   `json:"leader"`
+	LeaderEpoch                    int      `json:"leader_epoch"`
+	Replicas                       []string `json:"replicas"`
+	ISR                            []string `json:"isr"`
+	RecoveryReplicas               []string `json:"recovery_replicas,omitempty"`
+	CommittedHWM                   uint64   `json:"committed_hwm"`
+	ExpectedReplicas               int      `json:"expected_replicas"`
+	ActiveReplicas                 int      `json:"active_replicas"`
+	InactiveReplicas               int      `json:"inactive_replicas"`
+	InSyncReplicas                 int      `json:"in_sync_replicas"`
+	MinInSyncReplicas              int      `json:"min_in_sync_replicas"`
+	LeaderAvailable                bool     `json:"leader_available"`
+	AssignmentComplete             bool     `json:"assignment_complete"`
+	UnderReplicated                bool     `json:"under_replicated"`
+	MinISRUnsatisfied              bool     `json:"min_isr_unsatisfied"`
+	RecoveryPending                bool     `json:"recovery_pending"`
+	PreferredLeader                string   `json:"preferred_leader,omitempty"`
+	LeaderRebalanceEligible        bool     `json:"leader_rebalance_eligible"`
+	LeaderRebalanceExclusionReason string   `json:"leader_rebalance_exclusion_reason,omitempty"`
+	Healthy                        bool     `json:"healthy"`
+	Reasons                        []string `json:"reasons,omitempty"`
 }
 
 type clusterStatus struct {
@@ -62,6 +67,9 @@ type clusterStatus struct {
 	InactiveReplicas              int                      `json:"inactive_replicas"`
 	MinISRUnsatisfied             int                      `json:"min_isr_unsatisfied_partitions"`
 	RecoveryPending               int                      `json:"recovery_pending_partitions"`
+	LeaderRebalanceImbalanced     int                      `json:"leader_rebalance_imbalanced_partitions"`
+	LeaderRebalanceEligible       int                      `json:"leader_rebalance_eligible_partitions"`
+	LeaderRebalanceSelected       int                      `json:"leader_rebalance_selected_partitions"`
 	TopicMaterializationPending   int                      `json:"topic_materialization_pending"`
 	ReplicaMaterializationPending int                      `json:"replica_materialization_pending"`
 	Healthy                       bool                     `json:"healthy"`
@@ -103,7 +111,11 @@ func (ch *CommandHandler) handleClusterStatus() string {
 		defaultMinISR = ch.Config.MinInSyncReplicas
 	}
 	_ = state.ReconcileReplicaMaterializations(ch.Cluster.BrokerID())
-	status := buildClusterStatus(state, ch.Cluster.RaftManager.GetLeaderAddress(), defaultMinISR)
+	maxLeaderMoves := config.DefaultLeaderRebalanceMaxMovesPerCycle
+	if ch.Config != nil {
+		maxLeaderMoves = ch.Config.LeaderRebalanceMaxMovesPerCycle
+	}
+	status := buildClusterStatusWithLeaderRebalance(state, ch.Cluster.RaftManager.GetLeaderAddress(), defaultMinISR, maxLeaderMoves)
 	if ch.Config != nil {
 		status.InternalCredentialGeneration = ch.Config.InternalAuthGeneration
 	}
@@ -130,6 +142,10 @@ func (ch *CommandHandler) handleClusterStatus() string {
 }
 
 func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR int) clusterStatus {
+	return buildClusterStatusWithLeaderRebalance(state, raftLeader, defaultMinISR, config.DefaultLeaderRebalanceMaxMovesPerCycle)
+}
+
+func buildClusterStatusWithLeaderRebalance(state *fsm.BrokerFSM, raftLeader string, defaultMinISR, maxLeaderMoves int) clusterStatus {
 	status := clusterStatus{RaftLeader: raftLeader}
 	brokers := state.GetBrokers()
 	sort.Slice(brokers, func(i, j int) bool { return brokers[i].ID < brokers[j].ID })
@@ -159,8 +175,16 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 	status.TopicMaterializationPending = len(status.TopicMaterializationIssues)
 	status.ReplicaMaterializationPending = len(state.ReplicaMaterializationIssues())
 	status.Healthy = topology.Healthy && status.TopicMaterializationPending == 0 && status.ReplicaMaterializationPending == 0
+	rebalance := clustercontroller.PlanPreferredLeaderRebalance(state.GetLeaderRebalanceSnapshot(), maxLeaderMoves)
+	status.LeaderRebalanceImbalanced = rebalance.ImbalancedPartitions
+	status.LeaderRebalanceEligible = rebalance.EligiblePartitions
+	status.LeaderRebalanceSelected = len(rebalance.Candidates)
+	rebalanceByKey := make(map[string]clustercontroller.LeaderRebalancePartition, len(rebalance.Partitions))
+	for _, partition := range rebalance.Partitions {
+		rebalanceByKey[partition.Key] = partition
+	}
 	for _, partition := range topology.Partitions {
-		status.Partitions = append(status.Partitions, clusterPartitionStatus{
+		partitionStatus := clusterPartitionStatus{
 			Key: partition.Key, Topic: partition.Topic, Partition: partition.Partition,
 			Leader: partition.Leader, LeaderEpoch: partition.LeaderEpoch,
 			Replicas: append([]string(nil), partition.Replicas...), ISR: append([]string(nil), partition.ISR...),
@@ -173,7 +197,15 @@ func buildClusterStatus(state *fsm.BrokerFSM, raftLeader string, defaultMinISR i
 			UnderReplicated: partition.UnderReplicated, MinISRUnsatisfied: partition.MinISRUnsatisfied,
 			RecoveryPending: partition.RecoveryPending,
 			Healthy:         partition.Healthy, Reasons: append([]string(nil), partition.Reasons...),
-		})
+		}
+		if assessment, found := rebalanceByKey[partition.Key]; found {
+			partitionStatus.PreferredLeader = assessment.PreferredLeader
+			partitionStatus.LeaderRebalanceEligible = assessment.Eligible
+			if !assessment.Eligible {
+				partitionStatus.LeaderRebalanceExclusionReason = string(assessment.Reason)
+			}
+		}
+		status.Partitions = append(status.Partitions, partitionStatus)
 	}
 	return status
 }

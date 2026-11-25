@@ -1,16 +1,21 @@
+# These fault tests inspect internal catch-up with a captured leader fence.
+# Keep the independent periodic leader scheduler out of that recovery fixture.
 services:
   broker-1:
     command: ["./broker", "--log-level=debug"]
     environment:
       LOG_SEGMENT_BYTES: "65536"
       LOG_RETENTION_CHECK_INTERVAL_MS: "250"
+      LEADER_REBALANCE_ENABLED: "false"
   broker-2:
     command: ["./broker", "--log-level=debug"]
     environment:
       LOG_SEGMENT_BYTES: "65536"
       LOG_RETENTION_CHECK_INTERVAL_MS: "250"
+      LEADER_REBALANCE_ENABLED: "false"
   broker-3:
     command: ["./broker", "--log-level=debug"]
     environment:
       LOG_SEGMENT_BYTES: "65536"
       LOG_RETENTION_CHECK_INTERVAL_MS: "250"
+      LEADER_REBALANCE_ENABLED: "false"
