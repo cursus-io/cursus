@@ -569,7 +569,7 @@ Common errors are `ERROR: distribution_required command=CLUSTER_STATUS`, `ERROR:
 
 ### ELECT_LEADER
 
-`ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>` performs a controlled preferred-leader change through the Raft metadata log. The target must be an active replica already present in the partition ISR. The broker records the current leader epoch in the command and the FSM rejects stale concurrent changes. A successful change increments `leader_epoch` while preserving `committed_hwm`, replicas, and ISR. Retrying an election whose target is already leader succeeds with `changed=false` and does not advance the epoch again.
+`ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>` transfers leadership to an active replica already in the partition ISR. The Raft FSM rejects stale topic instances and topology changes, and rejects elections while replica recovery is pending. A successful change increments `leader_epoch` while preserving `committed_hwm`, replicas, and ISR. Retrying an election whose target is already leader succeeds with `changed=false` while the topology checks still pass.
 
 Success:
 
@@ -591,7 +591,9 @@ This command does not add replicas, expand ISR, or perform data movement.
 
 ### REASSIGN_PARTITION
 
-`REASSIGN_PARTITION topic=<name> partition=<N> replicas=<broker-a,broker-b,...>` changes one partition's replica set through the Raft metadata log. Expansion may add one replica beyond the configured replication factor so that the destination can catch up. Removal is accepted only when every target replica is already in ISR, the current leader remains, and the result has exactly the configured replication factor. A safe move uses two calls: add the destination, wait until it enters ISR, then submit the final replica set without the source.
+`REASSIGN_PARTITION topic=<name> partition=<N> replicas=<broker-a,broker-b,...>` changes one partition's replica set through the Raft metadata log. Expansion may add one replica beyond the configured replication factor so that the destination can catch up. Removal is accepted only when every target replica is already in ISR, the current leader remains, and the result has exactly the configured replication factor. Add the destination and wait until it enters ISR. If the replica being removed is the leader, use `ELECT_LEADER` to transfer leadership to an in-sync replica in the final set. Then submit the final replica set without the source.
+
+If the apply wait ends with `replica_reassignment_outcome_unknown`, check the current assignment before retrying. An admitted Raft entry may still apply after the wait ends.
 
 ### RAFT_APPLY
 

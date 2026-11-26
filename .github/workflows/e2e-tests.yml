@@ -682,7 +682,8 @@ jobs:
           RUN_E2E_COOPERATIVE: "1"
         run: |
           set -o pipefail
-          go test -v -timeout 20m ./test/e2e-cluster -run '^TestCooperativeBrokerGoFaultRecovery$' -count=1 | tee cooperative-go.log
+          go test -v -timeout 20m ./test/e2e-cluster \
+            -run '^TestCooperative(BrokerGoFaultRecovery|DrainUsesRaftWatermarks)$' -count=1 | tee cooperative-go.log
       - name: Upload fault recovery measurements
         if: always()
         uses: actions/upload-artifact@v7

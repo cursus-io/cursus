@@ -2,6 +2,7 @@ package e2e_cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const cooperativePartitionCount = 6
 
 func cooperativeE2EConfig(addrs []string) *sdk.ConsumerConfig {
 	cfg := sdk.NewDefaultConsumerConfig()
@@ -101,7 +104,7 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	defer cancel()
 	publishCtx, stopPublishing := context.WithCancel(ctx)
 	defer stopPublishing()
-	var published [6]atomic.Uint64
+	var published [cooperativePartitionCount]atomic.Uint64
 	publishDone := make(chan struct{})
 	go func() {
 		defer close(publishDone)
@@ -287,18 +290,25 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 	<-publishDone
 	admin, err := sdk.NewAdminClient(&sdk.AdminConfig{BrokerAddrs: addrs, RequestTimeoutMS: 2000})
 	require.NoError(t, err)
-	require.Eventually(t, func() bool {
+	var acknowledged [cooperativePartitionCount]uint64
+	for partition := range acknowledged {
+		acknowledged[partition] = published[partition].Load()
+	}
+	// HWM must come from the applied Raft leader, not the arbitrary broker
+	// serving the SDK's LIST_OFFSETS request. The group commits still come
+	// from the group's authoritative coordinator.
+	require.NoError(t, eventually(t, "all acknowledged records to reach committed consumer offsets", 60*time.Second, func() (bool, string, error) {
+		hwm, err := cooperativeCommittedWatermarks(cfg.Topic)
+		if err != nil {
+			return false, "read Raft committed watermarks", err
+		}
 		offsets, err := admin.GroupOffsets(ctx, cfg.GroupID, cfg.Topic)
-		if err != nil || len(offsets) != 6 {
-			return false
+		if err != nil {
+			return false, fmt.Sprintf("acknowledged=%v committed_hwm=%v SDK=%+v", acknowledged, hwm, a.Stats()), err
 		}
-		for _, offset := range offsets {
-			if offset.Offset != offset.Latest || offset.Offset < published[offset.Partition].Load() {
-				return false
-			}
-		}
-		return true
-	}, 60*time.Second, 200*time.Millisecond, "all acknowledged records must reach a committed consumer offset")
+		err = validateCooperativeDrain(acknowledged, hwm, offsets)
+		return err == nil, fmt.Sprintf("SDK=%+v", a.Stats()), err
+	}))
 	t.Log("all_partitions_drained=true committed_consumer_offsets_equal_log_end=true")
 	cancel()
 	err = <-doneA
@@ -318,4 +328,89 @@ func TestCooperativeBrokerGoFaultRecovery(t *testing.T) {
 		assert.LessOrEqual(t, n, cfg.BatchSize, "a transferred partition must retain the one-batch replay bound: %s", grant)
 	}
 	mu.Unlock()
+}
+
+func cooperativeCommittedWatermarks(topic string) (map[int]uint64, error) {
+	var lastErr error
+	for node := 1; node <= 3; node++ {
+		response, err := sendDirectBrokerCommand(node, "CLUSTER_STATUS")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		payload, found := strings.CutPrefix(response, "OK cluster=")
+		if !found {
+			return nil, fmt.Errorf("unexpected cluster status from broker %d: %q", node, response)
+		}
+		var status struct {
+			RaftState        string              `json:"raft_state"`
+			RaftAppliedIndex uint64              `json:"raft_applied_index"`
+			RaftCommitIndex  uint64              `json:"raft_commit_index"`
+			Partitions       []ackFaultPartition `json:"partitions"`
+		}
+		if err := json.Unmarshal([]byte(payload), &status); err != nil {
+			return nil, fmt.Errorf("decode cluster status from broker %d: %w", node, err)
+		}
+		if status.RaftState != "Leader" || status.RaftAppliedIndex < status.RaftCommitIndex {
+			continue
+		}
+		hwm := make(map[int]uint64)
+		for _, partition := range status.Partitions {
+			if partition.Topic == topic {
+				hwm[partition.Partition] = partition.CommittedHWM
+			}
+		}
+		return hwm, nil
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("no caught-up Raft leader: %w", lastErr)
+	}
+	return nil, fmt.Errorf("no caught-up Raft leader")
+}
+
+func validateCooperativeDrain(acknowledged [cooperativePartitionCount]uint64, hwm map[int]uint64, offsets []sdk.GroupOffset) error {
+	if len(hwm) != len(acknowledged) || len(offsets) != len(acknowledged) {
+		return fmt.Errorf("need all partition offsets: acknowledged=%v committed_hwm=%v group_offsets=%+v", acknowledged, hwm, offsets)
+	}
+	var seen [cooperativePartitionCount]bool
+	var differences []string
+	for _, offset := range offsets {
+		id := offset.Partition
+		if id < 0 || id >= len(seen) || seen[id] {
+			return fmt.Errorf("unexpected or duplicate group offset partition %d", id)
+		}
+		seen[id] = true
+		end, found := hwm[id]
+		if !found || offset.Offset != end || end < acknowledged[id] {
+			differences = append(differences, fmt.Sprintf("P%d acknowledged=%d committed=%d raft_hwm=%d known=%t local_hwm=%d",
+				id, acknowledged[id], offset.Offset, end, found, offset.Latest))
+		}
+	}
+	if len(differences) != 0 {
+		return errors.New(strings.Join(differences, "; "))
+	}
+	return nil
+}
+
+func TestCooperativeDrainUsesRaftWatermarks(t *testing.T) {
+	acknowledged := [cooperativePartitionCount]uint64{11, 12, 13, 14, 15, 16}
+	hwm := make(map[int]uint64)
+	var offsets []sdk.GroupOffset
+	for partition, count := range acknowledged {
+		hwm[partition] = count
+		offsets = append(offsets, sdk.GroupOffset{Partition: partition, Offset: count, Latest: count})
+	}
+	offsets[1].Latest--
+	require.NoError(t, validateCooperativeDrain(acknowledged, hwm, offsets), "a stale local watermark must not fail a fully committed group")
+
+	hwm[2]++ // A write can commit without the publisher observing its ACK.
+	require.ErrorContains(t, validateCooperativeDrain(acknowledged, hwm, offsets), "P2 acknowledged=13 committed=13 raft_hwm=14")
+	offsets[2].Offset++
+	require.NoError(t, validateCooperativeDrain(acknowledged, hwm, offsets))
+
+	offsets[3].Offset--
+	hwm[3]--
+	require.ErrorContains(t, validateCooperativeDrain(acknowledged, hwm, offsets), "P3 acknowledged=14 committed=13 raft_hwm=13")
+	offsets[4] = offsets[3]
+	require.ErrorContains(t, validateCooperativeDrain(acknowledged, hwm, offsets), "duplicate group offset partition 3")
 }

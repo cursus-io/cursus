@@ -41,6 +41,7 @@ type LeaderRebalancePartition struct {
 	LeaderEpoch        int
 	LifecycleEpoch     uint64
 	DefinitionRevision uint64
+	TopicInstanceID    string
 	ExpectedReplicas   []string
 	Internal           bool
 	Eligible           bool
@@ -138,6 +139,7 @@ func assessLeaderRebalancePartition(key, topicName string, partition int, defini
 	assessment.LeaderEpoch = metadata.LeaderEpoch
 	assessment.LifecycleEpoch = metadata.LifecycleEpoch
 	assessment.DefinitionRevision = definition.Revision
+	assessment.TopicInstanceID = definition.InstanceID
 	assessment.ExpectedReplicas = append([]string(nil), metadata.Replicas...)
 	if definition.LifecycleEpoch == 0 || metadata.LifecycleEpoch != definition.LifecycleEpoch || metadata.PartitionCount != definition.Partitions || !validLeaderRebalanceAssignment(metadata) || !leaderRebalanceReplicasKnown(metadata.Replicas, snapshot.Brokers) {
 		assessment.Reason = LeaderRebalanceInvalidMetadata
@@ -273,7 +275,8 @@ func (cc *ClusterController) RunLeaderRebalanceOnce(ctx context.Context) (result
 			Topic: candidate.Topic, Partition: candidate.Partition, Broker: candidate.PreferredLeader,
 			ExpectedLeaderEpoch: candidate.LeaderEpoch, TopologyFenceVersion: fsm.LeaderElectionTopologyFenceVersionCurrent,
 			ExpectedLifecycleEpoch: candidate.LifecycleEpoch, ExpectedDefinitionRevision: candidate.DefinitionRevision,
-			ExpectedReplicas: append([]string(nil), candidate.ExpectedReplicas...),
+			ExpectedReplicas:        append([]string(nil), candidate.ExpectedReplicas...),
+			ExpectedTopicInstanceID: &candidate.TopicInstanceID, RequireStableAssignment: true,
 		}
 		payload, err := json.Marshal(command)
 		if err == nil {

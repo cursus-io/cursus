@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -195,13 +196,14 @@ func leaderRebalanceRunnerState(t *testing.T, partitions int) *fsm.BrokerFSM {
 	t.Helper()
 	state := fsm.NewBrokerFSM(nil, nil)
 	for _, id := range []string{"n1", "n2", "n3"} {
-		payload, err := json.Marshal(fsm.BrokerInfo{ID: id, Addr: id + ":9001", Status: "active"})
+		payload, err := json.Marshal(fsm.BrokerInfo{ID: id, Addr: id + ":9001", Status: "active", LifecycleProtocol: fsm.BrokerProtocolVersionCurrent})
 		require.NoError(t, err)
 		require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("REGISTER:"), payload...)}))
 	}
 	definition := topic.DefaultDefinition("orders", nil)
 	definition.Partitions = partitions
 	definition.ReplicationFactor = 3
+	definition.InstanceID = rand.Text()
 	payload, err := json.Marshal(fsm.TopicCommand{Definition: &definition})
 	require.NoError(t, err)
 	require.Nil(t, state.Apply(&raft.Log{Data: append([]byte("TOPIC:"), payload...)}))
@@ -244,6 +246,11 @@ func TestRunLeaderRebalanceOnceContinuesAfterPartitionFailure(t *testing.T) {
 	require.Len(t, manager.commands, 2)
 	require.Equal(t, fsm.LeaderElectionTopologyFenceVersionCurrent, manager.commands[1].TopologyFenceVersion)
 	require.Equal(t, uint64(topic.InitialDefinitionRevision), manager.commands[1].ExpectedDefinitionRevision)
+	definition, found := state.GetTopicDefinition("orders")
+	require.True(t, found)
+	require.NotEmpty(t, definition.InstanceID)
+	require.Equal(t, &definition.InstanceID, manager.commands[1].ExpectedTopicInstanceID)
+	require.True(t, manager.commands[1].RequireStableAssignment)
 }
 
 func TestRunLeaderRebalanceOnceRejectsStateChangesAfterPlanning(t *testing.T) {

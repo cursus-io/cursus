@@ -1022,7 +1022,10 @@ func (f *BrokerFSM) Snapshot() (raft.FSMSnapshot, error) {
 func (f *BrokerFSM) GetPartitionMetadata(key string) *PartitionMetadata {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	return f.getPartitionMetadataLocked(key)
+}
 
+func (f *BrokerFSM) getPartitionMetadataLocked(key string) *PartitionMetadata {
 	if meta := f.partitionMetadata[key]; meta != nil {
 		copy := *meta
 		// Deep copy slices to avoid aliasing internal FSM state

@@ -411,7 +411,7 @@ ELECT_LEADER topic=<name> partition=<N> broker=<broker-id>
 ```
 Response: `OK topic=<name> partition=<N> previous_leader=<broker-id> leader=<broker-id> leader_epoch=<N> changed=<true|false>`.
 
-The target must be an active broker in both the replica set and ISR. The Raft FSM compares the expected current leader epoch before changing leaders, increments the epoch exactly once, and preserves the committed HWM and replica membership. A retry against the already selected leader is idempotent. `ELECT_LEADER` is not a partition reassignment or broker-drain command and never promotes an out-of-sync replica.
+The target must be an active broker in both the replica set and ISR, and no replica recovery may be pending. The Raft FSM checks the topic instance, lifecycle epoch, definition revision, ordered replica assignment, and leader epoch before changing leaders. A successful election increments the leader epoch once and preserves the committed HWM and replica membership. A retry against the already selected leader is idempotent while the topology checks still pass. During manual reassignment, `ELECT_LEADER` can transfer leadership to an in-sync replica while the assignment temporarily exceeds the configured replication factor.
 
 Missing targets return `ERROR: missing_broker command=ELECT_LEADER`; rejected state changes return `ERROR: leader_election_rejected ...`; an unavailable apply result returns `ERROR: leader_election_result_unavailable ...` and may be retried because election is idempotent.
 
